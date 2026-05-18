@@ -293,6 +293,10 @@ async function bootGlasses(): Promise<void> {
             // null = not yet loaded; the first tick fills it in. The
             // late-night row hides until then.
             lastTrainToday: null,
+            // Pin is per-mount — the user re-engages with TAP when
+            // they navigate back to Predictions. This avoids stale
+            // pins surviving across station changes.
+            pinned: null,
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);

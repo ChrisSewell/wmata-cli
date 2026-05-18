@@ -34,6 +34,7 @@ import {
   MAX_VISIBLE_TRAINS,
   STALE_THRESHOLD_MS,
   TICK_INTERVAL_MS,
+  findPinnedTrainIndex,
   formatClock,
   isStale,
   makePredictionsScreen,
@@ -41,6 +42,7 @@ import {
   renderFooter,
   renderHeader,
   renderLastTrainRow,
+  renderPinRow,
   renderTrainRow,
   shouldShowLastTrain,
   sortTrainsForDisplay,
@@ -95,6 +97,7 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     consecutiveFetchFailures: 0,
     incidentHeadline: null,
     lastTrainToday: null,
+    pinned: null,
     ...over,
   };
 }
@@ -1134,9 +1137,12 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
     // Exact-pin against the canonical render. Cells (24 cols total):
     //   header:    name(18) + " " + clock(5)
     //   body row:  glyph(2) + " " + dest(11) + " " + cars(2) + " " + eta(6)
+    //
+    // The first train carries the `>` cursor in place of its second
+    // glyph char (v1.2 pin-a-train default cursor — TAP affordance).
     expect(lines).toEqual([
       "Metro Center       14:32",
-      "RD Shady Grove 6c    ARR",
+      "R> Shady Grove 6c    ARR",
       "RD Glenmont    8c  3 min",
       "OR Vienna      6c  5 min",
     ]);
@@ -1174,7 +1180,7 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
     expectFits(lines);
     expect(lines).toEqual([
       "Metro Center       14:32",
-      "RD Shady Grove 6c    ARR",
+      "R> Shady Grove 6c    ARR",
       "RD Glenmont    8c  3 min",
       "OR Vienna      6c  5 min",
       "! Single-tracking on RD…",
@@ -1182,5 +1188,221 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
     expect(lines[4]!.length).toBe(LINE_WIDTH);
     expect(lines[4]!.startsWith("! ")).toBe(true);
     expect(lines[4]!.endsWith("…")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pin-a-train (cursor + TAP-to-pin)
+// ---------------------------------------------------------------------------
+
+describe("renderTrainRow: cursor + pin markers", () => {
+  it("renders the full line glyph when no marker is supplied", () => {
+    const out = renderTrainRow(train({ Line: "RD" }));
+    expect(out.startsWith("RD")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+
+  it("replaces the second glyph char with `*` for a pinned train", () => {
+    const out = renderTrainRow(train({ Line: "RD" }), "*");
+    expect(out.startsWith("R*")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+
+  it("replaces the second glyph char with `>` for the cursor target", () => {
+    const out = renderTrainRow(train({ Line: "OR" }), ">");
+    expect(out.startsWith("O>")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+});
+
+describe("findPinnedTrainIndex", () => {
+  it("returns -1 when nothing matches", () => {
+    const trains = [
+      train({ Line: "RD", Destination: "Glenmont" }),
+      train({ Line: "OR", Destination: "Vienna" }),
+    ];
+    expect(
+      findPinnedTrainIndex(trains, { line: "BL", destination: "Largo" }),
+    ).toBe(-1);
+  });
+
+  it("returns the first matching index", () => {
+    const trains = [
+      train({ Line: "RD", Destination: "Shady Grove" }),
+      train({ Line: "RD", Destination: "Glenmont" }),
+      train({ Line: "RD", Destination: "Glenmont" }), // duplicate
+    ];
+    expect(
+      findPinnedTrainIndex(trains, { line: "RD", destination: "Glenmont" }),
+    ).toBe(1);
+  });
+
+  it("returns -1 when the pin is null", () => {
+    expect(findPinnedTrainIndex([], null)).toBe(-1);
+  });
+});
+
+describe("renderPinRow", () => {
+  it("returns null when no train is pinned", () => {
+    expect(renderPinRow(snap({}), [])).toBeNull();
+  });
+
+  it("returns null when the pinned train is no longer visible", () => {
+    const visible = [train({ Line: "RD", Destination: "Glenmont", Min: "3" })];
+    const out = renderPinRow(
+      snap({ pinned: { line: "BL", destination: "Largo" } }),
+      visible,
+    );
+    expect(out).toBeNull();
+  });
+
+  it("renders `* <line> <dest> <eta>` at exactly LINE_WIDTH", () => {
+    const visible = [
+      train({ Line: "RD", Destination: "Glenmont", Min: "3" }),
+    ];
+    const out = renderPinRow(
+      snap({ pinned: { line: "RD", destination: "Glenmont" } }),
+      visible,
+    );
+    expect(out).not.toBeNull();
+    expect(out!.length).toBe(LINE_WIDTH);
+    expect(out!).toContain("RD");
+    expect(out!).toContain("Glenmont");
+    expect(out!).toContain("3 min");
+    expect(out!.startsWith("* ")).toBe(true);
+  });
+});
+
+describe("predictions view: pin + cursor rendering", () => {
+  function trains(): Train[] {
+    return [
+      train({ Line: "RD", Destination: "Shady Grove", Min: "5" }),
+      train({ Line: "RD", Destination: "Glenmont", Min: "8" }),
+      train({ Line: "OR", Destination: "Vienna", Min: "10" }),
+    ];
+  }
+
+  it("marks the cursor target with `>` and no pin when nothing pinned", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const lines = screen.view(
+      screen.init(),
+      { highlightedIndex: 1 },
+      CTX,
+    );
+    // header at 0; trains start at index 1 with no pin row.
+    const cursorRow = lines.find((l) => l.startsWith("R>"));
+    expect(cursorRow).toBeDefined();
+    expect(cursorRow).toContain("Glenmont");
+  });
+
+  it("marks the pinned train with `*` regardless of cursor position", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: trains(),
+        pinned: { line: "OR", destination: "Vienna" },
+      }),
+    );
+    const lines = screen.view(
+      screen.init(),
+      { highlightedIndex: 0 },
+      CTX,
+    );
+    // Pin row appears under the header (line index 1).
+    expect(lines[1]).toMatch(/^\* /);
+    expect(lines[1]).toContain("Vienna");
+    // The OR/Vienna row in the body carries `O*` marker.
+    expect(lines.some((l) => l.startsWith("O*") && l.includes("Vienna"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("predictions reduce: pin + cursor", () => {
+  function trains(): Train[] {
+    return [
+      train({ Line: "RD", Destination: "Shady Grove", Min: "5" }),
+      train({ Line: "RD", Destination: "Glenmont", Min: "8" }),
+      train({ Line: "OR", Destination: "Vienna", Min: "10" }),
+    ];
+  }
+
+  it("SCROLL_DOWN advances the cursor", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.nav.highlightedIndex).toBe(1);
+  });
+
+  it("SCROLL_DOWN clamps at the last visible train", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 99 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.nav.highlightedIndex).toBe(2); // 3 visible trains -> max idx 2
+  });
+
+  it("SCROLL_UP clamps at 0", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_UP" },
+    );
+    expect(r.nav.highlightedIndex).toBe(0);
+  });
+
+  it("TAP pins the cursor target", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 1 },
+      { type: "TAP" },
+    );
+    expect(r.snapshot?.pinned).toEqual({
+      line: "RD",
+      destination: "Glenmont",
+    });
+  });
+
+  it("TAP on the already-pinned train UNPINS it", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: trains(),
+        pinned: { line: "RD", destination: "Glenmont" },
+      }),
+    );
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 1 },
+      { type: "TAP" },
+    );
+    expect(r.snapshot?.pinned).toBeNull();
+  });
+
+  it("DOUBLE_TAP still navigates Home", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 1 },
+      { type: "DOUBLE_TAP" },
+    );
+    expect(r.navigate).toEqual({ to: "home" });
+  });
+
+  it("SCROLL with empty trains is a no-op", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: [] }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.nav.highlightedIndex).toBe(0);
   });
 });

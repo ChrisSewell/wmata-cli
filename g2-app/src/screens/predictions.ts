@@ -194,6 +194,24 @@ export interface PredictionsSnapshot {
    * landed or the station isn't in the data.
    */
   lastTrainToday: string | null;
+  /**
+   * If non-null, the user has TAP-pinned a specific (line,
+   * destination) pair to track. The screen renders a single-line
+   * summary row at the top of the body, and the matching train (if
+   * still visible in the predictions list) is highlighted with a
+   * "*" cursor in place of its line-glyph cell.
+   *
+   * WMATA predictions don't carry a stable `TrainId`, so a pin is
+   * identified by (Line + Destination). If multiple trains match
+   * (a busy commute window with two RD-Glenmont trains stacked),
+   * the FIRST match in the sorted list wins for cursor + summary
+   * display.
+   *
+   * `null` = no pin. Reset on remount (the pin doesn't persist
+   * across navigations — the user explicitly chose it for this
+   * Predictions session).
+   */
+  pinned: { line: string; destination: string } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,9 +320,29 @@ export function renderHeader(
  * destination cell is left-aligned (`padRight`), the cars and ETA cells
  * are right-aligned-or-padded so the visual rhythm of the column lines up
  * across rows.
+ *
+ * `marker` is an optional 1-char glyph that replaces the line code's
+ * SECOND character (so the line is still readable as just the first
+ * letter):
+ *   - undefined / "" → no marker; full 2-char line glyph
+ *   - "*"            → pinned train (kept across ticks)
+ *   - ">"            → cursor highlight (TAP target)
+ *
+ * Why steal the second glyph char and not pad somewhere else: the
+ * existing 24-col layout has no slack. The first letter of the line
+ * code is enough signal once the user knows they're on Red / Orange
+ * / Blue — and the marker is more informative than the second
+ * letter at the moment they need it (pinning / selecting a row).
  */
-export function renderTrainRow(train: Train): string {
-  const glyph = padRight(lineGlyph(train.Line), GLYPH_WIDTH);
+export function renderTrainRow(
+  train: Train,
+  marker: "" | "*" | ">" = "",
+): string {
+  const fullGlyph = lineGlyph(train.Line);
+  const glyph =
+    marker === ""
+      ? padRight(fullGlyph, GLYPH_WIDTH)
+      : fullGlyph.charAt(0) + marker;
   const dest = padRight(
     abbreviateStation(train.Destination || train.DestinationName, DEST_WIDTH),
     DEST_WIDTH,
@@ -317,6 +355,54 @@ export function renderTrainRow(train: Train): string {
   const eta = padLeft(formatEta(train.Min), ETA_WIDTH);
   // glyph(2) + " "(1) + dest(11) + " "(1) + cars(2) + " "(1) + eta(6) = 24
   return glyph + " " + dest + " " + cars + " " + eta;
+}
+
+/**
+ * Find the index of the first visible train whose (line, destination)
+ * matches the pin. Returns -1 when nothing matches. The destination
+ * field on a `Train` is the short form (e.g. "Vienna"); the pin
+ * captures it verbatim at TAP time so equality works directly.
+ */
+export function findPinnedTrainIndex(
+  trains: readonly Train[],
+  pin: { line: string; destination: string } | null,
+): number {
+  if (!pin) return -1;
+  for (let i = 0; i < trains.length; i++) {
+    const t = trains[i]!;
+    if (t.Line === pin.line && t.Destination === pin.destination) return i;
+  }
+  return -1;
+}
+
+/**
+ * Build the optional "pin summary" row that sits between the header
+ * and the train list. Returns `null` when no train is pinned, or
+ * when the pinned train is no longer visible in the predictions
+ * (e.g. it already departed). Width contract: ≤ LINE_WIDTH.
+ *
+ *   "* RD Glenmont   3 min"
+ *
+ * Layout: marker(1) + " "(1) + line(2) + " "(1) + dest(11) + " "(1) +
+ *         eta(6) = 23. Pad one trailing space to LINE_WIDTH.
+ */
+export function renderPinRow(
+  snapshot: PredictionsSnapshot,
+  visibleTrains: readonly Train[],
+): string | null {
+  if (!snapshot.pinned) return null;
+  const idx = findPinnedTrainIndex(visibleTrains, snapshot.pinned);
+  if (idx < 0) return null;
+  const t = visibleTrains[idx]!;
+  const line = padRight(lineGlyph(t.Line), GLYPH_WIDTH);
+  const dest = padRight(
+    abbreviateStation(t.Destination || t.DestinationName, DEST_WIDTH),
+    DEST_WIDTH,
+  );
+  const eta = padLeft(formatEta(t.Min), ETA_WIDTH);
+  // "*"(1) + " "(1) + line(2) + " "(1) + dest(11) + " "(1) + eta(6) = 23
+  const composed = "* " + line + " " + dest + " " + eta;
+  return padRight(composed, LINE_WIDTH);
 }
 
 /**
@@ -393,7 +479,7 @@ export function makePredictionsScreen(
   return {
     name: "predictions",
     init: () => initialSnapshot,
-    view(snapshot, _nav, ctx: ViewContext): string[] {
+    view(snapshot, nav, ctx: ViewContext): string[] {
       const lines: string[] = [];
       // `ctx.nowMs` is freshly stamped by the host on EVERY render —
       // including the 1Hz clock-only re-renders that fire independently
@@ -403,6 +489,13 @@ export function makePredictionsScreen(
 
       const sorted = sortTrainsForDisplay(snapshot.trains);
       const visible = sorted.slice(0, MAX_VISIBLE_TRAINS);
+
+      // Pin summary row sits directly under the header when an active
+      // pin matches a visible train. Renders nothing otherwise (e.g.
+      // before the user has pinned anything, or after the pinned
+      // train has rolled out of the predictions window).
+      const pinRow = renderPinRow(snapshot, visible);
+      if (pinRow !== null) lines.push(pinRow);
 
       if (visible.length === 0) {
         // Empty state — distinct copy depending on whether we have data
@@ -416,8 +509,22 @@ export function makePredictionsScreen(
         lines.push("");
         lines.push(truncate("(double-tap to exit)", LINE_WIDTH));
       } else {
-        for (const t of visible) {
-          lines.push(renderTrainRow(t));
+        // Cursor: `nav.highlightedIndex` is clamped to the visible
+        // range. The pinned train (if any) is marked with "*"; the
+        // cursor target (which may or may not be the pinned train)
+        // is marked with ">". When both coincide on the same row,
+        // the pin marker wins — the user has confirmed this is
+        // their tracked train, no need to also surface the cursor.
+        const pinnedIdx = findPinnedTrainIndex(visible, snapshot.pinned);
+        const cursorIdx = Math.max(
+          0,
+          Math.min(nav.highlightedIndex, visible.length - 1),
+        );
+        for (let i = 0; i < visible.length; i++) {
+          const t = visible[i]!;
+          const marker: "" | "*" | ">" =
+            i === pinnedIdx ? "*" : i === cursorIdx ? ">" : "";
+          lines.push(renderTrainRow(t, marker));
         }
       }
 
@@ -433,20 +540,50 @@ export function makePredictionsScreen(
       if (lastTrain !== null) lines.push(lastTrain);
       return lines;
     },
-    reduce(_snapshot, nav, event: ScreenEvent): ReduceResult<PredictionsSnapshot> {
-      // Predictions is a glanceable screen: SCROLL_UP/DOWN and TAP have
-      // no meaning here. DOUBLE_TAP navigates BACK to Home (not "exit")
-      // — that's the new behaviour for non-root screens.
+    reduce(snapshot, nav, event: ScreenEvent): ReduceResult<PredictionsSnapshot> {
+      // Predictions added a cursor + pin model in v1.2. The cursor
+      // selects a row in the visible-trains slice; TAP toggles a pin
+      // on the cursor's target. DOUBLE_TAP still navigates Home.
       //
-      // The voice-flow event variants (TRANSCRIPT, RESOLVE_RESULT, etc.)
-      // are dispatched only by the Voice screen's `onMount` glue; they
-      // arrive at this reducer only via a programming error. The default
-      // branch absorbs them as a no-op so the contract stays total.
+      // The voice-flow event variants (TRANSCRIPT, RESOLVE_RESULT,
+      // etc.) are dispatched only by the Voice screen's `onMount`
+      // glue; they arrive at this reducer only via a programming
+      // error. The default branch absorbs them as a no-op so the
+      // contract stays total.
+      const visible = sortTrainsForDisplay(snapshot.trains).slice(
+        0,
+        MAX_VISIBLE_TRAINS,
+      );
+      const maxIdx = Math.max(0, visible.length - 1);
+      const cursorIdx = Math.max(0, Math.min(nav.highlightedIndex, maxIdx));
       switch (event.type) {
         case "SCROLL_UP":
+          if (visible.length === 0) return { nav };
+          return {
+            nav: { highlightedIndex: Math.max(0, cursorIdx - 1) },
+          };
         case "SCROLL_DOWN":
-        case "TAP":
-          return { nav };
+          if (visible.length === 0) return { nav };
+          return {
+            nav: { highlightedIndex: Math.min(maxIdx, cursorIdx + 1) },
+          };
+        case "TAP": {
+          if (visible.length === 0) return { nav };
+          const t = visible[cursorIdx]!;
+          const candidate = { line: t.Line, destination: t.Destination };
+          // TAP on the already-pinned train toggles the pin off.
+          const isAlreadyPinned =
+            snapshot.pinned !== null &&
+            snapshot.pinned.line === candidate.line &&
+            snapshot.pinned.destination === candidate.destination;
+          return {
+            nav,
+            snapshot: {
+              ...snapshot,
+              pinned: isAlreadyPinned ? null : candidate,
+            },
+          };
+        }
         case "DOUBLE_TAP":
           return { nav, navigate: { to: "home" } };
         default:
