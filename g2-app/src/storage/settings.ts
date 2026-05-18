@@ -52,6 +52,16 @@ export type FavoriteStation = {
   code: string;
   name: string;
   lines: LineCode[];
+  /**
+   * Geocoded coordinates of the station entrance. Optional —
+   * v1.1 favorites stored before WP-G don't carry these fields,
+   * and the parser tolerates their absence. Populated by the
+   * companion when adding new favorites (lat/lon come from
+   * WMATA's `jStations` response). Used only by the WP-G
+   * geofence boot path.
+   */
+  lat?: number;
+  lon?: number;
 };
 
 /** Public shape returned by `loadSettings`. */
@@ -99,6 +109,14 @@ export interface Settings {
    * either or both enables the screen.
    */
   journeyPlan: JourneyPlan;
+  /**
+   * Boot-time geofence enable flag (WP-G). When true AND the
+   * runtime exposes `navigator.geolocation` AND favorites carry
+   * lat/lon, `bootGlasses` checks the user's current position and
+   * auto-mounts predictions for the nearest in-range favorite
+   * instead of Home. Default: false.
+   */
+  geofenceEnabled: boolean;
 }
 
 /** Labelled station codes for voice navigation keywords. */
@@ -138,6 +156,7 @@ const KEY_TUTORIAL_SEEN = "wmata.g2.tutorialSeen";
 const KEY_SCHEDULE = "wmata.g2.schedule";
 const KEY_VOICE_TARGETS = "wmata.g2.voiceTargets";
 const KEY_JOURNEY_PLAN = "wmata.g2.journeyPlan";
+const KEY_GEOFENCE_ENABLED = "wmata.g2.geofenceEnabled";
 
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -232,7 +251,9 @@ function asLineCode(x: unknown): LineCode | null {
 
 /**
  * Narrow an unknown value to a `FavoriteStation`, dropping any malformed
- * `lines` entries. Returns null if `code`/`name` are missing.
+ * `lines` entries. Returns null if `code`/`name` are missing. The
+ * optional `lat` / `lon` fields are tolerated when present and ignored
+ * when malformed — v1.1 entries (no coords) keep working untouched.
  */
 function asFavorite(x: unknown): FavoriteStation | null {
   if (!isRecord(x)) return null;
@@ -246,7 +267,12 @@ function asFavorite(x: unknown): FavoriteStation | null {
     const lc = asLineCode(line);
     if (lc !== null) cleanedLines.push(lc);
   }
-  return { code, name, lines: cleanedLines };
+  const out: FavoriteStation = { code, name, lines: cleanedLines };
+  const lat = x["lat"];
+  const lon = x["lon"];
+  if (typeof lat === "number" && Number.isFinite(lat)) out.lat = lat;
+  if (typeof lon === "number" && Number.isFinite(lon)) out.lon = lon;
+  return out;
 }
 
 /** Narrow an unknown value to a `FavoriteStation[]`, dropping malformed rows. */
@@ -412,6 +438,19 @@ function readJourneyPlan(): JourneyPlan {
   };
 }
 
+function readGeofenceEnabled(): boolean {
+  const value = parseEnvelope(safeGet(KEY_GEOFENCE_ENABLED));
+  return typeof value === "boolean" ? value : false;
+}
+
+function writeGeofenceEnabled(enabled: boolean): void {
+  const envelope: Envelope<boolean> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: enabled,
+  };
+  safeSet(KEY_GEOFENCE_ENABLED, JSON.stringify(envelope));
+}
+
 function writeJourneyPlan(plan: JourneyPlan): void {
   const envelope: Envelope<JourneyPlan> = {
     schemaVersion: SCHEMA_VERSION,
@@ -469,7 +508,13 @@ export function loadSettings(): Settings {
     schedule: readSchedule(),
     voiceTargets: readVoiceTargets(),
     journeyPlan: readJourneyPlan(),
+    geofenceEnabled: readGeofenceEnabled(),
   };
+}
+
+/** Persist the geofence enable flag (WP-G). */
+export function saveGeofenceEnabled(enabled: boolean): void {
+  writeGeofenceEnabled(enabled);
 }
 
 /** Persist the user's saved journey plan. Pass empty strings to clear. */
@@ -598,5 +643,6 @@ export function clearSettings(): void {
   safeRemove(KEY_SCHEDULE);
   safeRemove(KEY_VOICE_TARGETS);
   safeRemove(KEY_JOURNEY_PLAN);
+  safeRemove(KEY_GEOFENCE_ENABLED);
   clearHistory();
 }

@@ -633,6 +633,12 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
             code: station.Code,
             name: station.Name,
             lines: stationLineCodes(station),
+            // Capture geo-coords at add-time so the WP-G geofence
+            // boot path can match against them. Field is optional
+            // in the storage schema for backward-compat with v1.1
+            // favorites (which were saved without coords).
+            lat: station.Lat,
+            lon: station.Lon,
           });
           state.favorites = next;
           if (next.length === before) {

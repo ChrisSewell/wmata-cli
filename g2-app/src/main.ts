@@ -47,6 +47,7 @@ import {
   resolveVoiceIntent,
 } from "./screens/voice";
 import { evaluateSchedule } from "./schedule/rules";
+import { findNearestFavorite } from "./geofence/geofence";
 import { Session } from "./session";
 import { parseLinesAffected } from "./wmata/incidents-cache";
 import {
@@ -107,6 +108,43 @@ function computeAffectedLines(
     }
   }
   return Array.from(out);
+}
+
+/**
+ * Best-effort geolocation lookup. Returns `null` on any failure
+ * (permission denied, timeout, runtime without `navigator.geolocation`,
+ * any thrown error). The boot path treats null as "geofence didn't
+ * fire" — fall through to the normal nav flow.
+ *
+ * `timeoutMs` caps how long we wait before giving up; 5s is more
+ * than enough for a GPS-warm device and short enough not to delay
+ * the glasses HUD mount when GPS is unavailable.
+ */
+async function geolocateOnce(
+  timeoutMs: number = 5_000,
+): Promise<{ lat: number; lon: number } | null> {
+  if (typeof navigator === "undefined" || !navigator.geolocation) return null;
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (v: { lat: number; lon: number } | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    try {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => settle({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+        () => settle(null),
+        { timeout: timeoutMs, maximumAge: 60_000 },
+      );
+    } catch {
+      settle(null);
+    }
+    // Belt-and-suspenders timeout: getCurrentPosition's own timeout
+    // should fire, but some WebView implementations have been known
+    // to ignore it.
+    setTimeout(() => settle(null), timeoutMs + 500);
+  });
 }
 
 /** Day-of-week key for indexing into a `StationTimes` schedule. */
@@ -453,29 +491,58 @@ async function bootGlasses(): Promise<void> {
     },
   };
 
-  // First-launch users land on the Tutorial; everyone else consults
-  // the schedule evaluator. The inference inside `readTutorialSeen()`
-  // means existing v1.1 users with a saved API key never see the
-  // tutorial on upgrade — only genuine clean-install users do.
+  // First-launch users land on the Tutorial; everyone else picks an
+  // initial nav intent from three signals (in priority order):
   //
-  // Schedule rules: if an auto-rotate window matches right now (and
-  // no quiet-hours rule overrides it), boot straight into the
-  // configured target screen instead of Home. The user keeps
-  // double-tap-to-Home as the manual escape hatch.
+  //   1. Geofence (WP-G): if enabled AND a favorite is within
+  //      MAX_RADIUS_METERS, mount predictions for that station.
+  //   2. Schedule auto-rotate (WP-B): a window-matching auto-rotate
+  //      rule mounts its configured target.
+  //   3. Default: Home.
+  //
+  // Quiet-hours rules from the same schedule suppress auto-rotate
+  // (handled inside `evaluateSchedule`); the geofence overrides
+  // BOTH because the user's physical position is the most
+  // immediate signal of intent.
+  //
+  // The inference inside `readTutorialSeen()` means existing v1.1
+  // users with a saved API key never see the tutorial on upgrade —
+  // only genuine clean-install users do.
   const settings = loadSettings();
   let initialIntent: NavIntent;
   if (!settings.tutorialSeen) {
     initialIntent = { to: "tutorial" };
   } else {
-    const evaluation = evaluateSchedule(settings.schedule, Date.now());
-    const target = evaluation.autoRotateTarget;
-    if (target && target.kind === "predictions") {
-      initialIntent = { to: "predictions", stationCode: target.stationCode };
-    } else {
-      initialIntent = { to: "home" };
-    }
+    initialIntent = await pickInitialIntent(settings);
   }
   await router.navigate(initialIntent);
+}
+
+/**
+ * Pick the boot-time nav intent from geofence / schedule / default.
+ * Extracted from `bootGlasses` so the geolocation round-trip is
+ * isolated to one async function the host can await once.
+ */
+async function pickInitialIntent(
+  settings: ReturnType<typeof loadSettings>,
+): Promise<NavIntent> {
+  // Geofence first (WP-G).
+  if (settings.geofenceEnabled && settings.favorites.length > 0) {
+    const pos = await geolocateOnce();
+    if (pos) {
+      const hit = findNearestFavorite(settings.favorites, pos.lat, pos.lon);
+      if (hit) {
+        return { to: "predictions", stationCode: hit.favorite.code };
+      }
+    }
+  }
+  // Schedule auto-rotate (WP-B).
+  const evaluation = evaluateSchedule(settings.schedule, Date.now());
+  const target = evaluation.autoRotateTarget;
+  if (target && target.kind === "predictions") {
+    return { to: "predictions", stationCode: target.stationCode };
+  }
+  return { to: "home" };
 }
 
 function bootCompanion(root: HTMLElement): void {
