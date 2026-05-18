@@ -61,6 +61,7 @@ import type {
   ViewContext,
 } from "./router";
 import type { EvenAppBridge } from "@evenrealities/even_hub_sdk";
+import { DeepgramSttEngine } from "../stt/deepgram";
 
 // ---------------------------------------------------------------------------
 // Public contract: SttEngine
@@ -78,10 +79,11 @@ import type { EvenAppBridge } from "@evenrealities/even_hub_sdk";
  */
 export interface SttEngine {
   /**
-   * Begin streaming. The returned function stops the stream; it MUST
-   * be safe to call multiple times (idempotent) so the host can call
-   * it from `onUnmount` even after an internal `onError` has already
-   * torn the stream down.
+   * Open the stream. The caller writes 16-bit signed PCM frames
+   * (16 kHz, mono) into the returned `write`. `close` shuts the stream
+   * down — it MUST be safe to call multiple times (idempotent) so the
+   * host can call it from `onUnmount` even after an internal `onError`
+   * has already torn the stream down.
    *
    * Callback semantics:
    *   - `onTranscript(text, isFinal=false)` — partial transcript, may
@@ -98,7 +100,12 @@ export interface SttEngine {
     onTranscript: (text: string, isFinal: boolean) => void;
     onSilence: () => void;
     onError: (err: Error) => void;
-  }): () => void;
+  }): {
+    /** Forward a binary PCM frame to the underlying provider. */
+    write(pcm: Uint8Array): void;
+    /** Shut the stream down. Idempotent. */
+    close(): void;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -286,11 +293,19 @@ export function makeVoiceScreen(
   const seeded: VoiceSnapshot = { ...base, ...(initial ?? {}) };
 
   /**
-   * Closure-local handle to the active STT stop function. Lives
-   * across `onMount` / `onUnmount` calls; the host guarantees only one
-   * mount per screen value.
+   * Closure-local handle to the active STT pipe. Lives across
+   * `onMount` / `onUnmount` calls; the host guarantees only one mount
+   * per screen value. `null` between unmount and the next mount.
    */
-  let stopStream: (() => void) | null = null;
+  let activePipe: { write(pcm: Uint8Array): void; close(): void } | null =
+    null;
+
+  /**
+   * Unsubscribe handle for the raw `bridge.onEvenHubEvent` audio
+   * subscription. Wired up after the STT pipe is opened in `onMount`;
+   * `onUnmount` calls it before tearing the pipe down.
+   */
+  let audioUnsub: (() => void) | null = null;
 
   /**
    * Bump the generation counter that gates in-flight `searchFn`
@@ -598,7 +613,7 @@ export function makeVoiceScreen(
         return;
       }
 
-      stopStream = stt.start({
+      activePipe = stt.start({
         onTranscript: (text, isFinal) => {
           liveTranscript = text;
           dispatch({ type: "TRANSCRIPT", text, isFinal });
@@ -638,6 +653,16 @@ export function makeVoiceScreen(
         },
       });
 
+      // Subscribe to raw EvenHub events so we can pluck `audioPcm`
+      // frames off and forward them into the STT pipe. The host's
+      // normalized subscription stays active in parallel — both can
+      // co-exist; the SDK fans every event out to every subscriber.
+      const pipe = activePipe;
+      audioUnsub = bridge.onEvenHubEvent((event) => {
+        const pcm = event.audioEvent?.audioPcm;
+        if (pcm) pipe.write(pcm);
+      });
+
       // Expose the generation bump for `onUnmount`. We stash it on
       // the closure-local `bumpSearchGen` so `onUnmount` doesn't need
       // to re-declare the counter (which would be a separate variable
@@ -657,13 +682,23 @@ export function makeVoiceScreen(
         bumpSearchGen();
         bumpSearchGen = null;
       }
-      if (stopStream) {
+      // Unsubscribe from raw audio events BEFORE closing the pipe so a
+      // late frame doesn't sneak into a torn-down WebSocket.
+      if (audioUnsub) {
         try {
-          stopStream();
+          audioUnsub();
         } catch (err) {
-          console.warn(`[voice] stopStream threw:`, err);
+          console.warn(`[voice] audio unsub threw:`, err);
         }
-        stopStream = null;
+        audioUnsub = null;
+      }
+      if (activePipe) {
+        try {
+          activePipe.close();
+        } catch (err) {
+          console.warn(`[voice] pipe.close threw:`, err);
+        }
+        activePipe = null;
       }
       try {
         await bridge.audioControl(false);
@@ -694,21 +729,29 @@ export class MockSttEngine implements SttEngine {
     onSilence: () => void;
     onError: (err: Error) => void;
   } | null = null;
-  /** True once `start` has returned and before its stop fn is called. */
+  /** True once `start` has returned and before `close()` is called. */
   public active = false;
+  /** Count of `close()` calls for assertions. */
   public stopCount = 0;
+  /** Every PCM frame written through `pipe.write` (for assertions). */
+  public writes: Uint8Array[] = [];
 
   start(callbacks: {
     onTranscript: (text: string, isFinal: boolean) => void;
     onSilence: () => void;
     onError: (err: Error) => void;
-  }): () => void {
+  }): { write(pcm: Uint8Array): void; close(): void } {
     this.cb = callbacks;
     this.active = true;
-    return () => {
-      this.active = false;
-      this.cb = null;
-      this.stopCount += 1;
+    return {
+      write: (pcm: Uint8Array): void => {
+        this.writes.push(pcm);
+      },
+      close: (): void => {
+        this.active = false;
+        this.cb = null;
+        this.stopCount += 1;
+      },
     };
   }
 
@@ -734,35 +777,30 @@ export class MockSttEngine implements SttEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Production STT factory — intentionally unimplemented.
+// Production STT factory — wired to Deepgram.
 // ---------------------------------------------------------------------------
 
 /**
- * Build the production `SttEngine`.
+ * Build the production `SttEngine` from a Deepgram API key.
  *
- * INTENTIONALLY THROWS: the project does not ship a real cloud STT
- * integration. The next developer to enable the VOICE LOOKUP flow on
- * real hardware must:
+ *   - Empty `apiKey` → throw a grep-able "STT provider not configured"
+ *     error. The router catches this and bounces back to Home, so the
+ *     user gets a clear "Voice unavailable" message rather than a
+ *     half-broken Voice screen.
+ *   - Non-empty `apiKey` → return a new `DeepgramSttEngine`. The audio
+ *     pipe still has to be fed PCM frames by the screen's `onMount`;
+ *     this factory only builds the provider object.
  *
- *   1. Pick a streaming STT provider (Whisper, Deepgram, AssemblyAI,
- *      or an on-device model like whisper.cpp).
- *   2. Implement the `SttEngine.start` contract — buffer raw PCM
- *      frames from `event.audioEvent.audioPcm` (16 kHz mono) and
- *      forward them to your provider, calling back through the
- *      provided `onTranscript` / `onSilence` / `onError`. The Even
- *      Realities SDK's `bridge.onEvenHubEvent` is the source of those
- *      PCM frames; the audio is enabled by `bridge.audioControl(true)`
- *      which the Voice screen's `onMount` already does.
- *   3. Replace this throw with a real implementation that returns an
- *      `SttEngine` instance.
- *
- * The thrown error message names this file so future grep-driven
- * debugging lands here on the first try.
+ * The error message names this file (and the storage helper) so the
+ * next developer's `grep` lands on the wire-up site, not the provider.
  */
-export function createSttEngine(_apiKey: string): SttEngine {
-  throw new Error(
-    "createSttEngine: STT provider not configured — see " +
-      "src/screens/voice.ts and wire your preferred provider (Whisper, " +
-      "Deepgram, on-device, ...) into the SttEngine interface.",
-  );
+export function createSttEngine(apiKey: string): SttEngine {
+  if (apiKey.trim().length === 0) {
+    throw new Error(
+      "createSttEngine: STT provider not configured — see " +
+        "src/screens/voice.ts and add a Deepgram API key via the " +
+        "companion settings screen (storage key wmata.g2.sttApiKey).",
+    );
+  }
+  return new DeepgramSttEngine(apiKey);
 }

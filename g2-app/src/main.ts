@@ -32,19 +32,13 @@ import {
 import { makePredictionsScreen } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { createSttEngine, makeVoiceScreen } from "./screens/voice";
+import { Session } from "./session";
 import {
-  WmataClient,
   buildRailPredictionsUrl,
-  resolveStationCode,
-  searchStations,
   type LineCode,
   type PredictionsResponse,
   type Station,
 } from "./wmata";
-import {
-  readCachedIncidents,
-  refreshIncidents,
-} from "./wmata/incidents-cache";
 
 /**
  * Collect the non-null line codes a Station serves. Inline rather than
@@ -66,11 +60,12 @@ function stationLines(station: Station): LineCode[] {
 
 /**
  * Extract the first-sentence headline of the freshest incident from the
- * shared cache. Returns null when the cache is empty (or the first
- * incident has no description) so the Predictions footer can hide.
+ * session's incidents cache. Returns null when the cache is empty (or
+ * the first incident has no description) so the Predictions footer can
+ * hide.
  */
-function readFirstIncidentHeadline(): string | null {
-  const first = readCachedIncidents().incidents[0];
+function readFirstIncidentHeadline(session: Session): string | null {
+  const first = session.readCachedIncidents().incidents[0];
   if (!first) return null;
   const desc = first.Description ?? "";
   const headline = desc.split(".")[0]?.trim() ?? "";
@@ -80,26 +75,29 @@ function readFirstIncidentHeadline(): string | null {
 async function bootGlasses(): Promise<void> {
   const bridge = await waitForEvenAppBridge();
 
-  // One WMATA client per glasses session — the API key only changes
-  // when the user re-runs the companion settings flow, which forces a
-  // full page reload anyway.
-  const client = new WmataClient(loadSettings().apiKey);
+  // One Session per glasses session — the API key only changes when
+  // the user re-runs the companion settings flow, which forces a full
+  // page reload anyway. The Session owns the WmataClient AND the
+  // stations/incidents caches; when v1.1 adds a "swap settings without
+  // reload" path, the implementation is just "drop the old Session,
+  // build a new one".
+  const session = new Session(loadSettings().apiKey);
 
   // Build the Home screen with a fresh-load snapshot factory. We
   // call `loadSettings()` inside `init` so re-mounting the screen
   // (e.g. after a return-from-predictions) picks up any favorite-list
   // changes made on the phone in the interim. The cached incident
-  // count is seeded from the shared cache so a re-mount doesn't blink
-  // the ALERTS row off-then-on while the first tick is in flight.
+  // count is seeded from the session's cache so a re-mount doesn't
+  // blink the ALERTS row off-then-on while the first tick is in flight.
   const homeScreen = makeHomeScreen(
     () => ({
       favorites: loadSettings().favorites,
-      incidentCount: readCachedIncidents().incidents.length,
+      incidentCount: session.readCachedIncidents().incidents.length,
     }),
     {
       refreshIncidentCount: async (): Promise<number> => {
         const userLines = computeUserLines(loadSettings().favorites);
-        const cache = await refreshIncidents(client, userLines);
+        const cache = await session.refreshIncidents(userLines);
         return cache.incidents.length;
       },
       tickIntervalMs: 60_000,
@@ -149,7 +147,9 @@ async function bootGlasses(): Promise<void> {
           let stationName = intent.stationCode;
           let stationServedLines: LineCode[] = [];
           try {
-            const station = await resolveStationCode(client, intent.stationCode);
+            const station = await session.resolveStationCode(
+              intent.stationCode,
+            );
             if (station) {
               stationName = station.Name;
               stationServedLines = stationLines(station);
@@ -165,14 +165,14 @@ async function bootGlasses(): Promise<void> {
             const url = buildRailPredictionsUrl(intent.stationCode);
             // Fire predictions + cache-refresh in sequence (not parallel)
             // to keep the request rate under WMATA's 10 req/s ceiling
-            // with margin. The shared incidents cache means this also
+            // with margin. The session's incidents cache means this also
             // keeps Home's ALERTS count fresh while the user is on
             // Predictions — useful side effect.
-            const data = await client.get<PredictionsResponse>(url);
-            await refreshIncidents(client, stationServedLines);
+            const data = await session.client.get<PredictionsResponse>(url);
+            await session.refreshIncidents(stationServedLines);
             return {
               trains: data.Trains ?? [],
-              incidentHeadline: readFirstIncidentHeadline(),
+              incidentHeadline: readFirstIncidentHeadline(session),
             };
           };
 
@@ -182,11 +182,12 @@ async function bootGlasses(): Promise<void> {
             trains: [],
             fetchedAt: 0,
             fetchError: null,
-            // Seed the headline from the cache so the first render shows
-            // any already-known incident (the cache is shared with Home
-            // and the Incidents screen). Avoids a one-tick blink between
-            // mount and the first fetcher resolution.
-            incidentHeadline: readFirstIncidentHeadline(),
+            // Seed the headline from the session cache so the first
+            // render shows any already-known incident (the cache is
+            // shared with Home and the Incidents screen). Avoids a
+            // one-tick blink between mount and the first fetcher
+            // resolution.
+            incidentHeadline: readFirstIncidentHeadline(session),
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);
@@ -198,18 +199,20 @@ async function bootGlasses(): Promise<void> {
             unmount = null;
           }
           const userLines = computeUserLines(loadSettings().favorites);
-          // The fetcher always goes through the shared cache so the
-          // Home screen's ticking + the Incidents screen's ticking
-          // converge on a single source of truth.
+          // The fetcher always goes through the session's incidents
+          // cache so the Home screen's ticking + the Incidents screen's
+          // ticking converge on a single source of truth.
           const fetcher = async () => {
-            const cache = await refreshIncidents(client, userLines);
+            const cache = await session.refreshIncidents(userLines);
             return {
               incidents: cache.incidents,
               fetchedAt: cache.fetchedAt,
               fetchError: cache.fetchError,
             };
           };
-          const initial = makeInitialIncidentsSnapshot(readCachedIncidents());
+          const initial = makeInitialIncidentsSnapshot(
+            session.readCachedIncidents(),
+          );
           const screen = makeIncidentsScreen(fetcher, initial);
           router.current = "incidents";
           unmount = await mountGlassesScreen(screen, bridge, router);
@@ -221,15 +224,21 @@ async function bootGlasses(): Promise<void> {
             unmount = null;
           }
           // The STT engine is the only WMATA-unrelated dependency this
-          // screen needs. `createSttEngine` intentionally throws today
-          // — see `src/screens/voice.ts` for the wiring TODO. We catch
-          // here so the user gets a clear error phase on the HUD
-          // rather than an uncaught exception in the router.
+          // screen needs. `createSttEngine` throws when the user has
+          // not yet entered a Deepgram API key in the companion
+          // settings UI. We catch here so the user gets a clear error
+          // message on the HUD rather than an uncaught exception in
+          // the router, and bounce back to Home.
+          const settings = loadSettings();
           let stt;
           try {
-            stt = createSttEngine(loadSettings().apiKey);
+            stt = createSttEngine(settings.sttApiKey);
           } catch (err) {
-            console.warn(`[router] createSttEngine failed:`, err);
+            console.warn(
+              "[router] Voice unavailable — Deepgram API key not configured. " +
+                "Open the phone app to add one.",
+              err,
+            );
             // Bounce back to Home rather than mounting a half-broken
             // page. The Home screen's footer is the natural recovery
             // surface (and the user can re-attempt or change settings).
@@ -238,7 +247,7 @@ async function bootGlasses(): Promise<void> {
           }
           const screen = makeVoiceScreen(
             stt,
-            (q: string) => searchStations(client, q),
+            (q: string) => session.searchStations(q),
           );
           router.current = "voice";
           unmount = await mountGlassesScreen(screen, bridge, router);
