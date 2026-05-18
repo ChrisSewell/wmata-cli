@@ -39,9 +39,10 @@ import {
   makeJourneyScreen,
 } from "./screens/journey";
 import {
+  bucketLastTrainsByLine,
   makePredictionsScreen,
-  pickLastTrainTime,
   resolvePinnedPosition,
+  type LastTrainByLine,
   type PredictionsSnapshot,
 } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
@@ -164,22 +165,54 @@ const WEEKDAY_KEYS = [
 ] as const;
 
 /**
- * Read the latest scheduled departure time from `code`'s
- * `LastTrains[]` for today's day-of-week. Returns `null` on any
- * failure (cache miss, unknown station, network blip). The session
- * cache makes calls after the first one essentially free.
+ * Read tonight's last-train summary for `code`, bucketed by line.
+ * Each entry is the latest PM departure on a line that this station
+ * serves. Returns `null` on any failure (cache miss, unknown
+ * station, network blip).
+ *
+ * Per-line resolution (WP-J): for each `LastTrains[]` entry, the
+ * destination station's primary line (`LineCode1`, falling through
+ * to `LineCode2`/3/4 for multi-line termini) tells us which line
+ * the train is running on. We bucket by that line and pick the
+ * latest PM time per bucket.
  */
 async function readLastTrainToday(
   session: Session,
   code: string,
-): Promise<string | null> {
+): Promise<LastTrainByLine[] | null> {
   try {
     const times = await session.getStationTimes(code);
     if (!times) return null;
     const today = WEEKDAY_KEYS[new Date().getDay()];
     const day = times[today];
     if (!day) return null;
-    return pickLastTrainTime(day.LastTrains ?? []);
+    const lastTrains = day.LastTrains ?? [];
+    if (lastTrains.length === 0) return [];
+    // Build a `destinationStation → line` map by resolving each
+    // unique destination through the stations cache. We only
+    // resolve uniques (a busy station has lots of duplicates in
+    // LastTrains[]) to minimise the lookup load.
+    const uniqueDests = new Set<string>(
+      lastTrains.map((t) => t.DestinationStation).filter((s) => s.length > 0),
+    );
+    const destToLine = new Map<string, string>();
+    for (const dest of uniqueDests) {
+      const station = await session.resolveStationCode(dest);
+      if (!station) continue;
+      // For multi-line termini, prefer LineCode1 by convention. A
+      // future WP could be smarter (cross-reference with the
+      // station's served-lines), but the heuristic is correct for
+      // every WMATA terminus today — all terminus stations are
+      // single-line.
+      const line =
+        station.LineCode1 ??
+        station.LineCode2 ??
+        station.LineCode3 ??
+        station.LineCode4 ??
+        null;
+      if (line) destToLine.set(dest, line);
+    }
+    return bucketLastTrainsByLine(lastTrains, destToLine);
   } catch {
     return null;
   }

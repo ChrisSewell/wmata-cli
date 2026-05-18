@@ -34,6 +34,7 @@ import {
   MAX_VISIBLE_TRAINS,
   STALE_THRESHOLD_MS,
   TICK_INTERVAL_MS,
+  bucketLastTrainsByLine,
   findPinnedTrainIndex,
   formatClock,
   isStale,
@@ -789,12 +790,12 @@ describe("predictions tick", () => {
       Promise.resolve({
         trains: [],
         incidentHeadline: null,
-        lastTrainToday: "23:47",
+        lastTrainToday: [{ line: "RD", time: "23:47" }],
         pinnedPosition: null,
       });
     const screen = makePredictionsScreen(fetcher, snap({}));
     const next = await screen.tick(screen.init());
-    expect(next.lastTrainToday).toBe("23:47");
+    expect(next.lastTrainToday).toEqual([{ line: "RD", time: "23:47" }]);
   });
 
   it("preserves prior lastTrainToday when the fetcher reports null", async () => {
@@ -811,10 +812,10 @@ describe("predictions tick", () => {
       });
     const screen = makePredictionsScreen(
       fetcher,
-      snap({ lastTrainToday: "23:47" }),
+      snap({ lastTrainToday: [{ line: "RD", time: "23:47" }] }),
     );
     const next = await screen.tick(screen.init());
-    expect(next.lastTrainToday).toBe("23:47");
+    expect(next.lastTrainToday).toEqual([{ line: "RD", time: "23:47" }]);
   });
 });
 
@@ -899,22 +900,63 @@ describe("renderLastTrainRow", () => {
 
   it("returns null before the late-night window", () => {
     expect(
-      renderLastTrainRow(snap({ lastTrainToday: "23:47" }), MORNING),
+      renderLastTrainRow(
+        snap({ lastTrainToday: [{ line: "RD", time: "23:47" }] }),
+        MORNING,
+      ),
     ).toBeNull();
   });
 
-  it("returns null when lastTrainToday is missing", () => {
-    expect(renderLastTrainRow(snap({ lastTrainToday: null, pinnedPosition: null }), EVENING)).toBeNull();
-    expect(renderLastTrainRow(snap({ lastTrainToday: "" }), EVENING)).toBeNull();
+  it("returns null when lastTrainToday is missing or empty", () => {
+    expect(
+      renderLastTrainRow(snap({ lastTrainToday: null }), EVENING),
+    ).toBeNull();
+    expect(
+      renderLastTrainRow(snap({ lastTrainToday: [] }), EVENING),
+    ).toBeNull();
   });
 
-  it("renders `Last train: HH:MM` when both conditions are met", () => {
+  it("renders single-line form when one bucket is present", () => {
     const out = renderLastTrainRow(
-      snap({ lastTrainToday: "23:47" }),
+      snap({ lastTrainToday: [{ line: "RD", time: "23:47" }] }),
       EVENING,
     );
-    expect(out).toBe("Last train: 23:47");
+    expect(out).toBe("Last RD 23:47");
     expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+  });
+
+  it("renders two-line form ascending by time (earliest-out first)", () => {
+    // OR 22:50 leaves before RD 23:47 — surface OR first so the
+    // user knows the line they have to leave fastest for.
+    const out = renderLastTrainRow(
+      snap({
+        lastTrainToday: [
+          { line: "OR", time: "22:50" },
+          { line: "RD", time: "23:47" },
+        ],
+      }),
+      EVENING,
+    );
+    expect(out).toBe("Last OR 22:50  RD 23:47");
+    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+  });
+
+  it("drops cell #2 for 3+ lines and surfaces overflow count", () => {
+    // 4 lines won't fit in two-cell form ("Last X HH:MM  X HH:MM +N" = 26
+    // chars). The render falls back to single-cell + overflow.
+    const out = renderLastTrainRow(
+      snap({
+        lastTrainToday: [
+          { line: "BL", time: "22:30" },
+          { line: "OR", time: "22:50" },
+          { line: "RD", time: "23:47" },
+          { line: "SV", time: "23:55" },
+        ],
+      }),
+      EVENING,
+    );
+    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(out).toBe("Last BL 22:30 +3");
   });
 });
 
@@ -927,12 +969,12 @@ describe("predictions view: late-night last-train row", () => {
       noopFetcher,
       snap({
         trains: [train({ Line: "RD", Min: "5" })],
-        lastTrainToday: "23:47",
+        lastTrainToday: [{ line: "RD", time: "23:47" }],
       }),
     );
     const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
     expectFits(lines);
-    expect(lines[lines.length - 1]).toBe("Last train: 23:47");
+    expect(lines[lines.length - 1]).toBe("Last RD 23:47");
   });
 
   it("does NOT append the row before LAST_TRAIN_HOUR", () => {
@@ -941,12 +983,13 @@ describe("predictions view: late-night last-train row", () => {
       noopFetcher,
       snap({
         trains: [train({ Line: "RD", Min: "5" })],
-        lastTrainToday: "23:47",
+        lastTrainToday: [{ line: "RD", time: "23:47" }],
       }),
     );
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines.some((l) => l.includes("Last train"))).toBe(false);
+    expect(lines.some((l) => l.includes("Last RD"))).toBe(false);
   });
 
   it("does NOT append the row when lastTrainToday is null (data not loaded yet)", () => {
@@ -1415,5 +1458,61 @@ describe("predictions reduce: pin + cursor", () => {
       { type: "SCROLL_DOWN" },
     );
     expect(r.nav.highlightedIndex).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bucketLastTrainsByLine (WP-J)
+// ---------------------------------------------------------------------------
+
+describe("bucketLastTrainsByLine", () => {
+  it("buckets entries by destination → line and picks the latest PM time", () => {
+    const lastTrains = [
+      { Time: "23:30", DestinationStation: "GLN" }, // RD
+      { Time: "23:47", DestinationStation: "SHA" }, // RD (later — wins for RD)
+      { Time: "00:12", DestinationStation: "VIE" }, // OR — AM, skipped
+      { Time: "22:50", DestinationStation: "VIE" }, // OR (latest PM)
+    ];
+    const destToLine = new Map<string, string>([
+      ["GLN", "RD"],
+      ["SHA", "RD"],
+      ["VIE", "OR"],
+    ]);
+    const out = bucketLastTrainsByLine(lastTrains, destToLine);
+    expect(out).toEqual([
+      { line: "OR", time: "22:50" }, // earliest-departing first
+      { line: "RD", time: "23:47" },
+    ]);
+  });
+
+  it("returns [] when no entry maps to a known line", () => {
+    const out = bucketLastTrainsByLine(
+      [{ Time: "23:30", DestinationStation: "GLN" }],
+      new Map(),
+    );
+    expect(out).toEqual([]);
+  });
+
+  it("skips AM-time entries (next-day per WMATA docs)", () => {
+    const out = bucketLastTrainsByLine(
+      [
+        { Time: "00:30", DestinationStation: "GLN" }, // AM, skipped
+        { Time: "23:47", DestinationStation: "GLN" },
+      ],
+      new Map<string, string>([["GLN", "RD"]]),
+    );
+    expect(out).toEqual([{ line: "RD", time: "23:47" }]);
+  });
+
+  it("skips malformed time entries", () => {
+    const out = bucketLastTrainsByLine(
+      [
+        { Time: "", DestinationStation: "GLN" },
+        { Time: "bad", DestinationStation: "GLN" },
+        { Time: "23:47", DestinationStation: "GLN" },
+      ],
+      new Map<string, string>([["GLN", "RD"]]),
+    );
+    expect(out).toEqual([{ line: "RD", time: "23:47" }]);
   });
 });
