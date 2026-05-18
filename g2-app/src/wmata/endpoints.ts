@@ -49,3 +49,11 @@ export function buildPathUrl(from: string, to: string): string {
   });
   return `${BASE}/Rail.svc/json/jPath?${params.toString()}`;
 }
+
+/** Live train positions endpoint (`?contentType=json` is required). */
+export const TRAIN_POSITIONS_URL =
+  `${BASE}/TrainPositions/TrainPositions?contentType=json`;
+
+/** Standard Routes endpoint — the static circuit-ordering data. */
+export const STANDARD_ROUTES_URL =
+  `${BASE}/TrainPositions/StandardRoutes?contentType=json`;

@@ -98,13 +98,14 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     incidentHeadline: null,
     lastTrainToday: null,
     pinned: null,
+    pinnedPosition: null,
     ...over,
   };
 }
 
 /** A noop fetcher — handy for screens that we never tick in a test. */
 const noopFetcher = (): Promise<PredictionsFetchResult> =>
-  Promise.resolve({ trains: [], incidentHeadline: null, lastTrainToday: null });
+  Promise.resolve({ trains: [], incidentHeadline: null, lastTrainToday: null, pinnedPosition: null });
 
 // ---------------------------------------------------------------------------
 // formatClock
@@ -722,6 +723,7 @@ describe("predictions tick", () => {
         trains: fixture,
         incidentHeadline: "Single-tracking RD",
         lastTrainToday: null,
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(
       fetcher,
@@ -765,6 +767,7 @@ describe("predictions tick", () => {
             trains: [],
             incidentHeadline: null,
             lastTrainToday: null,
+        pinnedPosition: null,
           });
     const screen = makePredictionsScreen(
       fetcher,
@@ -792,6 +795,7 @@ describe("predictions tick", () => {
         trains: [],
         incidentHeadline: null,
         lastTrainToday: "23:47",
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(fetcher, snap({}));
     const next = await screen.tick(screen.init());
@@ -808,6 +812,7 @@ describe("predictions tick", () => {
         trains: [],
         incidentHeadline: null,
         lastTrainToday: null,
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(
       fetcher,
@@ -904,7 +909,7 @@ describe("renderLastTrainRow", () => {
   });
 
   it("returns null when lastTrainToday is missing", () => {
-    expect(renderLastTrainRow(snap({ lastTrainToday: null }), EVENING)).toBeNull();
+    expect(renderLastTrainRow(snap({ lastTrainToday: null, pinnedPosition: null }), EVENING)).toBeNull();
     expect(renderLastTrainRow(snap({ lastTrainToday: "" }), EVENING)).toBeNull();
   });
 
@@ -955,6 +960,7 @@ describe("predictions view: late-night last-train row", () => {
       snap({
         trains: [train({ Line: "RD", Min: "5" })],
         lastTrainToday: null,
+        pinnedPosition: null,
       }),
     );
     const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
@@ -990,6 +996,7 @@ describe("predictions: stale check uses ctx.nowMs (not the snapshot)", () => {
         trains: [],
         incidentHeadline: null,
         lastTrainToday: null,
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(fetcher, s1);
     // Pin Date.now() so the tick stamps fetchedAt deterministically.
@@ -1372,6 +1379,10 @@ describe("predictions reduce: pin + cursor", () => {
     expect(r.snapshot?.pinned).toEqual({
       line: "RD",
       destination: "Glenmont",
+      // WP-I extends the pin shape with the destination code (used
+      // to match `/TrainPositions/TrainPositions` entries). Test
+      // fixtures use `DestinationCode: null` so it's null here.
+      destinationCode: null,
     });
   });
 
