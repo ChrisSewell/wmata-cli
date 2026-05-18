@@ -36,7 +36,7 @@
 import type { JourneyPlan } from "../storage/settings";
 import type { PathStep } from "../wmata";
 import { LINE_WIDTH, padRight, truncate } from "../ui/render";
-import { abbreviateStation, lineGlyph } from "../ui/format";
+import { abbreviateStation } from "../ui/format";
 import type {
   ReduceResult,
   Screen,
@@ -58,27 +58,56 @@ export const TICK_INTERVAL_MS = 0;
 // ---------------------------------------------------------------------------
 
 /**
- * What the fetcher resolves to. The path is either an ordered list
- * (same-line route), an empty list (cross-line, not supported),
- * or `null` (network failure / unset journey plan).
+ * What the fetcher resolves to. For a same-line journey the
+ * `legs` array carries one entry; for a transfer-composed
+ * journey two entries.
  */
 export interface JourneyFetchResult {
-  /** Resolved path, or `null` for failure / unconfigured. */
-  path: PathStep[] | null;
+  /**
+   * Resolved legs. One entry per same-line segment. An empty array
+   * means "not a routable journey" (the user picked a cross-line
+   * pair with no transfer, or one of the legs returned empty).
+   * `null` means "fetcher hasn't populated yet / network failure".
+   */
+  legs: PathStep[][] | null;
   /** Resolved origin station name for the header. */
   originName: string;
   /** Resolved destination station name for the header. */
   destinationName: string;
+  /** Resolved transfer station name; empty when no transfer. */
+  transferName: string;
+  /**
+   * Live next-train at the origin for the leg's lead line. `null`
+   * when not pinned, fetch failed, or no train matches. WP-K
+   * surfaces this as a "Next: RD 5 min" row in the body.
+   */
+  nextTrain: JourneyNextTrain | null;
+}
+
+/** Compact next-train summary for the origin's lead line. */
+export interface JourneyNextTrain {
+  /** Line code, e.g. "RD". */
+  line: string;
+  /** `Min` string from rail predictions ("5", "ARR", "BRD", etc). */
+  min: string;
+  /** Short destination name (e.g. "Glenmont"). */
+  destination: string;
 }
 
 export interface JourneySnapshot {
   /** The configured journey (or empty strings if unset). */
   plan: JourneyPlan;
-  /** Resolved origin / destination names; mirror of plan codes if unresolved. */
+  /** Resolved origin / destination / transfer names. */
   originName: string;
   destinationName: string;
-  /** Resolved path, or `null` for "not yet loaded / unconfigured / network err". */
-  path: PathStep[] | null;
+  transferName: string;
+  /**
+   * Resolved legs. One entry per same-line segment. `null` =
+   * unresolved, `[]` = not routable, populated = one or two legs.
+   */
+  legs: PathStep[][] | null;
+  /** Live next-train at origin, mirrored from the fetch result. */
+  nextTrain: JourneyNextTrain | null;
   /** Epoch-ms of the last successful resolution; 0 = never. */
   fetchedAt: number;
   /** Last fetch error string, or `null` if the most recent resolve worked. */
@@ -141,6 +170,49 @@ export function estimateTravelMinutes(path: readonly PathStep[]): number {
   return segments * MINUTES_PER_STOP;
 }
 
+/**
+ * Total travel-time estimate across all legs. Sums each leg's
+ * segment count (intermediate hops) and applies the same
+ * MINUTES_PER_STOP heuristic; adds a 2-minute transfer dwell
+ * between legs for the platform walk + waiting for the connecting
+ * train.
+ */
+export function estimateTravelMinutesForLegs(
+  legs: readonly (readonly PathStep[])[],
+): number {
+  if (legs.length === 0) return 0;
+  let total = 0;
+  for (const leg of legs) total += estimateTravelMinutes(leg);
+  // Transfer dwell between consecutive legs.
+  if (legs.length > 1) total += (legs.length - 1) * 2;
+  return total;
+}
+
+/** Total revenue-station hops across all legs (sum of `len - 1`). */
+export function stopsAcrossLegs(
+  legs: readonly (readonly PathStep[])[],
+): number {
+  let total = 0;
+  for (const leg of legs) total += Math.max(0, leg.length - 1);
+  return total;
+}
+
+/**
+ * Compact "RD" / "OR→YL" line indicator string. One leg → just
+ * the line code; two legs → "AA→BB" using the lead-circuit's
+ * `LineCode`.
+ */
+export function formatLineSummary(
+  legs: readonly (readonly PathStep[])[],
+): string {
+  const codes: string[] = [];
+  for (const leg of legs) {
+    const lc = leg[0]?.LineCode ?? "?";
+    if (codes[codes.length - 1] !== lc) codes.push(lc);
+  }
+  return codes.join("→");
+}
+
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
@@ -171,7 +243,7 @@ export function makeJourneyScreen(
       }
 
       // Unresolved (first tick still pending or fetcher failed).
-      if (snapshot.path === null) {
+      if (snapshot.legs === null) {
         if (snapshot.fetchError !== null && snapshot.fetchedAt === 0) {
           lines.push(truncate("Couldn't reach WMATA.", LINE_WIDTH));
           lines.push(truncate("Will retry shortly.", LINE_WIDTH));
@@ -183,24 +255,43 @@ export function makeJourneyScreen(
         return lines;
       }
 
-      // Cross-line route — jPath returned [].
-      if (snapshot.path.length === 0) {
-        lines.push(truncate("Not a same-line", LINE_WIDTH));
-        lines.push(truncate("route. Transfer", LINE_WIDTH));
-        lines.push(truncate("required.", LINE_WIDTH));
+      // No routable journey: either a cross-line pair without a
+      // transfer configured (legs === []), or one of the two legs
+      // returned empty (a malformed transfer code).
+      if (snapshot.legs.length === 0) {
+        lines.push(truncate("Not a routable", LINE_WIDTH));
+        lines.push(truncate("journey. Add a", LINE_WIDTH));
+        lines.push(truncate("transfer station.", LINE_WIDTH));
         lines.push(truncate("(double-tap to return)", LINE_WIDTH));
         return lines;
       }
 
-      // Happy path.
-      const lineCode = snapshot.path[0]?.LineCode ?? "";
-      const glyph = lineGlyph(lineCode);
-      const intermediates = Math.max(0, snapshot.path.length - 1);
-      lines.push(
-        truncate(`${glyph} · ${intermediates} stops`, LINE_WIDTH),
-      );
-      const minutes = estimateTravelMinutes(snapshot.path);
+      // Happy path. Summary line shows the line(s) involved + stop
+      // count. For two-leg journeys: "OR→YL · 11 stops".
+      const lineSummary = formatLineSummary(snapshot.legs);
+      const stops = stopsAcrossLegs(snapshot.legs);
+      lines.push(truncate(`${lineSummary} · ${stops} stops`, LINE_WIDTH));
+
+      // Optional "via" row for transfer journeys.
+      if (snapshot.legs.length > 1 && snapshot.transferName.length > 0) {
+        lines.push(truncate(`via ${snapshot.transferName}`, LINE_WIDTH));
+      }
+
+      const minutes = estimateTravelMinutesForLegs(snapshot.legs);
       lines.push(truncate(`Est. travel: ~${minutes} min`, LINE_WIDTH));
+
+      // Live next-train at origin.
+      if (snapshot.nextTrain !== null) {
+        const { line, min, destination } = snapshot.nextTrain;
+        const minLabel =
+          min === "ARR" || min === "BRD" || min === "" || min === "---"
+            ? min || "—"
+            : `${min} min`;
+        lines.push(
+          truncate(`Next: ${line} ${destination} ${minLabel}`, LINE_WIDTH),
+        );
+      }
+
       lines.push("");
       lines.push(truncate("(double-tap to return)", LINE_WIDTH));
       return lines;
@@ -224,10 +315,12 @@ export function makeJourneyScreen(
         const result = await fetcher();
         return {
           ...snapshot,
-          path: result.path,
+          legs: result.legs,
           originName: result.originName || snapshot.plan.origin,
           destinationName: result.destinationName || snapshot.plan.destination,
-          fetchedAt: result.path !== null ? Date.now() : snapshot.fetchedAt,
+          transferName: result.transferName || snapshot.transferName,
+          nextTrain: result.nextTrain,
+          fetchedAt: result.legs !== null ? Date.now() : snapshot.fetchedAt,
           fetchError: null,
         };
       } catch (err) {
@@ -248,7 +341,9 @@ export function makeInitialJourneySnapshot(
     plan,
     originName: plan.origin,
     destinationName: plan.destination,
-    path: null,
+    transferName: plan.transfer ?? "",
+    legs: null,
+    nextTrain: null,
     fetchedAt: 0,
     fetchError: null,
   };

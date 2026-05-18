@@ -131,15 +131,23 @@ export interface VoiceTargets {
  * Both fields empty (the default) → the Journey screen is hidden.
  *
  * Per the WMATA jPath endpoint, both stations must be on the SAME
- * line for the path lookup to return data. A cross-line journey
- * returns an empty Path array and the screen surfaces a friendly
- * "Not a same-line route" message.
+ * line for the path lookup to return data. WP-K adds an optional
+ * `transfer` station code that lets the user compose a two-leg
+ * cross-line journey (origin → transfer → destination); the screen
+ * concatenates two jPath responses.
  */
 export interface JourneyPlan {
   /** Origin station code, e.g. "C01". Empty = unset. */
   origin: string;
   /** Destination station code, e.g. "C04". Empty = unset. */
   destination: string;
+  /**
+   * Optional transfer station. When non-empty, the Journey screen
+   * fetches `origin → transfer` and `transfer → destination` and
+   * renders as a two-leg composition (`OR→YL via Lenfant`).
+   * Empty = same-line route.
+   */
+  transfer?: string;
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -429,12 +437,14 @@ function writeVoiceTargets(targets: VoiceTargets): void {
 
 function readJourneyPlan(): JourneyPlan {
   const value = parseEnvelope(safeGet(KEY_JOURNEY_PLAN));
-  if (!isRecord(value)) return { origin: "", destination: "" };
+  if (!isRecord(value)) return { origin: "", destination: "", transfer: "" };
   const origin = value["origin"];
   const destination = value["destination"];
+  const transfer = value["transfer"];
   return {
     origin: typeof origin === "string" ? origin : "",
     destination: typeof destination === "string" ? destination : "",
+    transfer: typeof transfer === "string" ? transfer : "",
   };
 }
 
@@ -522,6 +532,7 @@ export function saveJourneyPlan(plan: JourneyPlan): void {
   writeJourneyPlan({
     origin: plan.origin.trim().toUpperCase(),
     destination: plan.destination.trim().toUpperCase(),
+    transfer: (plan.transfer ?? "").trim().toUpperCase(),
   });
 }
 

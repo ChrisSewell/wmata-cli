@@ -7,10 +7,13 @@ import { initialNav, type ViewContext } from "./router";
 import {
   MINUTES_PER_STOP,
   estimateTravelMinutes,
+  estimateTravelMinutesForLegs,
   formatClock,
+  formatLineSummary,
   makeInitialJourneySnapshot,
   makeJourneyScreen,
   renderHeader,
+  stopsAcrossLegs,
   type JourneyFetchResult,
   type JourneySnapshot,
 } from "./journey";
@@ -31,10 +34,12 @@ function step(over: Partial<PathStep>): PathStep {
 
 function snap(over: Partial<JourneySnapshot> = {}): JourneySnapshot {
   return {
-    plan: { origin: "A01", destination: "A04" },
+    plan: { origin: "A01", destination: "A04", transfer: "" },
     originName: "Metro Center",
     destinationName: "Foggy Bottom-GWU",
-    path: null,
+    transferName: "",
+    legs: null,
+    nextTrain: null,
     fetchedAt: 0,
     fetchError: null,
     ...over,
@@ -42,10 +47,16 @@ function snap(over: Partial<JourneySnapshot> = {}): JourneySnapshot {
 }
 
 const noopFetcher = (): Promise<JourneyFetchResult> =>
-  Promise.resolve({ path: null, originName: "", destinationName: "" });
+  Promise.resolve({
+    legs: null,
+    originName: "",
+    destinationName: "",
+    transferName: "",
+    nextTrain: null,
+  });
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Pure helpers
 // ---------------------------------------------------------------------------
 
 describe("estimateTravelMinutes", () => {
@@ -58,6 +69,54 @@ describe("estimateTravelMinutes", () => {
   it("scales linearly with the segment count", () => {
     const path = [step({ SeqNum: 1 }), step({ SeqNum: 2 }), step({ SeqNum: 3 })];
     expect(estimateTravelMinutes(path)).toBe(2 * MINUTES_PER_STOP);
+  });
+});
+
+describe("estimateTravelMinutesForLegs", () => {
+  it("returns 0 for an empty leg list", () => {
+    expect(estimateTravelMinutesForLegs([])).toBe(0);
+  });
+
+  it("matches the single-leg estimator for one leg", () => {
+    const path = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    expect(estimateTravelMinutesForLegs([path])).toBe(MINUTES_PER_STOP);
+  });
+
+  it("adds a 2-minute transfer dwell between legs", () => {
+    const a = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    const b = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    expect(estimateTravelMinutesForLegs([a, b])).toBe(
+      2 * MINUTES_PER_STOP + 2,
+    );
+  });
+});
+
+describe("stopsAcrossLegs", () => {
+  it("returns 0 for an empty leg list", () => {
+    expect(stopsAcrossLegs([])).toBe(0);
+  });
+  it("sums intermediate hops across legs", () => {
+    const a = [step({ SeqNum: 1 }), step({ SeqNum: 2 }), step({ SeqNum: 3 })];
+    const b = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    expect(stopsAcrossLegs([a, b])).toBe(3);
+  });
+});
+
+describe("formatLineSummary", () => {
+  it("returns the single line for a one-leg journey", () => {
+    const a = [step({ LineCode: "RD" })];
+    expect(formatLineSummary([a])).toBe("RD");
+  });
+  it("joins distinct lines with `→`", () => {
+    const a = [step({ LineCode: "OR" })];
+    const b = [step({ LineCode: "YL" })];
+    expect(formatLineSummary([a, b])).toBe("OR→YL");
+  });
+  it("dedups consecutive identical line codes", () => {
+    // (Unusual but possible if the user picks a same-line transfer.)
+    const a = [step({ LineCode: "RD" })];
+    const b = [step({ LineCode: "RD" })];
+    expect(formatLineSummary([a, b])).toBe("RD");
   });
 });
 
@@ -104,27 +163,30 @@ describe("view: empty plan", () => {
   });
 });
 
-describe("view: cross-line route", () => {
-  it("surfaces the 'transfer required' message when path is empty", () => {
+describe("view: not-routable", () => {
+  it("surfaces the 'add a transfer' message when legs is empty", () => {
     const screen = makeJourneyScreen(
       noopFetcher,
-      snap({ path: [], fetchedAt: NOW }),
+      snap({ legs: [], fetchedAt: NOW }),
     );
     const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines.some((l) => l.includes("Not a same-line"))).toBe(true);
-    expect(lines.some((l) => l.includes("Transfer"))).toBe(true);
+    expect(lines.some((l) => l.includes("Not a routable"))).toBe(true);
+    expect(lines.some((l) => l.includes("transfer"))).toBe(true);
   });
 });
 
-describe("view: happy path", () => {
-  it("renders line glyph + stop count + ETA estimate", () => {
+describe("view: happy path (same line)", () => {
+  it("renders line summary + stop count + ETA estimate", () => {
     const path = [
       step({ SeqNum: 1, StationCode: "A01", LineCode: "RD" }),
       step({ SeqNum: 2, StationCode: "A02", LineCode: "RD" }),
       step({ SeqNum: 3, StationCode: "A03", LineCode: "RD" }),
       step({ SeqNum: 4, StationCode: "A04", LineCode: "RD" }),
     ];
-    const screen = makeJourneyScreen(noopFetcher, snap({ path, fetchedAt: NOW }));
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({ legs: [path], fetchedAt: NOW }),
+    );
     const lines = screen.view(screen.init(), initialNav(), CTX);
     for (const line of lines) {
       expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
@@ -132,6 +194,71 @@ describe("view: happy path", () => {
     expect(lines.some((l) => l.includes("RD"))).toBe(true);
     expect(lines.some((l) => l.includes("3 stops"))).toBe(true);
     expect(lines.some((l) => l.includes("6 min"))).toBe(true);
+  });
+});
+
+describe("view: cross-line (two legs)", () => {
+  it("renders OR→YL summary + via transfer + combined estimate", () => {
+    const leg1 = [
+      step({ SeqNum: 1, StationCode: "C01", LineCode: "OR" }),
+      step({ SeqNum: 2, StationCode: "C02", LineCode: "OR" }),
+      step({ SeqNum: 3, StationCode: "C03", LineCode: "OR" }),
+    ];
+    const leg2 = [
+      step({ SeqNum: 1, StationCode: "C03", LineCode: "YL" }),
+      step({ SeqNum: 2, StationCode: "F01", LineCode: "YL" }),
+      step({ SeqNum: 3, StationCode: "F02", LineCode: "YL" }),
+    ];
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({
+        legs: [leg1, leg2],
+        transferName: "Lenfant Plaza",
+        fetchedAt: NOW,
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    for (const line of lines) {
+      expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    }
+    expect(lines.some((l) => l.includes("OR→YL"))).toBe(true);
+    expect(lines.some((l) => l.includes("via Lenfant Plaza"))).toBe(true);
+    expect(lines.some((l) => l.includes("4 stops"))).toBe(true);
+    // 2 segs × 2 min/seg × 2 legs + 2 dwell = 10 min.
+    expect(lines.some((l) => l.includes("10 min"))).toBe(true);
+  });
+});
+
+describe("view: next-train integration", () => {
+  it("renders a 'Next:' row when nextTrain is populated", () => {
+    const path = [step({ SeqNum: 1, LineCode: "RD" })];
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({
+        legs: [path],
+        fetchedAt: NOW,
+        nextTrain: { line: "RD", min: "5", destination: "Glenmont" },
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expect(lines.some((l) => l.includes("Next: RD Glenmont 5 min"))).toBe(
+      true,
+    );
+  });
+
+  it("renders ARR/BRD sentinels without 'min' suffix", () => {
+    const path = [step({ SeqNum: 1, LineCode: "RD" })];
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({
+        legs: [path],
+        fetchedAt: NOW,
+        nextTrain: { line: "RD", min: "ARR", destination: "Glenmont" },
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expect(lines.some((l) => l.includes("ARR"))).toBe(true);
+    expect(lines.some((l) => /ARR min/.test(l))).toBe(false);
   });
 });
 
@@ -179,19 +306,26 @@ describe("reduce", () => {
 // ---------------------------------------------------------------------------
 
 describe("tick", () => {
-  it("folds a resolved path + names into the snapshot", async () => {
-    const path = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+  it("folds resolved legs + names + nextTrain into the snapshot", async () => {
+    const leg = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
     const fetcher = () =>
       Promise.resolve<JourneyFetchResult>({
-        path,
+        legs: [leg],
         originName: "Metro Center",
         destinationName: "Foggy Bottom-GWU",
+        transferName: "",
+        nextTrain: { line: "RD", min: "3", destination: "Glenmont" },
       });
     const screen = makeJourneyScreen(fetcher, snap({}));
     const next = await screen.tick(screen.init());
-    expect(next.path).toEqual(path);
+    expect(next.legs).toEqual([leg]);
     expect(next.originName).toBe("Metro Center");
     expect(next.destinationName).toBe("Foggy Bottom-GWU");
+    expect(next.nextTrain).toEqual({
+      line: "RD",
+      min: "3",
+      destination: "Glenmont",
+    });
     expect(next.fetchedAt).toBeGreaterThan(0);
   });
 
@@ -219,12 +353,22 @@ describe("makeInitialJourneySnapshot", () => {
       destination: "A04",
     });
     expect(out.plan.origin).toBe("A01");
-    expect(out.path).toBeNull();
+    expect(out.legs).toBeNull();
   });
 
   it("seeds an empty plan as 'unconfigured'", () => {
     const out = makeInitialJourneySnapshot({ origin: "", destination: "" });
     expect(out.plan.origin).toBe("");
     expect(out.plan.destination).toBe("");
+  });
+
+  it("captures the optional transfer code", () => {
+    const out = makeInitialJourneySnapshot({
+      origin: "C01",
+      destination: "F02",
+      transfer: "C03",
+    });
+    expect(out.plan.transfer).toBe("C03");
+    expect(out.transferName).toBe("C03");
   });
 });

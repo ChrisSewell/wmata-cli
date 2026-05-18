@@ -338,7 +338,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     state.favoritesCountAtLastRender = 0;
     state.schedule = [];
     state.voiceTargets = { home: '', work: '' };
-    state.journeyPlan = { origin: '', destination: '' };
+    state.journeyPlan = { origin: '', destination: '', transfer: '' };
     state.geofenceEnabled = false;
     state.reorderDismissed = false;
     state.journeyPreviewText = '';
@@ -1496,20 +1496,45 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     };
 
     const runJourneyPreview = async (): Promise<void> => {
-      const { origin, destination } = state.journeyPlan;
+      const { origin, destination, transfer } = state.journeyPlan;
+      const transferStr = (transfer ?? '').trim();
       const client = new WmataClient(state.apiKey);
       try {
-        const data = await client.get<PathResponse>(
-          buildPathUrl(origin, destination),
-        );
-        const path = data.Path ?? [];
-        if (path.length === 0) {
-          state.journeyPreviewText = 'Cross-line route — transfer required (WP-K).';
+        if (transferStr.length > 0) {
+          // Two-leg composition: preview each leg and concatenate.
+          const [leg1, leg2] = await Promise.all([
+            client.get<PathResponse>(buildPathUrl(origin, transferStr)),
+            client.get<PathResponse>(buildPathUrl(transferStr, destination)),
+          ]);
+          const p1 = leg1.Path ?? [];
+          const p2 = leg2.Path ?? [];
+          if (p1.length === 0 || p2.length === 0) {
+            state.journeyPreviewText =
+              'One leg is cross-line. Pick a different transfer.';
+          } else {
+            const line1 = p1[0]?.LineCode ?? '?';
+            const line2 = p2[0]?.LineCode ?? '?';
+            const stops =
+              Math.max(0, p1.length - 1) + Math.max(0, p2.length - 1);
+            const mins = estimateTravelMinutes(p1) +
+              estimateTravelMinutes(p2) + 2; // +2 transfer dwell
+            state.journeyPreviewText =
+              `${line1}→${line2} · ${stops} stops · ~${mins} min`;
+          }
         } else {
-          const line = path[0]?.LineCode ?? '?';
-          const stops = Math.max(0, path.length - 1);
-          const mins = estimateTravelMinutes(path);
-          state.journeyPreviewText = `${line} line · ${stops} stops · ~${mins} min`;
+          const data = await client.get<PathResponse>(
+            buildPathUrl(origin, destination),
+          );
+          const path = data.Path ?? [];
+          if (path.length === 0) {
+            state.journeyPreviewText =
+              'Cross-line route — add a transfer station above.';
+          } else {
+            const line = path[0]?.LineCode ?? '?';
+            const stops = Math.max(0, path.length - 1);
+            const mins = estimateTravelMinutes(path);
+            state.journeyPreviewText = `${line} line · ${stops} stops · ~${mins} min`;
+          }
         }
       } catch (err) {
         if (err instanceof WmataError) {
@@ -1536,18 +1561,19 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
         { class: 'wmata-settings__label', for: id },
         [label],
       );
+      const initialValue = state.journeyPlan[key] ?? '';
       const input = el('input', {
         id,
         class: 'wmata-settings__input',
         type: 'text',
         list: dataListId,
         placeholder: 'Station code',
-        value: state.journeyPlan[key],
+        value: initialValue,
         autocomplete: 'off',
         autocapitalize: 'characters',
         spellcheck: 'false',
       });
-      input.value = state.journeyPlan[key];
+      input.value = initialValue;
       input.addEventListener('change', () => {
         state.journeyPlan = {
           ...state.journeyPlan,
@@ -1559,6 +1585,9 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     };
 
     journeyMount.appendChild(makeField('Origin station', 'origin'));
+    journeyMount.appendChild(
+      makeField('Transfer station (optional)', 'transfer'),
+    );
     journeyMount.appendChild(makeField('Destination station', 'destination'));
     journeyMount.appendChild(previewRow);
 

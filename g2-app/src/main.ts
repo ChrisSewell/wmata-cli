@@ -37,6 +37,7 @@ import {
 import {
   makeInitialJourneySnapshot,
   makeJourneyScreen,
+  type JourneyNextTrain,
 } from "./screens/journey";
 import {
   bucketLastTrainsByLine,
@@ -59,6 +60,7 @@ import { parseLinesAffected } from "./wmata/incidents-cache";
 import {
   buildRailPredictionsUrl,
   type LineCode,
+  type PathStep,
   type PredictionsResponse,
   type RailIncident,
   type Station,
@@ -513,20 +515,80 @@ async function bootGlasses(): Promise<void> {
           const plan = loadSettings().journeyPlan;
           const fetcher = async () => {
             if (plan.origin.length === 0 || plan.destination.length === 0) {
-              return { path: null, originName: "", destinationName: "" };
+              return {
+                legs: null,
+                originName: "",
+                destinationName: "",
+                transferName: "",
+                nextTrain: null,
+              };
             }
-            // Resolve names + path in parallel — both come from cached
-            // session calls so this is essentially free after the
-            // first round trip.
-            const [origStation, destStation, path] = await Promise.all([
-              session.resolveStationCode(plan.origin),
-              session.resolveStationCode(plan.destination),
-              session.getPath(plan.origin, plan.destination),
-            ]);
+            const hasTransfer =
+              typeof plan.transfer === "string" && plan.transfer.length > 0;
+            const [origStation, destStation, transferStation] =
+              await Promise.all([
+                session.resolveStationCode(plan.origin),
+                session.resolveStationCode(plan.destination),
+                hasTransfer
+                  ? session.resolveStationCode(plan.transfer!)
+                  : Promise.resolve(null),
+              ]);
+
+            // Path composition.
+            let legs: PathStep[][] | null = null;
+            if (hasTransfer) {
+              const [leg1, leg2] = await Promise.all([
+                session.getPath(plan.origin, plan.transfer!),
+                session.getPath(plan.transfer!, plan.destination),
+              ]);
+              if (leg1 === null || leg2 === null) {
+                legs = null;
+              } else if (leg1.length === 0 || leg2.length === 0) {
+                // One leg is itself cross-line — the user picked a
+                // bad transfer station.
+                legs = [];
+              } else {
+                legs = [leg1, leg2];
+              }
+            } else {
+              const path = await session.getPath(plan.origin, plan.destination);
+              if (path === null) legs = null;
+              else if (path.length === 0) legs = [];
+              else legs = [path];
+            }
+
+            // Live next-train at origin (WP-K). Pull the predictions
+            // for the origin station and pick the first train whose
+            // line matches the origin leg. Best-effort: any failure
+            // here resolves to null.
+            let nextTrain: JourneyNextTrain | null = null;
+            try {
+              const data = await session.client.get<PredictionsResponse>(
+                buildRailPredictionsUrl(plan.origin),
+              );
+              const trains = data.Trains ?? [];
+              const originLine =
+                legs && legs.length > 0 ? legs[0]![0]?.LineCode : null;
+              const match = originLine
+                ? trains.find((t) => t.Line === originLine)
+                : trains[0];
+              if (match) {
+                nextTrain = {
+                  line: match.Line,
+                  min: match.Min,
+                  destination: match.Destination || match.DestinationName,
+                };
+              }
+            } catch {
+              nextTrain = null;
+            }
+
             return {
-              path,
+              legs,
               originName: origStation?.Name ?? plan.origin,
               destinationName: destStation?.Name ?? plan.destination,
+              transferName: transferStation?.Name ?? plan.transfer ?? "",
+              nextTrain,
             };
           };
           const initial = makeInitialJourneySnapshot(plan);
