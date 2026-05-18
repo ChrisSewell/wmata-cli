@@ -13,8 +13,10 @@ import { LINE_WIDTH } from "../ui/render";
 import type { FavoriteStation } from "../storage/settings";
 import { initialNav, type ViewContext } from "./router";
 import {
+  ALERTS_LABEL_PREFIX,
   VOICE_LABEL,
   makeHomeScreen,
+  renderAlertsRow,
   renderFavoriteRow,
   renderHeader,
   renderLinesSuffix,
@@ -74,9 +76,12 @@ function expectFits(lines: string[]): void {
   }
 }
 
-// A stable loader so tests don't share state.
-function loaderFor(favorites: FavoriteStation[]) {
-  return () => ({ favorites });
+// A stable loader so tests don't share state. The optional second
+// argument supplies the `incidentCount` field added in WP8 — almost
+// every test stays at `0` (no alerts) so the existing assertions about
+// row counts and indices keep their original meanings.
+function loaderFor(favorites: FavoriteStation[], incidentCount: number = 0) {
+  return () => ({ favorites, incidentCount });
 }
 
 // ---------------------------------------------------------------------------
@@ -429,5 +434,167 @@ describe("home view snapshot: 3 favorites, highlight idx 1", () => {
     expect(lines[1]!.length).toBe(LINE_WIDTH);
     expect(lines[2]!.length).toBe(LINE_WIDTH);
     expect(lines[3]!.length).toBe(LINE_WIDTH);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP8: ALERTS row (renders only when `incidentCount > 0`)
+// ---------------------------------------------------------------------------
+
+describe("renderAlertsRow", () => {
+  it("fits exactly LINE_WIDTH cols with a single-digit count and a trailing `!`", () => {
+    const out = renderAlertsRow(2, false);
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.startsWith("  " + ALERTS_LABEL_PREFIX + " (2)")).toBe(true);
+    expect(out.endsWith("!")).toBe(true);
+  });
+
+  it("renders the highlight prefix when selected", () => {
+    const out = renderAlertsRow(1, true);
+    expect(out.startsWith("> ")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+});
+
+describe("home view: ALERTS row presence", () => {
+  it("renders an ALERTS row when incidentCount > 0", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 3));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    expectFits(lines);
+    // header + 1 favorite + ALERTS + VOICE = 4 lines.
+    expect(lines.length).toBe(4);
+    const alertsLine = lines.find((l) => l.includes("ALERTS (3)"));
+    expect(alertsLine).toBeDefined();
+    expect(alertsLine!.endsWith("!")).toBe(true);
+    expect(alertsLine!.length).toBe(LINE_WIDTH);
+  });
+
+  it("omits the ALERTS row when incidentCount === 0", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    expectFits(lines);
+    expect(lines.length).toBe(3); // header + 1 favorite + voice
+    expect(lines.some((l) => l.includes("ALERTS"))).toBe(false);
+  });
+
+  it("places ALERTS directly ABOVE the VOICE LOOKUP row", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter, F.galleryPl], 2));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    // header(0) + fav(1) + fav(2) + ALERTS(3) + VOICE(4)
+    expect(lines.length).toBe(5);
+    expect(lines[3]).toContain("ALERTS (2)");
+    expect(lines[4]).toContain(VOICE_LABEL);
+  });
+
+  it("renders in the empty-favorites state too (above VOICE LOOKUP)", () => {
+    const screen = makeHomeScreen(loaderFor([], 1));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    expectFits(lines);
+    // header + 2 help lines + ALERTS + VOICE = 5
+    expect(lines.length).toBe(5);
+    expect(lines[3]).toContain("ALERTS (1)");
+    expect(lines[4]).toContain(VOICE_LABEL);
+  });
+});
+
+describe("home reduce: ALERTS row navigation", () => {
+  it("SCROLL_DOWN past the favorites lands on the ALERTS row", () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter, F.galleryPl], 2),
+    );
+    const snap = screen.init();
+    // rowCount = 2 favs + 1 alerts + 1 voice = 4. ALERTS index = 2.
+    expect(rowCount(snap)).toBe(4);
+    let nav = { highlightedIndex: 0 };
+    for (let i = 0; i < 2; i++) {
+      const r = screen.reduce(snap, nav, { type: "SCROLL_DOWN" });
+      nav = r.nav;
+    }
+    expect(nav.highlightedIndex).toBe(2);
+    // And the rendered ALERTS line carries the `> ` prefix at idx 2.
+    const lines = screen.view(snap, nav, CTX);
+    expect(lines[3]!.startsWith("> ")).toBe(true);
+    expect(lines[3]).toContain("ALERTS (2)");
+  });
+
+  it("TAP on the ALERTS row returns `{ to: 'incidents' }`", () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter, F.galleryPl], 2),
+    );
+    const snap = screen.init();
+    // ALERTS row index = 2.
+    const r = screen.reduce(snap, { highlightedIndex: 2 }, { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "incidents" });
+  });
+
+  it("VOICE row is the LAST row when ALERTS is present (TAP -> 'voice')", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 1));
+    const snap = screen.init();
+    // rowCount = 1 fav + 1 alerts + 1 voice = 3. VOICE index = 2.
+    expect(rowCount(snap)).toBe(3);
+    const r = screen.reduce(snap, { highlightedIndex: 2 }, { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "voice" });
+  });
+
+  it("VOICE row TAP still resolves to 'voice' when ALERTS is absent", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0));
+    const snap = screen.init();
+    // rowCount = 1 fav + 1 voice = 2. VOICE index = 1.
+    expect(rowCount(snap)).toBe(2);
+    const r = screen.reduce(snap, { highlightedIndex: 1 }, { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "voice" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP8: optional tick refreshes the incidentCount
+// ---------------------------------------------------------------------------
+
+describe("home tick: incident-count refresh", () => {
+  it("folds a new count into the snapshot", async () => {
+    let calls = 0;
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0), {
+      refreshIncidentCount: () => {
+        calls += 1;
+        return Promise.resolve(4);
+      },
+      tickIntervalMs: 60_000,
+    });
+    expect(screen.tickIntervalMs).toBe(60_000);
+    expect(screen.tick).toBeDefined();
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.incidentCount).toBe(4);
+    expect(calls).toBe(1);
+  });
+
+  it("swallows fetch errors and keeps the previous count", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 7), {
+      refreshIncidentCount: () => Promise.reject(new Error("boom")),
+      tickIntervalMs: 60_000,
+    });
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.incidentCount).toBe(7);
+  });
+
+  it("returns the SAME snapshot reference when the count is unchanged", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 2), {
+      refreshIncidentCount: () => Promise.resolve(2),
+      tickIntervalMs: 60_000,
+    });
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next).toBe(snap);
+  });
+
+  it("omits `tick`/`tickIntervalMs` entirely when no options are passed", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0));
+    expect(screen.tick).toBeUndefined();
+    expect(screen.tickIntervalMs).toBeUndefined();
   });
 });

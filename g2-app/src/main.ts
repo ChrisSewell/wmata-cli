@@ -21,6 +21,11 @@ import { loadSettings } from "./storage/settings";
 import { mountSettingsScreen } from "./screens/settings";
 import { mountGlassesScreen } from "./screens/glasses-host";
 import { makeHomeScreen } from "./screens/home";
+import {
+  computeUserLines,
+  makeIncidentsScreen,
+  makeInitialIncidentsSnapshot,
+} from "./screens/incidents";
 import { makePredictionsScreen } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import {
@@ -29,22 +34,39 @@ import {
   resolveStationCode,
   type PredictionsResponse,
 } from "./wmata";
+import {
+  readCachedIncidents,
+  refreshIncidents,
+} from "./wmata/incidents-cache";
 
 async function bootGlasses(): Promise<void> {
   const bridge = await waitForEvenAppBridge();
-
-  // Build the Home screen with a fresh-load snapshot factory. We
-  // call `loadSettings()` inside `init` so re-mounting the screen
-  // (e.g. after a return-from-predictions) picks up any favorite-list
-  // changes made on the phone in the interim.
-  const homeScreen = makeHomeScreen(() => ({
-    favorites: loadSettings().favorites,
-  }));
 
   // One WMATA client per glasses session — the API key only changes
   // when the user re-runs the companion settings flow, which forces a
   // full page reload anyway.
   const client = new WmataClient(loadSettings().apiKey);
+
+  // Build the Home screen with a fresh-load snapshot factory. We
+  // call `loadSettings()` inside `init` so re-mounting the screen
+  // (e.g. after a return-from-predictions) picks up any favorite-list
+  // changes made on the phone in the interim. The cached incident
+  // count is seeded from the shared cache so a re-mount doesn't blink
+  // the ALERTS row off-then-on while the first tick is in flight.
+  const homeScreen = makeHomeScreen(
+    () => ({
+      favorites: loadSettings().favorites,
+      incidentCount: readCachedIncidents().incidents.length,
+    }),
+    {
+      refreshIncidentCount: async (): Promise<number> => {
+        const userLines = computeUserLines(loadSettings().favorites);
+        const cache = await refreshIncidents(client, userLines);
+        return cache.incidents.length;
+      },
+      tickIntervalMs: 60_000,
+    },
+  );
 
   // Mutable handle to the active unmount fn so the router can swap
   // screens cleanly.
@@ -116,7 +138,26 @@ async function bootGlasses(): Promise<void> {
           return;
         }
         case "incidents": {
-          console.log(`[router] incidents screen not yet implemented in WP6`);
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          const userLines = computeUserLines(loadSettings().favorites);
+          // The fetcher always goes through the shared cache so the
+          // Home screen's ticking + the Incidents screen's ticking
+          // converge on a single source of truth.
+          const fetcher = async () => {
+            const cache = await refreshIncidents(client, userLines);
+            return {
+              incidents: cache.incidents,
+              fetchedAt: cache.fetchedAt,
+              fetchError: cache.fetchError,
+            };
+          };
+          const initial = makeInitialIncidentsSnapshot(readCachedIncidents());
+          const screen = makeIncidentsScreen(fetcher, initial);
+          router.current = "incidents";
+          unmount = await mountGlassesScreen(screen, bridge, router);
           return;
         }
         case "voice": {
