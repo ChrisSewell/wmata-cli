@@ -20,6 +20,7 @@
 
 import { waitForEvenAppBridge } from "@evenrealities/even_hub_sdk";
 
+import { recordOpen } from "./storage/history";
 import { loadSettings } from "./storage/settings";
 import { mountSettingsScreen } from "./screens/settings";
 import { mountGlassesScreen } from "./screens/glasses-host";
@@ -229,6 +230,11 @@ async function bootGlasses(): Promise<void> {
             await unmount();
             unmount = null;
           }
+          // Travel-history hook: log the station code the user just
+          // opened. The companion's "Reorder favorites?" suggestion
+          // reads this to surface popular destinations. Stays purely
+          // on-device.
+          recordOpen(intent.stationCode, Date.now());
           // Resolve a human-readable station name for the header AND the
           // station's served lines. The lines drive the incident filter
           // so the footer only surfaces alerts relevant to *this* station,

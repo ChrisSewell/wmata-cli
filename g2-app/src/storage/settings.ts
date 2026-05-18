@@ -41,6 +41,7 @@ import type {
   Weekday,
 } from "../schedule/rules";
 import { WEEKDAYS } from "../schedule/rules";
+import { clearHistory } from "./history";
 
 // ---------------------------------------------------------------------------
 // Types & constants
@@ -597,4 +598,5 @@ export function clearSettings(): void {
   safeRemove(KEY_SCHEDULE);
   safeRemove(KEY_VOICE_TARGETS);
   safeRemove(KEY_JOURNEY_PLAN);
+  clearHistory();
 }
