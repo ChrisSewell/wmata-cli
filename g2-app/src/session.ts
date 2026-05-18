@@ -30,8 +30,11 @@
 import {
   WmataClient,
   WmataError,
+  INCIDENTS_ELEVATOR,
   INCIDENTS_RAIL,
   getStations as fetchStations,
+  type ElevatorIncident,
+  type ElevatorIncidentsResponse,
   type IncidentsResponse,
   type LineCode,
   type RailIncident,
@@ -49,6 +52,21 @@ import { parseLinesAffected } from "./wmata/incidents-cache";
 export interface CachedIncidents {
   /** Incidents already filtered to lines the user cares about. */
   incidents: RailIncident[];
+  /** Epoch-ms of the last successful refresh; 0 if never. */
+  fetchedAt: number;
+  /** Last fetch error message, or `null` if the most recent refresh succeeded. */
+  fetchError: string | null;
+}
+
+/**
+ * Cached elevator/escalator-outage snapshot. Same shape as
+ * `CachedIncidents` but filtered by station code rather than line —
+ * the screen scopes outages to the user's favorite stations because
+ * a network-wide list would overflow the HUD on busy days.
+ */
+export interface CachedElevatorIncidents {
+  /** Outages already filtered to the user's favorite station codes. */
+  incidents: ElevatorIncident[];
   /** Epoch-ms of the last successful refresh; 0 if never. */
   fetchedAt: number;
   /** Last fetch error message, or `null` if the most recent refresh succeeded. */
@@ -177,6 +195,90 @@ function matchesUserLines(
 }
 
 // ---------------------------------------------------------------------------
+// ElevatorIncidentsCache (internal)
+// ---------------------------------------------------------------------------
+
+/**
+ * Elevator/escalator-outages cache, scoped to one WmataClient and
+ * filtered by station code (rather than line, like the rail-incidents
+ * cache). All failure / race / staleness semantics mirror
+ * `IncidentsCache` above:
+ *
+ *   - `refresh` never throws; a failed fetch keeps the prior list
+ *     and stamps `fetchError`.
+ *   - `fetchedAt` only advances on success.
+ *   - `read` returns a shallow copy so callers can't mutate cache
+ *     state.
+ *
+ * Network-cost note: we issue a single GET (without a `StationCode`
+ * query parameter) and filter client-side. That's cheaper than N
+ * per-station calls (one per favorite at the 60s cadence), and the
+ * unfiltered list is small in practice. If response sizes grow over
+ * time (see RISK #3 in the WP-A plan) switch to per-station calls.
+ */
+class ElevatorIncidentsCache {
+  private cache: CachedElevatorIncidents = {
+    incidents: [],
+    fetchedAt: 0,
+    fetchError: null,
+  };
+
+  constructor(private readonly client: WmataClient) {}
+
+  /** Return a shallow-copied snapshot. Safe to mutate. */
+  read(): CachedElevatorIncidents {
+    return {
+      incidents: this.cache.incidents.slice(),
+      fetchedAt: this.cache.fetchedAt,
+      fetchError: this.cache.fetchError,
+    };
+  }
+
+  /**
+   * Refresh from the WMATA API. Filters to `userStationCodes` before
+   * storing — no point caching outages at stations the user doesn't
+   * visit. Never throws; returns the post-update snapshot.
+   */
+  async refresh(
+    userStationCodes: readonly string[],
+  ): Promise<CachedElevatorIncidents> {
+    const userSet = new Set<string>(userStationCodes);
+    try {
+      const data = await this.client.get<ElevatorIncidentsResponse>(
+        INCIDENTS_ELEVATOR,
+      );
+      const all = data.ElevatorIncidents ?? [];
+      // Empty user-set means "no favorites configured yet" — nothing
+      // to filter against, so we return an empty list rather than
+      // surfacing every outage in the network (which would overflow
+      // the HUD and isn't actionable for a user with no favorites).
+      const filtered =
+        userSet.size === 0
+          ? []
+          : all.filter((inc) => userSet.has(inc.StationCode));
+      this.cache = {
+        incidents: filtered,
+        fetchedAt: Date.now(),
+        fetchError: null,
+      };
+    } catch (err) {
+      const message =
+        err instanceof WmataError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err ?? "Unknown error");
+      this.cache = {
+        incidents: this.cache.incidents,
+        fetchedAt: this.cache.fetchedAt,
+        fetchError: message,
+      };
+    }
+    return this.read();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -191,6 +293,7 @@ export class Session {
   readonly client: WmataClient;
   private readonly stationsCache: StationsCache;
   private readonly incidentsCache: IncidentsCache;
+  private readonly elevatorIncidentsCache: ElevatorIncidentsCache;
 
   /**
    * Build a Session from an API key (production path) or from a
@@ -207,6 +310,7 @@ export class Session {
         : apiKeyOrClient;
     this.stationsCache = new StationsCache(this.client);
     this.incidentsCache = new IncidentsCache(this.client);
+    this.elevatorIncidentsCache = new ElevatorIncidentsCache(this.client);
   }
 
   // -- Stations -------------------------------------------------------------
@@ -238,5 +342,22 @@ export class Session {
     userLines: readonly LineCode[],
   ): Promise<CachedIncidents> {
     return this.incidentsCache.refresh(userLines);
+  }
+
+  // -- Elevator / escalator outages -----------------------------------------
+
+  /** Synchronously read the current elevator-outages snapshot. */
+  readCachedElevatorIncidents(): CachedElevatorIncidents {
+    return this.elevatorIncidentsCache.read();
+  }
+
+  /**
+   * Refresh the elevator-outages cache (filtered to the user's
+   * favorite station codes). Never throws.
+   */
+  refreshElevatorIncidents(
+    userStationCodes: readonly string[],
+  ): Promise<CachedElevatorIncidents> {
+    return this.elevatorIncidentsCache.refresh(userStationCodes);
   }
 }

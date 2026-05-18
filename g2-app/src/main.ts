@@ -29,6 +29,10 @@ import {
   makeIncidentsScreen,
   makeInitialIncidentsSnapshot,
 } from "./screens/incidents";
+import {
+  makeElevatorScreen,
+  makeInitialElevatorSnapshot,
+} from "./screens/elevator";
 import { makePredictionsScreen } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
@@ -110,16 +114,20 @@ async function bootGlasses(): Promise<void> {
   // call `loadSettings()` inside `init` so re-mounting the screen
   // (e.g. after a return-from-predictions) picks up any favorite-list
   // changes made on the phone in the interim. The affected-lines set
-  // is seeded from the session's cache so a re-mount doesn't blink
-  // the status row off-then-on while the first tick is in flight.
+  // and the access outage count are seeded from the session caches so
+  // a re-mount doesn't blink the synthetic rows off-then-on while the
+  // first tick is in flight.
   const homeScreen = makeHomeScreen(
     () => {
       const favorites = loadSettings().favorites;
       const userLines = computeUserLines(favorites);
       const cached = session.readCachedIncidents().incidents;
+      const cachedAccess =
+        session.readCachedElevatorIncidents().incidents.length;
       return {
         favorites,
         affectedLines: computeAffectedLines(cached, userLines),
+        accessOutageCount: cachedAccess,
       };
     },
     {
@@ -127,6 +135,11 @@ async function bootGlasses(): Promise<void> {
         const userLines = computeUserLines(loadSettings().favorites);
         const cache = await session.refreshIncidents(userLines);
         return computeAffectedLines(cache.incidents, userLines);
+      },
+      refreshAccessOutageCount: async (): Promise<number> => {
+        const codes = loadSettings().favorites.map((f) => f.code);
+        const cache = await session.refreshElevatorIncidents(codes);
+        return cache.incidents.length;
       },
       tickIntervalMs: 60_000,
     },
@@ -246,6 +259,33 @@ async function bootGlasses(): Promise<void> {
           );
           const screen = makeIncidentsScreen(fetcher, initial);
           router.current = "incidents";
+          unmount = await mountGlassesScreen(screen, bridge, router);
+          return;
+        }
+        case "elevator": {
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          // Filter the elevator outages to the user's favorite station
+          // codes — a network-wide list would overflow the HUD. The
+          // session-side cache also enforces this filter, so a
+          // re-mount of the Elevator screen and a Home tick converge
+          // on the same source of truth.
+          const codes = loadSettings().favorites.map((f) => f.code);
+          const fetcher = async () => {
+            const cache = await session.refreshElevatorIncidents(codes);
+            return {
+              incidents: cache.incidents,
+              fetchedAt: cache.fetchedAt,
+              fetchError: cache.fetchError,
+            };
+          };
+          const initial = makeInitialElevatorSnapshot(
+            session.readCachedElevatorIncidents(),
+          );
+          const screen = makeElevatorScreen(fetcher, initial);
+          router.current = "elevator";
           unmount = await mountGlassesScreen(screen, bridge, router);
           return;
         }

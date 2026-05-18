@@ -79,6 +79,9 @@ const MAX_VERBATIM_LINES = 4;
 /** Label rendered for the synthetic voice-lookup row. */
 export const VOICE_LABEL = "VOICE LOOKUP";
 
+/** Label prefix rendered for the synthetic elevator/escalator row. */
+export const ACCESS_LABEL_PREFIX = "ACCESS";
+
 /**
  * Canonical order for the line-code glyph cells in the status row.
  *
@@ -120,6 +123,13 @@ export interface HomeSnapshot {
    * to worry about without opening the Incidents screen.)
    */
   affectedLines: LineCode[];
+  /**
+   * Number of active elevator/escalator outages at the user's
+   * favorite stations. 0 → hide the ACCESS row; > 0 → render a
+   * tappable `ACCESS (n)` row between the status glyph row and the
+   * favorites list (TAP → Elevator screen).
+   */
+  accessOutageCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +188,32 @@ export function renderVoiceRow(isHighlighted: boolean): string {
 }
 
 /**
+ * Build the synthetic `ACCESS (n) !` row. Same right-aligned-`!`
+ * pattern as the v1.1 ALERTS row, used here for elevator/escalator
+ * outages at favorite stations.
+ *
+ * Width contract: always exactly LINE_WIDTH cols.
+ */
+export function renderAccessRow(
+  count: number,
+  isHighlighted: boolean,
+): string {
+  const prefix = highlightPrefix(isHighlighted); // 2 cols
+  const label = `${ACCESS_LABEL_PREFIX} (${count})`;
+  const trailing = "!";
+  const spacesNeeded =
+    LINE_WIDTH - prefix.length - label.length - trailing.length;
+  if (spacesNeeded < 1) {
+    // Defensive — large outage counts shouldn't realistically crowd
+    // the trailing glyph (there are only ~100 elevators system-wide),
+    // but truncate the label rather than overflowing.
+    const safeLabel = truncate(label, LINE_WIDTH - prefix.length - 2);
+    return prefix + safeLabel + " " + trailing;
+  }
+  return prefix + label + " ".repeat(spacesNeeded) + trailing;
+}
+
+/**
  * Build the per-line status glyph row. Six fixed-width 3-col cells,
  * one per WMATA rail line in `STATUS_ROW_LINE_ORDER`, each rendered
  * as the 2-char code followed by either `!` (line has an active
@@ -228,35 +264,44 @@ export function renderHeader(favoritesCount: number): string {
  * the user follows, so the status glyph row should be rendered.
  *
  * Row position: the row sits ABOVE the favorites (the v1.1 ALERTS
- * row sat below them). Future WPs (A4 elevator) add an ACCESS peer
- * row at index 1; favorites and voice shift down accordingly.
+ * row sat below them).
  */
 export function hasAlertsRow(snapshot: HomeSnapshot): boolean {
   return snapshot.affectedLines.length > 0;
 }
 
 /**
- * The flat list of selectable rows. The synthetic rows (status,
- * voice) are part of the navigation model so SCROLL_UP/DOWN can land
- * on them.
+ * True when the snapshot has ≥ 1 elevator/escalator outage at a
+ * favorite station, so the ACCESS row should be rendered.
  *
- * Index conventions (all rows that are absent are simply skipped):
- *   - 0           (optional) status glyph row
- *   - 1..N        the favorites
- *   - N+1         the voice-lookup row
- *
- * (When the status row is absent the favorites start at 0 and the
- * voice row sits at N.)
+ * Position: just below the status glyph row (if present), above the
+ * favorites. Tappable; TAP navigates to the Elevator screen.
  */
-export function rowCount(snapshot: HomeSnapshot): number {
-  return (hasAlertsRow(snapshot) ? 1 : 0) + snapshot.favorites.length + 1;
+export function hasAccessRow(snapshot: HomeSnapshot): boolean {
+  return snapshot.accessOutageCount > 0;
 }
 
 /**
- * True if `index` points at the status glyph (alerts) synthetic row.
+ * The flat list of selectable rows. The synthetic rows (status,
+ * access, voice) are part of the navigation model so SCROLL_UP/DOWN
+ * can land on them.
  *
- * The row is at index 0 when present; absent → always false.
+ * Index conventions (rows that are absent are skipped, indices shift):
+ *   - 0?  (optional) status glyph row
+ *   - 1?  (optional) ACCESS row
+ *   - …   the favorites
+ *   - …+1 the voice-lookup row
  */
+export function rowCount(snapshot: HomeSnapshot): number {
+  return (
+    (hasAlertsRow(snapshot) ? 1 : 0) +
+    (hasAccessRow(snapshot) ? 1 : 0) +
+    snapshot.favorites.length +
+    1
+  );
+}
+
+/** True if `index` points at the status glyph (alerts) row. */
 export function isAlertsIndex(
   snapshot: HomeSnapshot,
   index: number,
@@ -265,13 +310,24 @@ export function isAlertsIndex(
   return index === 0;
 }
 
+/** True if `index` points at the ACCESS (elevator outages) row. */
+export function isAccessIndex(
+  snapshot: HomeSnapshot,
+  index: number,
+): boolean {
+  if (!hasAccessRow(snapshot)) return false;
+  return index === (hasAlertsRow(snapshot) ? 1 : 0);
+}
+
 /**
- * Index where the favorites region starts. Equals 0 when the status
- * row is hidden, 1 when present. Exported so reducers / tests can
- * translate raw indices into favorite-array indices.
+ * Index where the favorites region starts. Equals the count of
+ * preceding synthetic rows (status + access). Exported so reducers /
+ * tests can translate raw indices into favorite-array indices.
  */
 export function favoritesOffset(snapshot: HomeSnapshot): number {
-  return hasAlertsRow(snapshot) ? 1 : 0;
+  return (
+    (hasAlertsRow(snapshot) ? 1 : 0) + (hasAccessRow(snapshot) ? 1 : 0)
+  );
 }
 
 /** True if `index` points at the voice-lookup synthetic row. */
@@ -318,6 +374,14 @@ export function makeHomeScreen(
   loader: () => HomeSnapshot,
   options?: {
     refreshAffectedLines?: () => Promise<LineCode[]>;
+    /**
+     * Fetch the current count of elevator/escalator outages at the
+     * user's favorite stations. Wired in `main.ts` to the session's
+     * `refreshElevatorIncidents` cache. Best-effort: a rejection is
+     * swallowed and the last-known count is preserved (the row will
+     * simply linger rather than blinking).
+     */
+    refreshAccessOutageCount?: () => Promise<number>;
     tickIntervalMs?: number;
   },
 ): Screen<HomeSnapshot> {
@@ -338,35 +402,43 @@ export function makeHomeScreen(
       const lines: string[] = [];
       lines.push(renderHeader(clamped.favorites.length));
 
-      // Status row sits ABOVE everything else when any followed line
-      // has an active incident. The same fixture-set is used in both
-      // the empty-favorites branch and the populated branch.
       const affected = new Set<LineCode>(clamped.affectedLines);
       const showStatus = hasAlertsRow(clamped);
+      const showAccess = hasAccessRow(clamped);
 
       if (clamped.favorites.length === 0) {
         // Empty state — exactly 4 rendered lines when there are no
-        // active alerts:
+        // active alerts AND no access outages:
         //   header + "No favorites yet." + "Open phone to add." + voice
-        // When alerts are active the status row slots in above the
-        // help text, bumping the total to 5.
+        // Synthetic rows (status / access), when present, slot in
+        // ABOVE the help text. The empty-state line count is locked
+        // at 4 by the test fixtures (which use no alerts / no
+        // outages), so adding any synthetic row to a populated
+        // snapshot bumps the total visibly.
         // NOTE: empty-state branch uses the RAW highlightedIndex (not
         // the clamped value) so that an out-of-range index renders an
         // un-highlighted row. The reducer clamps separately; this
         // preserves the WP6 contract that `view` is a pure projection
         // of (snapshot, nav) without any auto-clamping side effect.
+        let cursor = 0;
         if (showStatus) {
           lines.push(
-            renderStatusGlyphRow(affected, nav.highlightedIndex === 0),
+            renderStatusGlyphRow(affected, nav.highlightedIndex === cursor),
           );
-          lines.push(truncate("No favorites yet.", LINE_WIDTH));
-          lines.push(truncate("Open phone to add.", LINE_WIDTH));
-          lines.push(renderVoiceRow(nav.highlightedIndex === 1));
-        } else {
-          lines.push(truncate("No favorites yet.", LINE_WIDTH));
-          lines.push(truncate("Open phone to add.", LINE_WIDTH));
-          lines.push(renderVoiceRow(nav.highlightedIndex === 0));
+          cursor += 1;
         }
+        if (showAccess) {
+          lines.push(
+            renderAccessRow(
+              clamped.accessOutageCount,
+              nav.highlightedIndex === cursor,
+            ),
+          );
+          cursor += 1;
+        }
+        lines.push(truncate("No favorites yet.", LINE_WIDTH));
+        lines.push(truncate("Open phone to add.", LINE_WIDTH));
+        lines.push(renderVoiceRow(nav.highlightedIndex === cursor));
         return lines;
       }
 
@@ -375,6 +447,14 @@ export function makeHomeScreen(
       const favOffset = favoritesOffset(clamped);
       if (showStatus) {
         lines.push(renderStatusGlyphRow(affected, isAlertsIndex(clamped, idx)));
+      }
+      if (showAccess) {
+        lines.push(
+          renderAccessRow(
+            clamped.accessOutageCount,
+            isAccessIndex(clamped, idx),
+          ),
+        );
       }
       for (let i = 0; i < clamped.favorites.length; i++) {
         const fav = clamped.favorites[i]!;
@@ -403,6 +483,12 @@ export function makeHomeScreen(
             return {
               nav: { highlightedIndex: idx },
               navigate: { to: "incidents" },
+            };
+          }
+          if (isAccessIndex(clamped, idx)) {
+            return {
+              nav: { highlightedIndex: idx },
+              navigate: { to: "elevator" },
             };
           }
           // Favorites occupy [favOffset, favOffset + N). Translate
@@ -434,24 +520,49 @@ export function makeHomeScreen(
     },
   };
 
-  // Optional auto-refresh of the affected-lines set. Wired via
-  // `options` (in `main.ts`) rather than reaching into the cache
-  // module directly, so the Home screen stays pure-testable: tests
-  // can omit `options` entirely and the screen never ticks.
-  if (options?.refreshAffectedLines && (options.tickIntervalMs ?? 0) > 0) {
-    const refresh = options.refreshAffectedLines;
+  // Optional auto-refresh of the synthetic rows (affected-lines set
+  // and ACCESS outage count). Wired via `options` (in `main.ts`)
+  // rather than reaching into the cache modules directly, so the Home
+  // screen stays pure-testable: tests can omit `options` entirely and
+  // the screen never ticks.
+  //
+  // Both refreshers fire in parallel on each tick so the rows update
+  // together. If either rejects the corresponding field is preserved
+  // (rather than blanked) — a transient network blip should NOT make
+  // a row disappear.
+  const refreshLines = options?.refreshAffectedLines;
+  const refreshAccess = options?.refreshAccessOutageCount;
+  if ((refreshLines || refreshAccess) && (options?.tickIntervalMs ?? 0) > 0) {
     screen.tick = async (snapshot: HomeSnapshot): Promise<HomeSnapshot> => {
-      try {
-        const next = await refresh();
-        if (sameLines(next, snapshot.affectedLines)) return snapshot;
-        return { ...snapshot, affectedLines: next };
-      } catch {
-        // Affected-lines is non-critical — swallow and keep the
-        // last-known value rather than blanking the row.
-        return snapshot;
-      }
+      const [linesResult, accessResult] = await Promise.allSettled([
+        refreshLines ? refreshLines() : Promise.resolve(snapshot.affectedLines),
+        refreshAccess
+          ? refreshAccess()
+          : Promise.resolve(snapshot.accessOutageCount),
+      ]);
+
+      const nextLines =
+        linesResult.status === "fulfilled"
+          ? linesResult.value
+          : snapshot.affectedLines;
+      const nextAccess =
+        accessResult.status === "fulfilled"
+          ? accessResult.value
+          : snapshot.accessOutageCount;
+
+      const linesUnchanged = sameLines(nextLines, snapshot.affectedLines);
+      const accessUnchanged = nextAccess === snapshot.accessOutageCount;
+      if (linesUnchanged && accessUnchanged) return snapshot;
+
+      return {
+        ...snapshot,
+        affectedLines: linesUnchanged ? snapshot.affectedLines : nextLines,
+        accessOutageCount: accessUnchanged
+          ? snapshot.accessOutageCount
+          : nextAccess,
+      };
     };
-    screen.tickIntervalMs = options.tickIntervalMs;
+    screen.tickIntervalMs = options!.tickIntervalMs;
   }
 
   return screen;

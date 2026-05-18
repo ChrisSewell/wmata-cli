@@ -14,13 +14,17 @@ import type { FavoriteStation } from "../storage/settings";
 import type { LineCode } from "../wmata";
 import { initialNav, type ViewContext } from "./router";
 import {
+  ACCESS_LABEL_PREFIX,
   STATUS_ROW_LINE_ORDER,
   VOICE_LABEL,
   favoritesOffset,
+  hasAccessRow,
   hasAlertsRow,
+  isAccessIndex,
   isAlertsIndex,
   isVoiceIndex,
   makeHomeScreen,
+  renderAccessRow,
   renderFavoriteRow,
   renderHeader,
   renderLinesSuffix,
@@ -82,16 +86,17 @@ function expectFits(lines: string[]): void {
 }
 
 // A stable loader so tests don't share state. The optional second
-// argument supplies the `affectedLines` field — almost every test
-// passes `[]` (no alerts) so the existing assertions about row
-// counts and indices keep their original meanings. A non-empty
-// array surfaces the status glyph row at index 0 and shifts every
-// other row by 1.
+// argument supplies the `affectedLines` field; the optional third
+// supplies `accessOutageCount`. Most tests use the empty defaults so
+// the row count assertions keep their original meanings. A non-empty
+// `affectedLines` surfaces the status glyph row; a positive
+// `accessOutageCount` adds the ACCESS row just beneath it.
 function loaderFor(
   favorites: FavoriteStation[],
   affectedLines: LineCode[] = [],
+  accessOutageCount: number = 0,
 ) {
-  return () => ({ favorites, affectedLines });
+  return () => ({ favorites, affectedLines, accessOutageCount });
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +612,90 @@ describe("home reduce: status row navigation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// ACCESS row (elevator/escalator outages at favorite stations)
+// ---------------------------------------------------------------------------
+
+describe("renderAccessRow", () => {
+  it("fits exactly LINE_WIDTH cols with the trailing `!`", () => {
+    const out = renderAccessRow(2, false);
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.startsWith("  " + ACCESS_LABEL_PREFIX + " (2)")).toBe(true);
+    expect(out.endsWith("!")).toBe(true);
+  });
+
+  it("renders the highlight prefix when selected", () => {
+    const out = renderAccessRow(1, true);
+    expect(out.startsWith("> ")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+});
+
+describe("home view: ACCESS row placement", () => {
+  it("renders the ACCESS row between the status row and the favorites", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], ["RD"], 2));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    // header(0) + status(1) + access(2) + fav(3) + voice(4)
+    expect(lines.length).toBe(5);
+    expect(lines[1]).toContain("RD!");
+    expect(lines[2]).toContain("ACCESS (2)");
+    expect(lines[3]).toContain("Metro Ctr");
+    expect(lines[4]).toContain(VOICE_LABEL);
+  });
+
+  it("renders the ACCESS row at the top when there is no status row", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 1));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    // header(0) + access(1) + fav(2) + voice(3)
+    expect(lines.length).toBe(4);
+    expect(lines[1]).toContain("ACCESS (1)");
+    expect(lines[2]).toContain("Metro Ctr");
+    expect(lines[3]).toContain(VOICE_LABEL);
+  });
+
+  it("omits the ACCESS row when accessOutageCount is 0", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 0));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    expect(lines.length).toBe(3); // header + fav + voice
+    expect(lines.some((l) => l.includes("ACCESS"))).toBe(false);
+  });
+});
+
+describe("home reduce: ACCESS row navigation", () => {
+  it("TAP on the ACCESS row returns `{ to: 'elevator' }`", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], ["RD"], 2));
+    const snap = screen.init();
+    // rowCount = status(1) + access(1) + 1 fav + voice = 4. ACCESS = 1.
+    expect(rowCount(snap)).toBe(4);
+    expect(hasAccessRow(snap)).toBe(true);
+    expect(isAccessIndex(snap, 1)).toBe(true);
+    const r = screen.reduce(snap, { highlightedIndex: 1 }, { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "elevator" });
+  });
+
+  it("ACCESS sits at idx 0 when the status row is hidden", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 3));
+    const snap = screen.init();
+    expect(isAccessIndex(snap, 0)).toBe(true);
+    const r = screen.reduce(snap, { highlightedIndex: 0 }, { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "elevator" });
+  });
+
+  it("Favorites index offset is 2 when both synthetic rows are present", () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter, F.galleryPl], ["RD"], 1),
+    );
+    const snap = screen.init();
+    expect(favoritesOffset(snap)).toBe(2);
+    // idx=2 lands on metroCenter (first favorite).
+    const r = screen.reduce(snap, { highlightedIndex: 2 }, { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "predictions", stationCode: "A01" });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Optional tick: refreshes the affected-lines set
 // ---------------------------------------------------------------------------
 
@@ -655,5 +744,56 @@ describe("home tick: affected-lines refresh", () => {
     const screen = makeHomeScreen(loaderFor([F.metroCenter], []));
     expect(screen.tick).toBeUndefined();
     expect(screen.tickIntervalMs).toBeUndefined();
+  });
+
+  it("refreshes BOTH affectedLines AND accessOutageCount in one tick", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 0), {
+      refreshAffectedLines: () => Promise.resolve(["RD"] as LineCode[]),
+      refreshAccessOutageCount: () => Promise.resolve(2),
+      tickIntervalMs: 60_000,
+    });
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.affectedLines).toEqual(["RD"]);
+    expect(next.accessOutageCount).toBe(2);
+  });
+
+  it("preserves the previous accessOutageCount when its refresher rejects", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 5), {
+      refreshAffectedLines: () => Promise.resolve(["RD"] as LineCode[]),
+      refreshAccessOutageCount: () => Promise.reject(new Error("boom")),
+      tickIntervalMs: 60_000,
+    });
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.affectedLines).toEqual(["RD"]);
+    // The previous value survives the rejection — the row doesn't blink.
+    expect(next.accessOutageCount).toBe(5);
+  });
+
+  it("preserves the previous affectedLines when ITS refresher rejects", async () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter], ["BL"], 0),
+      {
+        refreshAffectedLines: () => Promise.reject(new Error("boom")),
+        refreshAccessOutageCount: () => Promise.resolve(1),
+        tickIntervalMs: 60_000,
+      },
+    );
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.affectedLines).toEqual(["BL"]);
+    expect(next.accessOutageCount).toBe(1);
+  });
+
+  it("registers tick when ONLY refreshAccessOutageCount is supplied", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 0), {
+      refreshAccessOutageCount: () => Promise.resolve(3),
+      tickIntervalMs: 60_000,
+    });
+    expect(screen.tick).toBeDefined();
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.accessOutageCount).toBe(3);
   });
 });

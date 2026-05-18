@@ -11,6 +11,9 @@ export const VALIDATE = `${BASE}/Misc/Validate`;
 // Rail Incidents
 export const INCIDENTS_RAIL = `${BASE}/Incidents.svc/json/Incidents`;
 
+// Elevator / Escalator Incidents
+export const INCIDENTS_ELEVATOR = `${BASE}/Incidents.svc/json/ElevatorIncidents`;
+
 // Rail Station Information
 export const RAIL_STATIONS = `${BASE}/Rail.svc/json/jStations`;
 export const RAIL_STATION_INFO = `${BASE}/Rail.svc/json/jStationInfo`;
