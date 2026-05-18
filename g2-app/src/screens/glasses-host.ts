@@ -186,13 +186,13 @@ export async function mountGlassesScreen<S>(
   bridge: EvenAppBridge,
   router: Router,
 ): Promise<() => Promise<void>> {
-  // The snapshot is built once at mount time. Live data refresh
-  // (e.g. predictions polling) is the responsibility of a future
-  // wrapper that would call `render()` after mutating the snapshot —
-  // WP6 has no live refresh, so `const` is honest here.
-  const snapshot = screen.init();
+  // The snapshot starts at `screen.init()` and is mutated in-place by
+  // tick refreshes (e.g. predictions polling). Reducers receive the
+  // current snapshot by reference and never mutate it themselves.
+  let snapshot = screen.init();
   let nav: NavState = initialNav();
   let active = true;
+  let tickTimer: ReturnType<typeof setInterval> | null = null;
 
   // Render-loop guard: ignore events that arrive after unmount.
   const render = async (): Promise<void> => {
@@ -225,6 +225,32 @@ export async function mountGlassesScreen<S>(
     console.warn(`[glasses-host] createStartUpPageContainer threw:`, err);
   }
 
+  // Run one tick (fetch + re-render). Defensive try/catch: a screen's
+  // `tick` is contracted not to throw, but we treat the contract as
+  // best-effort so a buggy screen can't take down the page.
+  const runTick = async (): Promise<void> => {
+    if (!active || !screen.tick) return;
+    try {
+      const next = await screen.tick(snapshot);
+      if (!active) return;
+      snapshot = next;
+      await render();
+    } catch (err) {
+      console.warn(`[glasses-host] tick threw:`, err);
+    }
+  };
+
+  // Wire up auto-refresh if the screen opted in. We deliberately fire
+  // the first tick AFTER the initial mount-render, so the user sees
+  // whatever the snapshot's `init()` produced (e.g. "Loading…") rather
+  // than a blank container during the network round-trip.
+  if (screen.tick && screen.tickIntervalMs && screen.tickIntervalMs > 0) {
+    void runTick();
+    tickTimer = setInterval(() => {
+      void runTick();
+    }, screen.tickIntervalMs);
+  }
+
   const unsubscribe = bridge.onEvenHubEvent((event: EvenHubEvent) => {
     if (!active) return;
 
@@ -255,6 +281,10 @@ export async function mountGlassesScreen<S>(
   const unmount = async (): Promise<void> => {
     if (!active) return;
     active = false;
+    if (tickTimer !== null) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
     try {
       unsubscribe();
     } catch (err) {

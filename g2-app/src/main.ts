@@ -21,23 +21,33 @@ import { loadSettings } from "./storage/settings";
 import { mountSettingsScreen } from "./screens/settings";
 import { mountGlassesScreen } from "./screens/glasses-host";
 import { makeHomeScreen } from "./screens/home";
+import { makePredictionsScreen } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
+import {
+  WmataClient,
+  buildRailPredictionsUrl,
+  resolveStationCode,
+  type PredictionsResponse,
+} from "./wmata";
 
 async function bootGlasses(): Promise<void> {
   const bridge = await waitForEvenAppBridge();
 
   // Build the Home screen with a fresh-load snapshot factory. We
   // call `loadSettings()` inside `init` so re-mounting the screen
-  // (e.g. after a hypothetical return-from-predictions) picks up
-  // any favorite-list changes made on the phone in the interim.
+  // (e.g. after a return-from-predictions) picks up any favorite-list
+  // changes made on the phone in the interim.
   const homeScreen = makeHomeScreen(() => ({
     favorites: loadSettings().favorites,
   }));
 
+  // One WMATA client per glasses session — the API key only changes
+  // when the user re-runs the companion settings flow, which forces a
+  // full page reload anyway.
+  const client = new WmataClient(loadSettings().apiKey);
+
   // Mutable handle to the active unmount fn so the router can swap
-  // screens cleanly. WP6 only ever has one screen mounted (Home),
-  // but the indirection lets WP7+ slot in new mounts without
-  // touching this file.
+  // screens cleanly.
   let unmount: (() => Promise<void>) | null = null;
 
   const router: Router = {
@@ -64,9 +74,46 @@ async function bootGlasses(): Promise<void> {
           return;
         }
         case "predictions": {
-          console.log(
-            `[router] predictions screen not yet implemented in WP6 (stationCode=${intent.stationCode})`,
-          );
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          // Resolve a human-readable station name for the header. If the
+          // station-cache lookup fails (network error, unknown code) we
+          // fall back to the raw code so the screen still mounts.
+          let stationName = intent.stationCode;
+          try {
+            const station = await resolveStationCode(client, intent.stationCode);
+            if (station) stationName = station.Name;
+          } catch (err) {
+            console.warn(
+              `[router] resolveStationCode(${intent.stationCode}) failed:`,
+              err,
+            );
+          }
+
+          const fetcher = async () => {
+            const url = buildRailPredictionsUrl(intent.stationCode);
+            const data = await client.get<PredictionsResponse>(url);
+            return {
+              trains: data.Trains ?? [],
+              // WP8 will wire real incidents into the footer; for WP7
+              // the predictions screen ships with an inert headline.
+              incidentHeadline: null,
+            };
+          };
+
+          const screen = makePredictionsScreen(fetcher, {
+            stationCode: intent.stationCode,
+            stationName,
+            trains: [],
+            fetchedAt: 0,
+            fetchError: null,
+            incidentHeadline: null,
+            nowMs: Date.now(),
+          });
+          router.current = "predictions";
+          unmount = await mountGlassesScreen(screen, bridge, router);
           return;
         }
         case "incidents": {

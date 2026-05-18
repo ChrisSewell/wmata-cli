@@ -63,6 +63,13 @@ export interface ReduceResult {
  * The contract each screen implements. `Snapshot` is screen-specific
  * data (favorites for Home, predictions for the Predictions screen, etc.)
  * and stays opaque to the router.
+ *
+ * Optional `tick` / `tickIntervalMs` hooks let a screen request periodic
+ * background refreshes (e.g. WP7 Predictions polls WMATA every 20s).
+ * The host calls `tick(currentSnapshot)` once on mount and then on a
+ * `setInterval(tickIntervalMs)` cadence, replacing the live snapshot
+ * with the returned value and re-rendering. A screen that omits both
+ * hooks (Home in WP6) never gets ticked.
  */
 export interface Screen<Snapshot> {
   /** Stable identifier for logging / debugging. */
@@ -73,6 +80,19 @@ export interface Screen<Snapshot> {
   view(snapshot: Snapshot, nav: NavState): string[];
   /** Pure reducer over (snapshot, nav, event). */
   reduce(snapshot: Snapshot, nav: NavState, event: ScreenEvent): ReduceResult;
+  /**
+   * Optional: called by the host on mount and then on the
+   * `tickIntervalMs` cadence. Must NOT throw — fetch errors should be
+   * encoded into the returned snapshot. Returning the same snapshot
+   * unchanged is fine and triggers a (cheap) re-render.
+   */
+  tick?: (snapshot: Snapshot) => Promise<Snapshot>;
+  /**
+   * Optional: refresh cadence in milliseconds. If both `tick` and
+   * `tickIntervalMs > 0` are provided, the host auto-ticks; otherwise
+   * the screen is render-once.
+   */
+  tickIntervalMs?: number;
 }
 
 /**
