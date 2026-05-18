@@ -1,22 +1,26 @@
-// Unit tests for the lazy station cache.
+// Unit tests for the bare HTTP wrappers in stations.ts.
+//
+// History: in v1.0 this module owned a module-scoped cache. That cache
+// has been lifted into `Session` (see `src/session.test.ts` for the
+// cached-behaviour tests). The functions here are now stateless typed
+// wrappers around `WmataClient.get` — every call must hit the network.
 //
 // Acceptance surface (mirrors stations.ts):
-//   - `getStations` populates the module-level cache on first call.
-//   - Subsequent calls return the cached array without re-hitting the
-//     network.
-//   - `clearStationCache` forces a refetch.
-//   - `searchStations` is a case-insensitive substring match on `Name`.
-//   - `resolveStationCode` is case-insensitive + whitespace-trimming.
-//   - Both helpers transparently warm the same shared cache.
+//   - `getStations` always hits the network and returns the response's
+//     `Stations` array (or `[]` if the field is missing).
+//   - `searchStations` is a case-insensitive substring match on `Name`
+//     and always hits the network.
+//   - `resolveStationCode` is case-insensitive + whitespace-trimming on
+//     input and always hits the network.
 //
 // We stub the `WmataClient` via the same `Pick<WmataClient, 'get'>` cast
-// used in `incidents-cache.test.ts` so we never make a real network call.
+// pattern used in `incidents-cache.test.ts` so we never make a real
+// network call.
 
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { WmataClient } from "./client";
 import type { Station, StationsResponse } from "./types";
 import {
-  clearStationCache,
   getStations,
   resolveStationCode,
   searchStations,
@@ -90,17 +94,12 @@ function stubClient(opts: {
   return { get } as unknown as WmataClient;
 }
 
-afterEach(() => {
-  // Always reset the module-level cache so per-test setups don't bleed.
-  clearStationCache();
-});
-
 // ---------------------------------------------------------------------------
 // getStations
 // ---------------------------------------------------------------------------
 
 describe("getStations", () => {
-  it("first call hits the network and returns the response Stations array", async () => {
+  it("returns the response's Stations array", async () => {
     const counter = { calls: 0 };
     const client = stubClient({ counter });
     const result = await getStations(client);
@@ -113,24 +112,13 @@ describe("getStations", () => {
     ]);
   });
 
-  it("second call returns the cached array (network call count stays at 1)", async () => {
-    const counter = { calls: 0 };
-    const client = stubClient({ counter });
-    const a = await getStations(client);
-    const b = await getStations(client);
-    expect(counter.calls).toBe(1);
-    // Same reference — the cache returns the same array.
-    expect(a).toBe(b);
-  });
-
-  it("clearStationCache forces a refetch on the next call", async () => {
+  it("always hits the network (no caching at this layer)", async () => {
     const counter = { calls: 0 };
     const client = stubClient({ counter });
     await getStations(client);
-    expect(counter.calls).toBe(1);
-    clearStationCache();
     await getStations(client);
-    expect(counter.calls).toBe(2);
+    await getStations(client);
+    expect(counter.calls).toBe(3);
   });
 
   it("returns [] (defensive) when the response has no `Stations` field", async () => {
@@ -181,6 +169,14 @@ describe("searchStations", () => {
       "C02",
     ]);
   });
+
+  it("always hits the network (no caching at this layer)", async () => {
+    const counter = { calls: 0 };
+    const client = stubClient({ counter });
+    await searchStations(client, "metro");
+    await searchStations(client, "metro");
+    expect(counter.calls).toBe(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -216,28 +212,12 @@ describe("resolveStationCode", () => {
     const result = await resolveStationCode(client, "ZZZ");
     expect(result).toBeNull();
   });
-});
 
-// ---------------------------------------------------------------------------
-// Cache sharing across helpers
-// ---------------------------------------------------------------------------
-
-describe("cache sharing across helpers", () => {
-  it("searchStations warms the cache so a subsequent getStations doesn't refetch", async () => {
-    const counter = { calls: 0 };
-    const client = stubClient({ counter });
-    await searchStations(client, "metro");
-    expect(counter.calls).toBe(1);
-    await getStations(client);
-    expect(counter.calls).toBe(1);
-  });
-
-  it("resolveStationCode warms the cache so a subsequent getStations doesn't refetch", async () => {
+  it("always hits the network (no caching at this layer)", async () => {
     const counter = { calls: 0 };
     const client = stubClient({ counter });
     await resolveStationCode(client, "A01");
-    expect(counter.calls).toBe(1);
-    await getStations(client);
-    expect(counter.calls).toBe(1);
+    await resolveStationCode(client, "A01");
+    expect(counter.calls).toBe(2);
   });
 });

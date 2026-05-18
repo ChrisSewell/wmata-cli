@@ -1,40 +1,31 @@
-// Process-wide rail-incidents cache.
+// Wire-format parsers for the WMATA rail-incidents endpoint.
 //
-// Why a shared cache?
+// History: v1.0 owned a module-scoped cache of filtered incidents
+// (`_cache`). That has been lifted into a per-session cache on the
+// `Session` class (see `src/session.ts`), so the lifetime of cached data
+// is the lifetime of the API key. This module now only owns the pure
+// parsing helper and the `CachedIncidents` shape — both stateless.
 //
-//   Two screens need this data at different cadences:
-//     - Home renders only an "ALERTS (n)" count and ticks every 60s.
-//     - The Incidents screen renders the full list and ticks every 60s.
-//   Without a shared cache, both would call `INCIDENTS_RAIL` on their
-//   own intervals, doubling the network load and the WMATA rate budget
-//   for what is, conceptually, a single fact about the world ("what
-//   alerts are active right now").
-//
-//   Module-level state mirrors `stations.ts` exactly — same pattern, same
-//   reasoning, same `clear*()` reset hook for tests.
-//
-// Failure semantics:
-//
-//   `refreshIncidents` NEVER throws. A failed fetch leaves the prior
-//   `incidents` list intact (so a transient network blip doesn't blank
-//   the screen) and stamps `fetchError` with a human-readable message.
-//   `fetchedAt` is only advanced on success. This is identical to the
-//   policy on the Predictions screen.
-//
-// Race / staleness behaviour:
-//
-//   Two concurrent `refreshIncidents` calls (e.g. Home fires its 60s
-//   tick at T while the Incidents screen fires at T+epsilon) will both
-//   start a fetch and the LAST one to resolve wins. We accept that:
-//   the only loss is "freshest wins", which is exactly what we want
-//   for a list-of-current-alerts surface where the data is identical
-//   between callers. There is no per-caller filter difference, because
-//   we filter against `userLines` AFTER the fetch — and `userLines`
-//   is loaded from the same `loadSettings()` source in both callers,
-//   so they always agree.
+// The file name is kept (`incidents-cache.ts`) rather than renamed to
+// `incidents.ts` to minimize churn on importers. The actual cache lives
+// in `session.ts`.
 
-import { INCIDENTS_RAIL, WmataError, type LineCode } from "./index";
-import type { WmataClient, RailIncident, IncidentsResponse } from "./index";
+import { type LineCode } from "./index";
+import type { RailIncident } from "./index";
+
+/**
+ * Shape of the cached value held inside `Session`.
+ *
+ * Always a plain object, never `null`.
+ */
+export interface CachedIncidents {
+  /** Incidents already filtered to lines the user cares about. */
+  incidents: RailIncident[];
+  /** Epoch-ms of the last successful refresh; 0 if never. */
+  fetchedAt: number;
+  /** Last fetch error message, or `null` if the most recent refresh succeeded. */
+  fetchError: string | null;
+}
 
 /** The set of valid line codes used to drop unknown codes during parsing. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -45,39 +36,6 @@ const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
   "GR",
   "SV",
 ]);
-
-/** Shape of the cached value. Always a plain object, never `null`. */
-export interface CachedIncidents {
-  /** Incidents already filtered to lines the user cares about. */
-  incidents: RailIncident[];
-  /** Epoch-ms of the last successful refresh; 0 if never. */
-  fetchedAt: number;
-  /** Last fetch error message, or `null` if the most recent refresh succeeded. */
-  fetchError: string | null;
-}
-
-/** Module-private cache. Survives across calls until `clearIncidentsCache`. */
-let _cache: CachedIncidents = {
-  incidents: [],
-  fetchedAt: 0,
-  fetchError: null,
-};
-
-/**
- * Read the current cache snapshot synchronously.
- *
- * Returns a shallow copy so callers can't mutate the module's state by
- * accident (e.g. by sorting the incidents array in place). This keeps
- * the cache referentially stable from the screen's point of view —
- * every render reads a fresh, immutable view.
- */
-export function readCachedIncidents(): CachedIncidents {
-  return {
-    incidents: _cache.incidents.slice(),
-    fetchedAt: _cache.fetchedAt,
-    fetchError: _cache.fetchError,
-  };
-}
 
 /**
  * Parse the wire format of `LinesAffected` into a deduped `LineCode[]`.
@@ -125,75 +83,4 @@ export function parseLinesAffected(s: string): LineCode[] {
     out.push(code as LineCode);
   }
   return out;
-}
-
-/**
- * True if an incident shares ≥1 affected line with `userLines`.
- *
- * Exported only for symmetry with the parsing helper; the cache uses
- * this internally inside `refreshIncidents`.
- */
-function matchesUserLines(
-  incident: RailIncident,
-  userLines: ReadonlySet<LineCode>,
-): boolean {
-  if (userLines.size === 0) return false;
-  const lines = parseLinesAffected(incident.LinesAffected);
-  for (const code of lines) {
-    if (userLines.has(code)) return true;
-  }
-  return false;
-}
-
-/**
- * Refresh the cache from the WMATA API. Filters to the user's lines
- * before storing — there's no point caching incidents on lines the user
- * doesn't ride.
- *
- * Never throws. On failure the prior `incidents` list is preserved
- * (don't blank the HUD over a transient network blip) and `fetchError`
- * is populated. `fetchedAt` only advances on success.
- *
- * Returns the new cache value.
- */
-export async function refreshIncidents(
-  client: WmataClient,
-  userLines: readonly LineCode[],
-): Promise<CachedIncidents> {
-  const userSet = new Set<LineCode>(userLines);
-  try {
-    const data = await client.get<IncidentsResponse>(INCIDENTS_RAIL);
-    const all = data.Incidents ?? [];
-    const filtered = all.filter((inc) => matchesUserLines(inc, userSet));
-    _cache = {
-      incidents: filtered,
-      fetchedAt: Date.now(),
-      fetchError: null,
-    };
-  } catch (err) {
-    const message =
-      err instanceof WmataError
-        ? err.message
-        : err instanceof Error
-          ? err.message
-          : String(err ?? "Unknown error");
-    // Preserve the prior incidents list so the screen doesn't blank on
-    // a transient failure. fetchedAt is left unchanged — it represents
-    // the LAST SUCCESSFUL fetch, not the last attempt.
-    _cache = {
-      incidents: _cache.incidents,
-      fetchedAt: _cache.fetchedAt,
-      fetchError: message,
-    };
-  }
-  return readCachedIncidents();
-}
-
-/** Wipe the cache. Tests / reset flows only. */
-export function clearIncidentsCache(): void {
-  _cache = {
-    incidents: [],
-    fetchedAt: 0,
-    fetchError: null,
-  };
 }

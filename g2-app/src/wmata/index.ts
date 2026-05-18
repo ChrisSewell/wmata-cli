@@ -11,7 +11,6 @@ export {
   getStations,
   searchStations,
   resolveStationCode,
-  clearStationCache,
 } from "./stations";
 
 export {
