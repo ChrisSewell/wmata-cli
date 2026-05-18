@@ -9,7 +9,9 @@
 //     through `resolving` and into `matches` / `noMatch` based on
 //     `searchFn` results.
 //   - Unique match → reducer emits `{ to: 'predictions', stationCode }`.
-//   - Multiple matches → TAP cycles `matchIndex` modulo `matches.length`.
+//   - Multiple matches → SCROLL_UP / SCROLL_DOWN cycle `matchIndex` modulo
+//     `matches.length`; TAP confirms the highlighted match and emits
+//     `{ to: 'predictions', stationCode }`.
 //   - `noMatch` → TAP returns to `listening` with a cleared transcript.
 //   - `error` → DOUBLE_TAP returns to Home.
 //   - DOUBLE_TAP from every phase navigates to `{ to: 'home' }`.
@@ -251,7 +253,7 @@ describe("voice reduce: unique match → predictions", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Three matches → renders 3 rows; TAP cycles matchIndex
+// Three matches → renders 3 rows; SCROLL cycles, TAP confirms
 // ---------------------------------------------------------------------------
 
 describe("voice view + reduce: three matches", () => {
@@ -297,7 +299,7 @@ describe("voice view + reduce: three matches", () => {
     expect(lines[5]).toContain("McPherson");
   });
 
-  it("TAP cycles matchIndex (0 → 1 → 2 → 0)", () => {
+  it("SCROLL_DOWN cycles matchIndex forward (0 → 1 → 2 → 0)", () => {
     const { screen } = makeRig(emptySearch, {
       phase: "matches",
       matches: THREE,
@@ -305,16 +307,62 @@ describe("voice view + reduce: three matches", () => {
     });
     let snap: VoiceSnapshot = screen.init();
     for (const expected of [1, 2, 0]) {
-      const r = screen.reduce(snap, initialNav(), { type: "TAP" });
+      const r = screen.reduce(snap, initialNav(), { type: "SCROLL_DOWN" });
       expect(r.snapshot).toBeDefined();
       expect(r.snapshot!.matchIndex).toBe(expected);
       snap = r.snapshot!;
     }
   });
+
+  it("SCROLL_UP cycles matchIndex in reverse (0 → 2 → 1 → 0)", () => {
+    const { screen } = makeRig(emptySearch, {
+      phase: "matches",
+      matches: THREE,
+      matchIndex: 0,
+    });
+    let snap: VoiceSnapshot = screen.init();
+    for (const expected of [2, 1, 0]) {
+      const r = screen.reduce(snap, initialNav(), { type: "SCROLL_UP" });
+      expect(r.snapshot).toBeDefined();
+      expect(r.snapshot!.matchIndex).toBe(expected);
+      snap = r.snapshot!;
+    }
+  });
+
+  it("TAP on the highlighted match emits { to: 'predictions', stationCode } for THAT match", () => {
+    // Highlight idx 1 (Mt Vernon Sq, Code F03) and confirm TAP picks it.
+    const { screen } = makeRig(emptySearch, {
+      phase: "matches",
+      matches: THREE,
+      matchIndex: 1,
+    });
+    const r = screen.reduce(screen.init(), initialNav(), { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "predictions", stationCode: "F03" });
+  });
+
+  it("TAP on idx 0 emits the first match's stationCode", () => {
+    const { screen } = makeRig(emptySearch, {
+      phase: "matches",
+      matches: THREE,
+      matchIndex: 0,
+    });
+    const r = screen.reduce(screen.init(), initialNav(), { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "predictions", stationCode: "A01" });
+  });
+
+  it("TAP on idx 2 emits the third match's stationCode", () => {
+    const { screen } = makeRig(emptySearch, {
+      phase: "matches",
+      matches: THREE,
+      matchIndex: 2,
+    });
+    const r = screen.reduce(screen.init(), initialNav(), { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "predictions", stationCode: "C02" });
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Two matches: TAP confirms when matches.length === 1 (post-cycle edge case)
+// Edge case: TAP on a single-match list still confirms
 // ---------------------------------------------------------------------------
 
 describe("voice reduce: matches phase edge cases", () => {
@@ -527,7 +575,7 @@ describe("voice view snapshot: 3 matches at highlight idx 0", () => {
       renderMatchRow(THREE[1]!, false),
       renderMatchRow(THREE[2]!, false),
       "",
-      "(tap=cycle, dbl=back)",
+      "(scroll=pick, tap=ok)",
     ]);
     expect(lines[0]!.length).toBe(LINE_WIDTH);
     expect(lines[3]!.length).toBe(LINE_WIDTH);
@@ -604,17 +652,31 @@ describe("voice reduce: RESOLVE_RESULT branches", () => {
 });
 
 // ---------------------------------------------------------------------------
-// SCROLL events: no-ops in every phase
+// SCROLL events: no-ops outside the `matches` phase (cycle only there)
 // ---------------------------------------------------------------------------
 
-describe("voice reduce: SCROLL events are no-ops", () => {
-  it("SCROLL_UP / SCROLL_DOWN do not navigate or mutate", () => {
+describe("voice reduce: SCROLL events are no-ops outside `matches`", () => {
+  const otherPhases: VoiceSnapshot["phase"][] = [
+    "listening",
+    "resolving",
+    "noMatch",
+    "error",
+  ];
+  for (const phase of otherPhases) {
+    it(`SCROLL_UP / SCROLL_DOWN are no-ops in phase=${phase}`, () => {
+      const { screen } = makeRig(emptySearch, { phase });
+      for (const t of ["SCROLL_UP", "SCROLL_DOWN"] as const) {
+        const r = screen.reduce(screen.init(), initialNav(), { type: t });
+        expect(r.navigate).toBeUndefined();
+        expect(r.snapshot).toBeUndefined();
+      }
+    });
+  }
+
+  it("SCROLL is also a no-op in `matches` with a single match (nothing to cycle)", () => {
     const { screen } = makeRig(emptySearch, {
       phase: "matches",
-      matches: [
-        station({ Code: "A01", Name: "Metro Center" }),
-        station({ Code: "B01", Name: "Gallery Pl-Chinatown" }),
-      ],
+      matches: [station({ Code: "A01", Name: "Metro Center" })],
       matchIndex: 0,
     });
     for (const t of ["SCROLL_UP", "SCROLL_DOWN"] as const) {

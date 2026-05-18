@@ -10,10 +10,13 @@
 //   - otherwise                         ->  glasses Home screen via
 //                                           `mountGlassesScreen`.
 //
-// The Router for WP6 handles only `home` and `exit`. Placeholder
-// branches for `predictions` / `incidents` / `voice` log the intent
-// and leave the user on Home rather than tearing the page down —
-// that way no user is ever stranded on a missing screen.
+// The Router below handles every `NavIntent.to` variant: `home`,
+// `exit`, `predictions`, `incidents`, and `voice`. Each branch tears
+// down the previous screen (`unmount`), builds the next, and mounts it.
+// The `voice` branch additionally degrades gracefully when the STT
+// provider hasn't been wired in (see `createSttEngine` in
+// `src/screens/voice.ts`): it bounces back to Home rather than mounting
+// a half-broken screen, so a missing STT never strands the user.
 
 import { waitForEvenAppBridge } from "@evenrealities/even_hub_sdk";
 
@@ -34,12 +37,45 @@ import {
   buildRailPredictionsUrl,
   resolveStationCode,
   searchStations,
+  type LineCode,
   type PredictionsResponse,
+  type Station,
 } from "./wmata";
 import {
   readCachedIncidents,
   refreshIncidents,
 } from "./wmata/incidents-cache";
+
+/**
+ * Collect the non-null line codes a Station serves. Inline rather than
+ * a top-level helper because this is the only caller and the body is
+ * three lines.
+ */
+function stationLines(station: Station): LineCode[] {
+  const out: LineCode[] = [];
+  for (const code of [
+    station.LineCode1,
+    station.LineCode2,
+    station.LineCode3,
+    station.LineCode4,
+  ]) {
+    if (code) out.push(code);
+  }
+  return out;
+}
+
+/**
+ * Extract the first-sentence headline of the freshest incident from the
+ * shared cache. Returns null when the cache is empty (or the first
+ * incident has no description) so the Predictions footer can hide.
+ */
+function readFirstIncidentHeadline(): string | null {
+  const first = readCachedIncidents().incidents[0];
+  if (!first) return null;
+  const desc = first.Description ?? "";
+  const headline = desc.split(".")[0]?.trim() ?? "";
+  return headline.length > 0 ? headline : null;
+}
 
 async function bootGlasses(): Promise<void> {
   const bridge = await waitForEvenAppBridge();
@@ -102,13 +138,22 @@ async function bootGlasses(): Promise<void> {
             await unmount();
             unmount = null;
           }
-          // Resolve a human-readable station name for the header. If the
-          // station-cache lookup fails (network error, unknown code) we
-          // fall back to the raw code so the screen still mounts.
+          // Resolve a human-readable station name for the header AND the
+          // station's served lines. The lines drive the incident filter
+          // so the footer only surfaces alerts relevant to *this* station,
+          // not the user's full favorite-set. If the station-cache lookup
+          // fails (network error, unknown code) we fall back to the raw
+          // code for the name and an empty line list (the cache will
+          // return no matching incidents in that case, which is the
+          // right degraded behaviour).
           let stationName = intent.stationCode;
+          let stationServedLines: LineCode[] = [];
           try {
             const station = await resolveStationCode(client, intent.stationCode);
-            if (station) stationName = station.Name;
+            if (station) {
+              stationName = station.Name;
+              stationServedLines = stationLines(station);
+            }
           } catch (err) {
             console.warn(
               `[router] resolveStationCode(${intent.stationCode}) failed:`,
@@ -118,12 +163,16 @@ async function bootGlasses(): Promise<void> {
 
           const fetcher = async () => {
             const url = buildRailPredictionsUrl(intent.stationCode);
+            // Fire predictions + cache-refresh in sequence (not parallel)
+            // to keep the request rate under WMATA's 10 req/s ceiling
+            // with margin. The shared incidents cache means this also
+            // keeps Home's ALERTS count fresh while the user is on
+            // Predictions — useful side effect.
             const data = await client.get<PredictionsResponse>(url);
+            await refreshIncidents(client, stationServedLines);
             return {
               trains: data.Trains ?? [],
-              // WP8 will wire real incidents into the footer; for WP7
-              // the predictions screen ships with an inert headline.
-              incidentHeadline: null,
+              incidentHeadline: readFirstIncidentHeadline(),
             };
           };
 
@@ -133,7 +182,11 @@ async function bootGlasses(): Promise<void> {
             trains: [],
             fetchedAt: 0,
             fetchError: null,
-            incidentHeadline: null,
+            // Seed the headline from the cache so the first render shows
+            // any already-known incident (the cache is shared with Home
+            // and the Incidents screen). Avoids a one-tick blink between
+            // mount and the first fetcher resolution.
+            incidentHeadline: readFirstIncidentHeadline(),
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);

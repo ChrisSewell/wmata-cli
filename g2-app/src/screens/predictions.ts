@@ -113,7 +113,12 @@ export interface PredictionsSnapshot {
   fetchedAt: number;
   /** Last fetch error string, or `null` if the most recent fetch succeeded. */
   fetchError: string | null;
-  /** Optional headline for the footer alert row. WP8 will wire this in. */
+  /**
+   * Optional headline for the footer alert row. Sourced from the shared
+   * incidents cache in `main.ts`'s predictions fetcher (the first
+   * sentence of the freshest incident on a line this station serves).
+   * `null` when there are no matching incidents — the footer hides.
+   */
   incidentHeadline: string | null;
 }
 

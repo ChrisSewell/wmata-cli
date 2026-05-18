@@ -566,6 +566,43 @@ describe("predictions view: footer presence", () => {
     // header + 1 train + footer = 3
     expect(lines.length).toBe(3);
     expect(lines[2]!.startsWith("! ")).toBe(true);
+    expect(lines[2]).toContain("Single-tracking RD");
+  });
+
+  it("truncates a long incident headline to fit LINE_WIDTH (24 cols)", () => {
+    // 30+ char description that doesn't fit verbatim — the footer must
+    // truncate (with the canonical ellipsis) rather than overflow.
+    const longHeadline =
+      "Single-tracking on RD between Foggy Bottom and Rosslyn";
+    const trains: Train[] = [train({ Min: "ARR" })];
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains, incidentHeadline: longHeadline }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expectFits(lines);
+    expect(lines.length).toBe(3);
+    expect(lines[2]!.startsWith("! ")).toBe(true);
+    // The footer line is exactly LINE_WIDTH cols when the headline
+    // overflows, and must terminate with the canonical ellipsis so the
+    // user sees the truncation.
+    expect(lines[2]!.length).toBe(LINE_WIDTH);
+    expect(lines[2]!.endsWith("…")).toBe(true);
+  });
+
+  it("hides the footer when incidentHeadline is null (no alert)", () => {
+    // Mirrors what main.ts seeds when the shared incidents cache has no
+    // entries for this station's lines. The footer row is omitted —
+    // not rendered as a blank line — so the body keeps its full budget.
+    const trains: Train[] = [train({ Min: "ARR" })];
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains, incidentHeadline: null }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expectFits(lines);
+    expect(lines.length).toBe(2); // header + 1 train, no footer
+    for (const l of lines) expect(l.startsWith("! ")).toBe(false);
   });
 
   it("omits the footer row entirely when there is nothing to surface", () => {
@@ -836,5 +873,43 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
     expect(lines[1]!.length).toBe(LINE_WIDTH);
     expect(lines[2]!.length).toBe(LINE_WIDTH);
     expect(lines[3]!.length).toBe(LINE_WIDTH);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Snapshot pin: 3 trains + a non-null incidentHeadline → 5-line render
+// with the truncated `! …` footer row at the tail.
+// ---------------------------------------------------------------------------
+
+describe("predictions view snapshot: 3 trains + incident footer", () => {
+  it("matches the exact line array including the truncated footer", () => {
+    const trains: Train[] = [
+      train({ Line: "RD", Destination: "Shady Grove", Car: "6", Min: "ARR" }),
+      train({ Line: "RD", Destination: "Glenmont", Car: "8", Min: "3" }),
+      train({ Line: "OR", Destination: "Vienna/Fairfax-GMU", Car: "6", Min: "5" }),
+    ];
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        stationName: "Metro Center",
+        trains,
+        // Long enough to force truncation: "! " (2) + 22 chars of the
+        // input + "…" (1) = 24. With the headline below, the rendered
+        // footer fills exactly to LINE_WIDTH and ends with `…`.
+        incidentHeadline: "Single-tracking on RD between Foggy Bottom",
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expectFits(lines);
+    expect(lines).toEqual([
+      "Metro Center       14:32",
+      "RD Shady Grove 6c    ARR",
+      "RD Glenmont    8c  3 min",
+      "OR Vienna      6c  5 min",
+      "! Single-tracking on RD…",
+    ]);
+    expect(lines[4]!.length).toBe(LINE_WIDTH);
+    expect(lines[4]!.startsWith("! ")).toBe(true);
+    expect(lines[4]!.endsWith("…")).toBe(true);
   });
 });

@@ -9,8 +9,9 @@
 //      handed to the injected `searchFn`, which returns up to 3
 //      candidate stations.
 //   4. Unique match    -> emit `{ to: 'predictions', stationCode }`.
-//      Multiple match  -> show all candidates; TAP cycles the highlight
-//                         and a final TAP confirms.
+//      Multiple match  -> show all candidates; SCROLL_UP / SCROLL_DOWN
+//                         cycle the highlight, TAP confirms the
+//                         highlighted candidate.
 //      No match        -> show "No match.", TAP retries (re-enters
 //                         `listening`).
 //   5. DOUBLE_TAP from any phase returns to Home (the non-root
@@ -134,7 +135,10 @@ export interface VoiceSnapshot {
   phase: VoicePhase;
   /** Candidate stations after a search; capped at MAX_MATCHES. */
   matches: Station[];
-  /** Index into `matches` for cycle-select. */
+  /**
+   * Index into `matches` for the cycle-select highlight. SCROLL_UP /
+   * SCROLL_DOWN cycle this index; TAP confirms the highlighted match.
+   */
   matchIndex: number;
   /** Error message if `phase === 'error'`. */
   errorMessage: string | null;
@@ -345,7 +349,7 @@ export function makeVoiceScreen(
             lines.push(renderMatchRow(station, i === snapshot.matchIndex));
           }
           lines.push("");
-          lines.push(truncate("(tap=cycle, dbl=back)", LINE_WIDTH));
+          lines.push(truncate("(scroll=pick, tap=ok)", LINE_WIDTH));
           return lines;
         }
         case "noMatch": {
@@ -462,23 +466,23 @@ export function makeVoiceScreen(
         }
         case "TAP": {
           if (snapshot.phase === "matches") {
-            // Cycle through candidates. If exactly one candidate is
-            // visible we treat TAP as a confirm instead.
+            // TAP confirms the highlighted candidate. The user cycles
+            // through candidates with SCROLL_UP / SCROLL_DOWN; TAP is
+            // the commit gesture. An empty matches list shouldn't be
+            // reachable from the reducer (the resolver routes 0-match
+            // results to `noMatch`), but guard anyway so a malformed
+            // snapshot can't navigate to a bogus station code.
             if (snapshot.matches.length === 0) return { nav };
-            if (snapshot.matches.length === 1) {
-              return {
-                nav,
-                navigate: {
-                  to: "predictions",
-                  stationCode: snapshot.matches[0]!.Code,
-                },
-              };
-            }
-            const nextIdx =
-              (snapshot.matchIndex + 1) % snapshot.matches.length;
+            const idx = Math.min(
+              Math.max(0, snapshot.matchIndex),
+              snapshot.matches.length - 1,
+            );
             return {
               nav,
-              snapshot: { ...snapshot, matchIndex: nextIdx },
+              navigate: {
+                to: "predictions",
+                stationCode: snapshot.matches[idx]!.Code,
+              },
             };
           }
           if (snapshot.phase === "noMatch") {
@@ -513,10 +517,24 @@ export function makeVoiceScreen(
           return { nav };
         }
         case "SCROLL_UP":
-        case "SCROLL_DOWN":
-          // Scrolling has no meaning in any phase — TAP is the cycle
-          // gesture, double-tap is back, scrolling is a no-op.
-          return { nav };
+        case "SCROLL_DOWN": {
+          // Scroll is the cycle gesture in the `matches` phase: DOWN
+          // advances the highlight, UP retreats it. In every other
+          // phase scrolling is a no-op (the list-navigation idiom only
+          // makes sense once we have a list of candidates on screen).
+          if (snapshot.phase !== "matches") return { nav };
+          const n = snapshot.matches.length;
+          if (n <= 1) return { nav };
+          const delta = event.type === "SCROLL_DOWN" ? 1 : -1;
+          // `((x % n) + n) % n` keeps the result in [0, n) for both
+          // forward and backward cycles regardless of the sign of `x`.
+          const nextIdx = ((snapshot.matchIndex + delta) % n + n) % n;
+          if (nextIdx === snapshot.matchIndex) return { nav };
+          return {
+            nav,
+            snapshot: { ...snapshot, matchIndex: nextIdx },
+          };
+        }
         default:
           return { nav };
       }
