@@ -11,15 +11,20 @@
 import { describe, expect, it } from "vitest";
 import { LINE_WIDTH } from "../ui/render";
 import type { FavoriteStation } from "../storage/settings";
+import type { LineCode } from "../wmata";
 import { initialNav, type ViewContext } from "./router";
 import {
-  ALERTS_LABEL_PREFIX,
+  STATUS_ROW_LINE_ORDER,
   VOICE_LABEL,
+  favoritesOffset,
+  hasAlertsRow,
+  isAlertsIndex,
+  isVoiceIndex,
   makeHomeScreen,
-  renderAlertsRow,
   renderFavoriteRow,
   renderHeader,
   renderLinesSuffix,
+  renderStatusGlyphRow,
   rowCount,
 } from "./home";
 
@@ -77,11 +82,16 @@ function expectFits(lines: string[]): void {
 }
 
 // A stable loader so tests don't share state. The optional second
-// argument supplies the `incidentCount` field added in WP8 — almost
-// every test stays at `0` (no alerts) so the existing assertions about
-// row counts and indices keep their original meanings.
-function loaderFor(favorites: FavoriteStation[], incidentCount: number = 0) {
-  return () => ({ favorites, incidentCount });
+// argument supplies the `affectedLines` field — almost every test
+// passes `[]` (no alerts) so the existing assertions about row
+// counts and indices keep their original meanings. A non-empty
+// array surfaces the status glyph row at index 0 and shifts every
+// other row by 1.
+function loaderFor(
+  favorites: FavoriteStation[],
+  affectedLines: LineCode[] = [],
+) {
+  return () => ({ favorites, affectedLines });
 }
 
 // ---------------------------------------------------------------------------
@@ -438,129 +448,175 @@ describe("home view snapshot: 3 favorites, highlight idx 1", () => {
 });
 
 // ---------------------------------------------------------------------------
-// WP8: ALERTS row (renders only when `incidentCount > 0`)
+// Status glyph row (renders only when ≥ 1 affected line)
 // ---------------------------------------------------------------------------
 
-describe("renderAlertsRow", () => {
-  it("fits exactly LINE_WIDTH cols with a single-digit count and a trailing `!`", () => {
-    const out = renderAlertsRow(2, false);
+describe("renderStatusGlyphRow", () => {
+  it("fits exactly LINE_WIDTH cols when no lines are affected", () => {
+    const out = renderStatusGlyphRow(new Set<LineCode>(), false);
     expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("  " + ALERTS_LABEL_PREFIX + " (2)")).toBe(true);
-    expect(out.endsWith("!")).toBe(true);
   });
 
-  it("renders the highlight prefix when selected", () => {
-    const out = renderAlertsRow(1, true);
+  it("renders the canonical row layout verbatim for an empty set", () => {
+    // prefix(2) + 6×3 cells(18) + trailing pad(4) = 24
+    const out = renderStatusGlyphRow(new Set<LineCode>(), false);
+    expect(out).toBe("  RD BL YL OR GR SV     ");
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+
+  it("places `!` after each affected line code in canonical order", () => {
+    const out = renderStatusGlyphRow(new Set<LineCode>(["RD", "OR"]), false);
+    expect(out).toBe("  RD!BL YL OR!GR SV     ");
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+
+  it("renders all six glyphs as `XX!` when every line is affected", () => {
+    // All-affected: cells block ends with "SV!" (no trailing space in
+    // the last cell). The function pads to LINE_WIDTH regardless, so
+    // the trailing 4 chars are still spaces; the layout grid stays
+    // constant across renders.
+    const out = renderStatusGlyphRow(
+      new Set<LineCode>(["RD", "BL", "YL", "OR", "GR", "SV"]),
+      false,
+    );
+    expect(out).toBe("  RD!BL!YL!OR!GR!SV!    ");
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+
+  it("uses the highlight prefix when selected", () => {
+    const out = renderStatusGlyphRow(new Set<LineCode>(["RD"]), true);
     expect(out.startsWith("> ")).toBe(true);
     expect(out.length).toBe(LINE_WIDTH);
   });
+
+  it("exposes the canonical line order for callers", () => {
+    expect(STATUS_ROW_LINE_ORDER).toEqual(["RD", "BL", "YL", "OR", "GR", "SV"]);
+  });
 });
 
-describe("home view: ALERTS row presence", () => {
-  it("renders an ALERTS row when incidentCount > 0", () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 3));
+describe("home view: status row presence", () => {
+  it("renders the status row at the TOP when ≥ 1 line is affected", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], ["RD", "OR"]));
     const snap = screen.init();
     const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
     expectFits(lines);
-    // header + 1 favorite + ALERTS + VOICE = 4 lines.
+    // header(0) + status(1) + fav(2) + voice(3)
     expect(lines.length).toBe(4);
-    const alertsLine = lines.find((l) => l.includes("ALERTS (3)"));
-    expect(alertsLine).toBeDefined();
-    expect(alertsLine!.endsWith("!")).toBe(true);
-    expect(alertsLine!.length).toBe(LINE_WIDTH);
+    // Status row anchor: contains the bang glyphs on RD and OR.
+    expect(lines[1]).toContain("RD!");
+    expect(lines[1]).toContain("OR!");
+    // And the unaffected lines render as code-then-space.
+    expect(lines[1]).toContain("BL ");
+    expect(lines[1]).toContain("GR ");
+    expect(lines[2]).toContain("Metro Ctr");
+    expect(lines[3]).toContain(VOICE_LABEL);
   });
 
-  it("omits the ALERTS row when incidentCount === 0", () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0));
+  it("omits the status row when affectedLines is empty", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], []));
     const snap = screen.init();
     const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
     expectFits(lines);
     expect(lines.length).toBe(3); // header + 1 favorite + voice
-    expect(lines.some((l) => l.includes("ALERTS"))).toBe(false);
+    // No status row → no bang glyphs in any rendered line.
+    expect(lines.some((l) => /[A-Z]{2}!/.test(l))).toBe(false);
   });
 
-  it("places ALERTS directly ABOVE the VOICE LOOKUP row", () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter, F.galleryPl], 2));
+  it("places the status row directly BELOW the header (above all favorites)", () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter, F.galleryPl], ["RD"]),
+    );
     const snap = screen.init();
     const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
-    // header(0) + fav(1) + fav(2) + ALERTS(3) + VOICE(4)
+    // header(0) + status(1) + fav(2) + fav(3) + VOICE(4)
     expect(lines.length).toBe(5);
-    expect(lines[3]).toContain("ALERTS (2)");
+    expect(lines[1]).toContain("RD!");
     expect(lines[4]).toContain(VOICE_LABEL);
   });
 
-  it("renders in the empty-favorites state too (above VOICE LOOKUP)", () => {
-    const screen = makeHomeScreen(loaderFor([], 1));
+  it("renders in the empty-favorites state too (above the help text)", () => {
+    const screen = makeHomeScreen(loaderFor([], ["RD"]));
     const snap = screen.init();
     const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
     expectFits(lines);
-    // header + 2 help lines + ALERTS + VOICE = 5
+    // header(0) + status(1) + 2 help lines + VOICE = 5
     expect(lines.length).toBe(5);
-    expect(lines[3]).toContain("ALERTS (1)");
+    expect(lines[1]).toContain("RD!");
     expect(lines[4]).toContain(VOICE_LABEL);
   });
 });
 
-describe("home reduce: ALERTS row navigation", () => {
-  it("SCROLL_DOWN past the favorites lands on the ALERTS row", () => {
+describe("home reduce: status row navigation", () => {
+  it("SCROLL_DOWN starts at status (idx 0) and steps onto favorites", () => {
     const screen = makeHomeScreen(
-      loaderFor([F.metroCenter, F.galleryPl], 2),
+      loaderFor([F.metroCenter, F.galleryPl], ["RD"]),
     );
     const snap = screen.init();
-    // rowCount = 2 favs + 1 alerts + 1 voice = 4. ALERTS index = 2.
+    // rowCount = 1 status + 2 favs + 1 voice = 4. Status idx = 0.
     expect(rowCount(snap)).toBe(4);
-    let nav = { highlightedIndex: 0 };
-    for (let i = 0; i < 2; i++) {
-      const r = screen.reduce(snap, nav, { type: "SCROLL_DOWN" });
-      nav = r.nav;
-    }
-    expect(nav.highlightedIndex).toBe(2);
-    // And the rendered ALERTS line carries the `> ` prefix at idx 2.
-    const lines = screen.view(snap, nav, CTX);
-    expect(lines[3]!.startsWith("> ")).toBe(true);
-    expect(lines[3]).toContain("ALERTS (2)");
+    expect(hasAlertsRow(snap)).toBe(true);
+    expect(isAlertsIndex(snap, 0)).toBe(true);
+    expect(favoritesOffset(snap)).toBe(1);
+    // Status row at index 0 gets the highlight prefix.
+    const linesAt0 = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    expect(linesAt0[1]!.startsWith("> ")).toBe(true);
+    expect(linesAt0[1]).toContain("RD!");
   });
 
-  it("TAP on the ALERTS row returns `{ to: 'incidents' }`", () => {
+  it("TAP on the status row returns `{ to: 'incidents' }`", () => {
     const screen = makeHomeScreen(
-      loaderFor([F.metroCenter, F.galleryPl], 2),
+      loaderFor([F.metroCenter, F.galleryPl], ["RD"]),
     );
     const snap = screen.init();
-    // ALERTS row index = 2.
-    const r = screen.reduce(snap, { highlightedIndex: 2 }, { type: "TAP" });
+    // Status row index = 0.
+    const r = screen.reduce(snap, { highlightedIndex: 0 }, { type: "TAP" });
     expect(r.navigate).toEqual({ to: "incidents" });
   });
 
-  it("VOICE row is the LAST row when ALERTS is present (TAP -> 'voice')", () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 1));
+  it("VOICE row is the LAST row when status is present (TAP -> 'voice')", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], ["RD"]));
     const snap = screen.init();
-    // rowCount = 1 fav + 1 alerts + 1 voice = 3. VOICE index = 2.
+    // rowCount = 1 status + 1 fav + 1 voice = 3. VOICE index = 2.
     expect(rowCount(snap)).toBe(3);
+    expect(isVoiceIndex(snap, 2)).toBe(true);
     const r = screen.reduce(snap, { highlightedIndex: 2 }, { type: "TAP" });
     expect(r.navigate).toEqual({ to: "voice" });
   });
 
-  it("VOICE row TAP still resolves to 'voice' when ALERTS is absent", () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0));
+  it("VOICE row TAP still resolves to 'voice' when status is absent", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], []));
     const snap = screen.init();
     // rowCount = 1 fav + 1 voice = 2. VOICE index = 1.
     expect(rowCount(snap)).toBe(2);
     const r = screen.reduce(snap, { highlightedIndex: 1 }, { type: "TAP" });
     expect(r.navigate).toEqual({ to: "voice" });
   });
+
+  it("TAP on a favorite (with status row present) navigates by station code", () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter, F.galleryPl], ["RD"]),
+    );
+    const snap = screen.init();
+    // Favorites occupy indices [1, 2]. idx=1 is metroCenter.
+    const r1 = screen.reduce(snap, { highlightedIndex: 1 }, { type: "TAP" });
+    expect(r1.navigate).toEqual({ to: "predictions", stationCode: "A01" });
+    // idx=2 is galleryPl.
+    const r2 = screen.reduce(snap, { highlightedIndex: 2 }, { type: "TAP" });
+    expect(r2.navigate).toEqual({ to: "predictions", stationCode: "B01" });
+  });
 });
 
 // ---------------------------------------------------------------------------
-// WP8: optional tick refreshes the incidentCount
+// Optional tick: refreshes the affected-lines set
 // ---------------------------------------------------------------------------
 
-describe("home tick: incident-count refresh", () => {
-  it("folds a new count into the snapshot", async () => {
+describe("home tick: affected-lines refresh", () => {
+  it("folds a new affected-lines set into the snapshot", async () => {
     let calls = 0;
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0), {
-      refreshIncidentCount: () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], []), {
+      refreshAffectedLines: () => {
         calls += 1;
-        return Promise.resolve(4);
+        return Promise.resolve(["RD", "OR"] as LineCode[]);
       },
       tickIntervalMs: 60_000,
     });
@@ -568,23 +624,26 @@ describe("home tick: incident-count refresh", () => {
     expect(screen.tick).toBeDefined();
     const snap = screen.init();
     const next = await screen.tick!(snap);
-    expect(next.incidentCount).toBe(4);
+    expect(new Set(next.affectedLines)).toEqual(new Set(["RD", "OR"]));
     expect(calls).toBe(1);
   });
 
-  it("swallows fetch errors and keeps the previous count", async () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 7), {
-      refreshIncidentCount: () => Promise.reject(new Error("boom")),
+  it("swallows fetch errors and keeps the previous affected-lines set", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], ["RD", "BL"]), {
+      refreshAffectedLines: () => Promise.reject(new Error("boom")),
       tickIntervalMs: 60_000,
     });
     const snap = screen.init();
     const next = await screen.tick!(snap);
-    expect(next.incidentCount).toBe(7);
+    expect(new Set(next.affectedLines)).toEqual(new Set(["RD", "BL"]));
   });
 
-  it("returns the SAME snapshot reference when the count is unchanged", async () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 2), {
-      refreshIncidentCount: () => Promise.resolve(2),
+  it("returns the SAME snapshot reference when the set is unchanged", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], ["RD", "BL"]), {
+      // Return a fresh array literal with the same members. The
+      // dedup logic compares by set membership, so the reference
+      // should still be reused.
+      refreshAffectedLines: () => Promise.resolve(["BL", "RD"] as LineCode[]),
       tickIntervalMs: 60_000,
     });
     const snap = screen.init();
@@ -593,7 +652,7 @@ describe("home tick: incident-count refresh", () => {
   });
 
   it("omits `tick`/`tickIntervalMs` entirely when no options are passed", () => {
-    const screen = makeHomeScreen(loaderFor([F.metroCenter], 0));
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], []));
     expect(screen.tick).toBeUndefined();
     expect(screen.tickIntervalMs).toBeUndefined();
   });

@@ -34,10 +34,12 @@ import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
 import { createSttEngine, makeVoiceScreen } from "./screens/voice";
 import { Session } from "./session";
+import { parseLinesAffected } from "./wmata/incidents-cache";
 import {
   buildRailPredictionsUrl,
   type LineCode,
   type PredictionsResponse,
+  type RailIncident,
   type Station,
 } from "./wmata";
 
@@ -73,6 +75,26 @@ function readFirstIncidentHeadline(session: Session): string | null {
   return headline.length > 0 ? headline : null;
 }
 
+/**
+ * Compute the deduped set of line codes that have at least one active
+ * incident, intersected with the user's followed lines. Drives the
+ * Home screen's status glyph row.
+ */
+function computeAffectedLines(
+  incidents: readonly RailIncident[],
+  userLines: readonly LineCode[],
+): LineCode[] {
+  if (userLines.length === 0) return [];
+  const userSet = new Set<LineCode>(userLines);
+  const out = new Set<LineCode>();
+  for (const inc of incidents) {
+    for (const code of parseLinesAffected(inc.LinesAffected ?? "")) {
+      if (userSet.has(code)) out.add(code);
+    }
+  }
+  return Array.from(out);
+}
+
 async function bootGlasses(): Promise<void> {
   const bridge = await waitForEvenAppBridge();
 
@@ -87,19 +109,24 @@ async function bootGlasses(): Promise<void> {
   // Build the Home screen with a fresh-load snapshot factory. We
   // call `loadSettings()` inside `init` so re-mounting the screen
   // (e.g. after a return-from-predictions) picks up any favorite-list
-  // changes made on the phone in the interim. The cached incident
-  // count is seeded from the session's cache so a re-mount doesn't
-  // blink the ALERTS row off-then-on while the first tick is in flight.
+  // changes made on the phone in the interim. The affected-lines set
+  // is seeded from the session's cache so a re-mount doesn't blink
+  // the status row off-then-on while the first tick is in flight.
   const homeScreen = makeHomeScreen(
-    () => ({
-      favorites: loadSettings().favorites,
-      incidentCount: session.readCachedIncidents().incidents.length,
-    }),
+    () => {
+      const favorites = loadSettings().favorites;
+      const userLines = computeUserLines(favorites);
+      const cached = session.readCachedIncidents().incidents;
+      return {
+        favorites,
+        affectedLines: computeAffectedLines(cached, userLines),
+      };
+    },
     {
-      refreshIncidentCount: async (): Promise<number> => {
+      refreshAffectedLines: async (): Promise<LineCode[]> => {
         const userLines = computeUserLines(loadSettings().favorites);
         const cache = await session.refreshIncidents(userLines);
-        return cache.incidents.length;
+        return computeAffectedLines(cache.incidents, userLines);
       },
       tickIntervalMs: 60_000,
     },

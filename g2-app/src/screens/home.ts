@@ -5,16 +5,20 @@
 //   col: 0         1         2
 //   col: 0123456789012345678901234
 //        WMATA — Favorites (3/5)
-//        > Metro Ctr  RD BL OR SV
+//        > RD!BL YL OR!GR SV
+//          Metro Ctr  RD BL OR SV
 //          Gallery Pl RD YL GR
 //          Union Stn  RD
-//          ALERTS (2)            !
 //          VOICE LOOKUP
 //
-// The "ALERTS (n)" row only appears when `snapshot.incidentCount > 0`.
-// It sits between the favorites and the VOICE LOOKUP row so it's
-// reachable by SCROLL_DOWN. TAP on it navigates to the Incidents
-// screen.
+// The status glyph row only appears when at least one line the user
+// follows has an active incident. When visible, it sits ABOVE the
+// favorites (the v1.1 behaviour put a count row BELOW favorites; v1.2
+// promotes the row to a denser per-line status display at the top of
+// the list because that's the surface users peek at first). TAP on it
+// still navigates to the Incidents screen. The 6 line codes (RD BL YL
+// OR GR SV) are always rendered in the same column positions; a
+// trailing `!` on a code means "this line has an active incident".
 //
 // Empty state (no favorites): exactly 4 rendered lines —
 //   1. header                ("WMATA — Favorites (0/5)")
@@ -22,10 +26,10 @@
 //   3. "Open phone to add."
 //   4. VOICE LOOKUP row (with the highlight prefix)
 //
-// (The ALERTS row, when present, ALSO appears in the empty-state
-// layout — but the empty-state count-of-lines assertion in the test
-// suite uses fixtures where incidentCount === 0, so the line count
-// stays at exactly 4.)
+// (The status row, when present, ALSO appears above the help text in
+// the empty-state layout — but the empty-state count-of-lines
+// assertion in the test suite uses fixtures where `affectedLines` is
+// empty, so the line count stays at exactly 4.)
 //
 // The empty-state line count is locked at 4 by an assertion in the
 // home.test.ts suite (per the WP6 Reviewer's "lock per-screen line
@@ -50,6 +54,7 @@
 
 import type { FavoriteStation } from "../storage/settings";
 import { MAX_FAVORITES } from "../storage/settings";
+import type { LineCode } from "../wmata";
 import { LINE_WIDTH, highlightPrefix, padRight, truncate } from "../ui/render";
 import { abbreviateStation } from "../ui/format";
 import type { ReduceResult, Screen } from "./router";
@@ -74,8 +79,22 @@ const MAX_VERBATIM_LINES = 4;
 /** Label rendered for the synthetic voice-lookup row. */
 export const VOICE_LABEL = "VOICE LOOKUP";
 
-/** Label rendered for the synthetic alerts row (when count > 0). */
-export const ALERTS_LABEL_PREFIX = "ALERTS";
+/**
+ * Canonical order for the line-code glyph cells in the status row.
+ *
+ * WMATA has six lines total. Listing them in the type-declaration
+ * order (RD BL YL OR GR SV) keeps the renderer deterministic and the
+ * visual scan-rhythm consistent across renders — affected lines
+ * always sit in the same column position.
+ */
+export const STATUS_ROW_LINE_ORDER: readonly LineCode[] = [
+  "RD",
+  "BL",
+  "YL",
+  "OR",
+  "GR",
+  "SV",
+];
 
 // ---------------------------------------------------------------------------
 // Snapshot
@@ -85,14 +104,22 @@ export const ALERTS_LABEL_PREFIX = "ALERTS";
 export interface HomeSnapshot {
   favorites: FavoriteStation[];
   /**
-   * Number of active rail incidents on the user's followed lines.
-   * `0` hides the ALERTS row entirely; a positive count renders it as
-   * a tappable synthetic row.
+   * Set of line codes (intersected with the user's followed lines)
+   * that currently have at least one active rail incident.
+   *
+   * Empty array → hide the status row entirely; one or more entries
+   * → render the per-line glyph row at the top of the screen as a
+   * tappable synthetic row (TAP → Incidents).
    *
    * Refreshed in-band by the screen's `tick()`, which delegates to the
-   * shared `refreshIncidents` cache in `wmata/incidents-cache.ts`.
+   * shared incidents cache (`Session.refreshIncidents`).
+   *
+   * (Replaces v1.1's `incidentCount: number`; the count is recoverable
+   * as `affectedLines.length` but the per-line breakdown is more
+   * actionable on a glanceable HUD — the user can tell which lines
+   * to worry about without opening the Incidents screen.)
    */
-  incidentCount: number;
+  affectedLines: LineCode[];
 }
 
 // ---------------------------------------------------------------------------
@@ -151,30 +178,34 @@ export function renderVoiceRow(isHighlighted: boolean): string {
 }
 
 /**
- * Build the synthetic "ALERTS (n)" row. The row is right-padded so a
- * `!` glyph sits flush at the 24th column — the panel is greyscale, so
- * we use a literal `!` for emphasis where a colored bold would
- * otherwise live.
+ * Build the per-line status glyph row. Six fixed-width 3-col cells,
+ * one per WMATA rail line in `STATUS_ROW_LINE_ORDER`, each rendered
+ * as the 2-char code followed by either `!` (line has an active
+ * incident the user follows) or ` ` (clear).
  *
- * Width contract: always exactly `LINE_WIDTH` cols.
+ * Width contract: returns exactly `LINE_WIDTH` columns.
+ *
+ *   prefix(2) + 6 cells × 3 chars (18) + 4 trailing pad = 24
+ *
+ * No leading "ALERTS" label — the bang-suffix glyphs are enough
+ * signal (an "RD!" cell is visually distinct from "RD "), and trying
+ * to fit a 5-char label drove the row over budget. The 4-col trailing
+ * pad keeps the row exactly LINE_WIDTH regardless of how many cells
+ * end with `!` vs ` `, so the visual grid stays stable across
+ * renders.
  */
-export function renderAlertsRow(
-  count: number,
+export function renderStatusGlyphRow(
+  affected: ReadonlySet<LineCode>,
   isHighlighted: boolean,
 ): string {
   const prefix = highlightPrefix(isHighlighted); // 2 cols
-  const label = `${ALERTS_LABEL_PREFIX} (${count})`;
-  const trailing = "!";
-  // prefix(2) + label + spaces + trailing(1) = LINE_WIDTH
-  const spacesNeeded = LINE_WIDTH - prefix.length - label.length - trailing.length;
-  if (spacesNeeded < 1) {
-    // Defensive: if `count` ever gets long enough to crowd the trailing
-    // glyph (won't happen in practice, but a guard keeps the contract
-    // honest), truncate the label.
-    const safeLabel = truncate(label, LINE_WIDTH - prefix.length - 2);
-    return prefix + safeLabel + " " + trailing;
-  }
-  return prefix + label + " ".repeat(spacesNeeded) + trailing;
+  const cells = STATUS_ROW_LINE_ORDER.map(
+    (code) => code + (affected.has(code) ? "!" : " "),
+  ).join("");
+  // padRight handles both the trailing pad and the (defensive)
+  // truncate-on-overflow contract — a future LineCode addition would
+  // truncate at the right edge rather than blowing past LINE_WIDTH.
+  return padRight(prefix + cells, LINE_WIDTH);
 }
 
 /**
@@ -193,42 +224,59 @@ export function renderHeader(favoritesCount: number): string {
 // ---------------------------------------------------------------------------
 
 /**
- * True when the snapshot has an active-incidents count and so the
- * synthetic ALERTS row should appear between the favorites and the
- * voice-lookup row.
+ * True when the snapshot has at least one active incident on a line
+ * the user follows, so the status glyph row should be rendered.
+ *
+ * Row position: the row sits ABOVE the favorites (the v1.1 ALERTS
+ * row sat below them). Future WPs (A4 elevator) add an ACCESS peer
+ * row at index 1; favorites and voice shift down accordingly.
  */
 export function hasAlertsRow(snapshot: HomeSnapshot): boolean {
-  return snapshot.incidentCount > 0;
+  return snapshot.affectedLines.length > 0;
 }
 
 /**
- * The flat list of selectable rows. We treat "VOICE LOOKUP" (and
- * optionally "ALERTS (n)") as real rows in the navigation model so
- * SCROLL_DOWN can land on them.
+ * The flat list of selectable rows. The synthetic rows (status,
+ * voice) are part of the navigation model so SCROLL_UP/DOWN can land
+ * on them.
  *
- * Index conventions:
- *   - 0..favorites.length-1                ->  the favorites
- *   - favorites.length (if alerts present) ->  the alerts row
- *   - last index                           ->  the voice-lookup row
+ * Index conventions (all rows that are absent are simply skipped):
+ *   - 0           (optional) status glyph row
+ *   - 1..N        the favorites
+ *   - N+1         the voice-lookup row
+ *
+ * (When the status row is absent the favorites start at 0 and the
+ * voice row sits at N.)
  */
 export function rowCount(snapshot: HomeSnapshot): number {
-  return snapshot.favorites.length + (hasAlertsRow(snapshot) ? 1 : 0) + 1;
+  return (hasAlertsRow(snapshot) ? 1 : 0) + snapshot.favorites.length + 1;
 }
 
-/** True if `index` points at the alerts synthetic row. */
+/**
+ * True if `index` points at the status glyph (alerts) synthetic row.
+ *
+ * The row is at index 0 when present; absent → always false.
+ */
 export function isAlertsIndex(
   snapshot: HomeSnapshot,
   index: number,
 ): boolean {
   if (!hasAlertsRow(snapshot)) return false;
-  return index === snapshot.favorites.length;
+  return index === 0;
 }
 
 /**
- * True if `index` points at the voice-lookup synthetic row.
+ * Index where the favorites region starts. Equals 0 when the status
+ * row is hidden, 1 when present. Exported so reducers / tests can
+ * translate raw indices into favorite-array indices.
  */
+export function favoritesOffset(snapshot: HomeSnapshot): number {
+  return hasAlertsRow(snapshot) ? 1 : 0;
+}
+
+/** True if `index` points at the voice-lookup synthetic row. */
 export function isVoiceIndex(snapshot: HomeSnapshot, index: number): boolean {
-  return index === snapshot.favorites.length + (hasAlertsRow(snapshot) ? 1 : 0);
+  return index === favoritesOffset(snapshot) + snapshot.favorites.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +317,7 @@ function clampedSnapshot(snapshot: HomeSnapshot): HomeSnapshot {
 export function makeHomeScreen(
   loader: () => HomeSnapshot,
   options?: {
-    refreshIncidentCount?: () => Promise<number>;
+    refreshAffectedLines?: () => Promise<LineCode[]>;
     tickIntervalMs?: number;
   },
 ): Screen<HomeSnapshot> {
@@ -290,28 +338,33 @@ export function makeHomeScreen(
       const lines: string[] = [];
       lines.push(renderHeader(clamped.favorites.length));
 
+      // Status row sits ABOVE everything else when any followed line
+      // has an active incident. The same fixture-set is used in both
+      // the empty-favorites branch and the populated branch.
+      const affected = new Set<LineCode>(clamped.affectedLines);
+      const showStatus = hasAlertsRow(clamped);
+
       if (clamped.favorites.length === 0) {
         // Empty state — exactly 4 rendered lines when there are no
         // active alerts:
         //   header + "No favorites yet." + "Open phone to add." + voice
-        // When alerts are active they slot in just above the voice row,
-        // bumping the total to 5.
-        lines.push(truncate("No favorites yet.", LINE_WIDTH));
-        lines.push(truncate("Open phone to add.", LINE_WIDTH));
+        // When alerts are active the status row slots in above the
+        // help text, bumping the total to 5.
         // NOTE: empty-state branch uses the RAW highlightedIndex (not
         // the clamped value) so that an out-of-range index renders an
         // un-highlighted row. The reducer clamps separately; this
         // preserves the WP6 contract that `view` is a pure projection
         // of (snapshot, nav) without any auto-clamping side effect.
-        if (hasAlertsRow(clamped)) {
+        if (showStatus) {
           lines.push(
-            renderAlertsRow(
-              clamped.incidentCount,
-              nav.highlightedIndex === 0,
-            ),
+            renderStatusGlyphRow(affected, nav.highlightedIndex === 0),
           );
+          lines.push(truncate("No favorites yet.", LINE_WIDTH));
+          lines.push(truncate("Open phone to add.", LINE_WIDTH));
           lines.push(renderVoiceRow(nav.highlightedIndex === 1));
         } else {
+          lines.push(truncate("No favorites yet.", LINE_WIDTH));
+          lines.push(truncate("Open phone to add.", LINE_WIDTH));
           lines.push(renderVoiceRow(nav.highlightedIndex === 0));
         }
         return lines;
@@ -319,17 +372,13 @@ export function makeHomeScreen(
 
       const total = rowCount(clamped);
       const idx = clampIndex(nav.highlightedIndex, total);
+      const favOffset = favoritesOffset(clamped);
+      if (showStatus) {
+        lines.push(renderStatusGlyphRow(affected, isAlertsIndex(clamped, idx)));
+      }
       for (let i = 0; i < clamped.favorites.length; i++) {
         const fav = clamped.favorites[i]!;
-        lines.push(renderFavoriteRow(fav, idx === i));
-      }
-      if (hasAlertsRow(clamped)) {
-        lines.push(
-          renderAlertsRow(
-            clamped.incidentCount,
-            isAlertsIndex(clamped, idx),
-          ),
-        );
+        lines.push(renderFavoriteRow(fav, idx === favOffset + i));
       }
       lines.push(renderVoiceRow(isVoiceIndex(clamped, idx)));
       return lines;
@@ -338,6 +387,7 @@ export function makeHomeScreen(
       const clamped = clampedSnapshot(snapshot);
       const total = rowCount(clamped);
       const idx = clampIndex(nav.highlightedIndex, total);
+      const favOffset = favoritesOffset(clamped);
       switch (event.type) {
         case "SCROLL_UP": {
           return { nav: { highlightedIndex: clampIndex(idx - 1, total) } };
@@ -355,7 +405,10 @@ export function makeHomeScreen(
               navigate: { to: "incidents" },
             };
           }
-          const fav = clamped.favorites[idx];
+          // Favorites occupy [favOffset, favOffset + N). Translate
+          // the raw nav index into the favorites-array index.
+          const favIdx = idx - favOffset;
+          const fav = clamped.favorites[favIdx];
           if (!fav) {
             // Defensive — should be impossible given clamping above.
             return { nav: { highlightedIndex: idx } };
@@ -381,19 +434,19 @@ export function makeHomeScreen(
     },
   };
 
-  // Optional auto-refresh of the incident count. Wired via `options`
-  // (in `main.ts`) rather than reaching into the cache module directly,
-  // so the Home screen stays pure-testable: tests can omit `options`
-  // entirely and the screen never ticks.
-  if (options?.refreshIncidentCount && (options.tickIntervalMs ?? 0) > 0) {
-    const refresh = options.refreshIncidentCount;
+  // Optional auto-refresh of the affected-lines set. Wired via
+  // `options` (in `main.ts`) rather than reaching into the cache
+  // module directly, so the Home screen stays pure-testable: tests
+  // can omit `options` entirely and the screen never ticks.
+  if (options?.refreshAffectedLines && (options.tickIntervalMs ?? 0) > 0) {
+    const refresh = options.refreshAffectedLines;
     screen.tick = async (snapshot: HomeSnapshot): Promise<HomeSnapshot> => {
       try {
-        const count = await refresh();
-        if (count === snapshot.incidentCount) return snapshot;
-        return { ...snapshot, incidentCount: count };
+        const next = await refresh();
+        if (sameLines(next, snapshot.affectedLines)) return snapshot;
+        return { ...snapshot, affectedLines: next };
       } catch {
-        // Incident count is non-critical — swallow and keep the
+        // Affected-lines is non-critical — swallow and keep the
         // last-known value rather than blanking the row.
         return snapshot;
       }
@@ -402,4 +455,17 @@ export function makeHomeScreen(
   }
 
   return screen;
+}
+
+/**
+ * Order-and-membership equality on `LineCode[]`. Used by the Home
+ * tick to skip a re-render when the affected-lines set hasn't
+ * changed. We compare by *set* membership rather than identity so a
+ * fresh array literal with the same contents is a no-op.
+ */
+function sameLines(a: readonly LineCode[], b: readonly LineCode[]): boolean {
+  if (a.length !== b.length) return false;
+  const seen = new Set<LineCode>(a);
+  for (const c of b) if (!seen.has(c)) return false;
+  return true;
 }
