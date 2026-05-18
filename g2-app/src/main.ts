@@ -31,6 +31,7 @@ import {
 } from "./screens/incidents";
 import { makePredictionsScreen } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
+import { makeTutorialScreen } from "./screens/tutorial";
 import { createSttEngine, makeVoiceScreen } from "./screens/voice";
 import { Session } from "./session";
 import {
@@ -256,11 +257,32 @@ async function bootGlasses(): Promise<void> {
           unmount = await mountGlassesScreen(screen, bridge, router);
           return;
         }
+        case "tutorial": {
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          // The Tutorial screen persists `tutorialSeen = true` from
+          // its own `onUnmount`, so we don't need to mark it here.
+          // Every gesture inside the screen routes back to Home,
+          // and the unmount-side persistence runs before the next
+          // mount lands.
+          router.current = "tutorial";
+          unmount = await mountGlassesScreen(makeTutorialScreen(), bridge, router);
+          return;
+        }
       }
     },
   };
 
-  await router.navigate({ to: "home" });
+  // First-launch users land on the Tutorial; everyone else goes to
+  // Home. The inference inside `readTutorialSeen()` means existing
+  // v1.1 users with a saved API key never see the tutorial on
+  // upgrade — only genuine clean-install users do.
+  const initialIntent: NavIntent = loadSettings().tutorialSeen
+    ? { to: "home" }
+    : { to: "tutorial" };
+  await router.navigate(initialIntent);
 }
 
 function bootCompanion(root: HTMLElement): void {

@@ -66,6 +66,7 @@ export type NavIntent =
   | { to: "predictions"; stationCode: string }
   | { to: "incidents" }
   | { to: "voice" }
+  | { to: "tutorial" }
   | { to: "exit" };
 
 /**

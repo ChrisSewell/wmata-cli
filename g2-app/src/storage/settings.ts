@@ -57,6 +57,18 @@ export interface Settings {
    * bounce back to Home.
    */
   sttApiKey: string;
+  /**
+   * True once the user has seen the first-launch gesture cheat sheet.
+   *
+   * Migration rule (rather than bumping SCHEMA_VERSION, which would
+   * invalidate every v1 user's stored value): when the
+   * `wmata.g2.tutorialSeen` key is absent, infer `true` if the user
+   * has any prior stored state (an `apiKey` was set) and `false`
+   * otherwise. Net effect: existing v1.1 users do NOT see the
+   * tutorial on upgrade (they're already configured), and only
+   * genuine first-launchers do.
+   */
+  tutorialSeen: boolean;
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -69,6 +81,7 @@ const SCHEMA_VERSION = 1;
 const KEY_API_KEY = "wmata.g2.apiKey";
 const KEY_FAVORITES = "wmata.g2.favorites";
 const KEY_STT_API_KEY = "wmata.g2.sttApiKey";
+const KEY_TUTORIAL_SEEN = "wmata.g2.tutorialSeen";
 
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -210,6 +223,29 @@ function readFavorites(): FavoriteStation[] {
   return asFavoritesArray(value);
 }
 
+/**
+ * Read the tutorial-seen flag.
+ *
+ *   - Explicit `true` / `false` stored under `KEY_TUTORIAL_SEEN`
+ *     (schema-versioned envelope) wins.
+ *   - Absent: infer `true` for existing users (any non-empty
+ *     `KEY_API_KEY`), `false` for clean installs. This avoids
+ *     bumping `SCHEMA_VERSION` (which would discard every v1 user's
+ *     favorites + key on upgrade — see RISK #1 in the WP-A plan).
+ */
+function readTutorialSeen(): boolean {
+  const raw = safeGet(KEY_TUTORIAL_SEEN);
+  if (raw !== null) {
+    const value = parseEnvelope(raw);
+    if (typeof value === "boolean") return value;
+  }
+  // Inference path. `parseEnvelope` returns null for missing /
+  // corrupt / version-mismatched envelopes; in any of those cases
+  // we fall back to "existing user → seen, fresh install → unseen".
+  const apiKey = parseEnvelope(safeGet(KEY_API_KEY));
+  return typeof apiKey === "string" && apiKey.length > 0;
+}
+
 function writeFavorites(favorites: FavoriteStation[]): void {
   const envelope: Envelope<FavoriteStation[]> = {
     schemaVersion: SCHEMA_VERSION,
@@ -232,7 +268,20 @@ export function loadSettings(): Settings {
     apiKey: readApiKey(),
     favorites: readFavorites(),
     sttApiKey: readSttApiKey(),
+    tutorialSeen: readTutorialSeen(),
   };
+}
+
+/**
+ * Mark the first-launch gesture cheat sheet as seen. Called by the
+ * Tutorial screen's `onUnmount` exactly once.
+ */
+export function markTutorialSeen(): void {
+  const envelope: Envelope<boolean> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: true,
+  };
+  safeSet(KEY_TUTORIAL_SEEN, JSON.stringify(envelope));
 }
 
 /**
@@ -320,4 +369,5 @@ export function clearSettings(): void {
   safeRemove(KEY_API_KEY);
   safeRemove(KEY_FAVORITES);
   safeRemove(KEY_STT_API_KEY);
+  safeRemove(KEY_TUTORIAL_SEEN);
 }

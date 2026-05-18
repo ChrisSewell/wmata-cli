@@ -22,6 +22,7 @@ import {
   addFavorite,
   clearSettings,
   loadSettings,
+  markTutorialSeen,
   removeFavorite,
   reorderFavorites,
   saveApiKey,
@@ -235,6 +236,75 @@ describe("clearSettings", () => {
     const s = loadSettings();
     expect(s.apiKey).toBe("");
     expect(s.favorites).toEqual([]);
+  });
+
+  it("also clears tutorialSeen so a reset truly returns to first-launch state", () => {
+    markTutorialSeen();
+    expect(loadSettings().tutorialSeen).toBe(true);
+    clearSettings();
+    expect(loadSettings().tutorialSeen).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tutorialSeen + markTutorialSeen
+// ---------------------------------------------------------------------------
+//
+// The flag is its own storage key with its own schema-versioned
+// envelope, so adding it did NOT require bumping `SCHEMA_VERSION`
+// (which would have nuked every v1 user's favorites + key). The
+// inference rule replaces a schema migration: on an absent
+// `wmata.g2.tutorialSeen`, infer `true` for users with a saved
+// apiKey (existing v1.1 user) and `false` for clean installs.
+
+describe("loadSettings.tutorialSeen: default + inference", () => {
+  it("returns false on a clean install (no apiKey, no stored flag)", () => {
+    expect(loadSettings().tutorialSeen).toBe(false);
+  });
+
+  it("infers true when a non-empty apiKey is already stored (v1 upgrade path)", () => {
+    saveApiKey("legacy-v1-key");
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("explicit markTutorialSeen() wins over the inference rule", () => {
+    // Clean install + explicit mark → true (no inference involved).
+    markTutorialSeen();
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("a saved empty apiKey does NOT infer 'seen' (the user explicitly cleared)", () => {
+    // saveApiKey('') is the documented "clear key" path. A user who
+    // cleared their key is back to a first-launch-like state for
+    // tutorial purposes — there's no other state worth inferring from.
+    saveApiKey("");
+    expect(loadSettings().tutorialSeen).toBe(false);
+  });
+});
+
+describe("markTutorialSeen + loadSettings roundtrip", () => {
+  it("a marked flag survives across loads", () => {
+    expect(loadSettings().tutorialSeen).toBe(false);
+    markTutorialSeen();
+    expect(loadSettings().tutorialSeen).toBe(true);
+    // Sanity: a second load returns the same value.
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("ignores a corrupt envelope and falls back to the inference rule", () => {
+    saveApiKey("legacy-v1-key");
+    mockStorage.store.set("wmata.g2.tutorialSeen", "{not valid json}");
+    // Falls through to inference: apiKey is set → true.
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("ignores a wrong-typed envelope value and falls back to the inference rule", () => {
+    saveApiKey("legacy-v1-key");
+    mockStorage.store.set(
+      "wmata.g2.tutorialSeen",
+      JSON.stringify({ schemaVersion: 1, value: "not-a-bool" }),
+    );
+    expect(loadSettings().tutorialSeen).toBe(true);
   });
 });
 
