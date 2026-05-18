@@ -53,9 +53,15 @@
 // (a fetch tick AND an independent 1Hz clock tick) and is the only
 // file that touches `Date.now()`.
 
-import type { Train } from "../wmata";
+import type { StandardRoute, Train } from "../wmata";
 import { LINE_WIDTH, padLeft, padRight, truncate } from "../ui/render";
 import { abbreviateStation, formatEta, lineGlyph } from "../ui/format";
+import {
+  buildLineStations,
+  findNearestStationToCircuit,
+  renderLineSchematic,
+  stationsBetween,
+} from "../ui/schematic";
 import type {
   ReduceResult,
   Screen,
@@ -157,6 +163,26 @@ export interface PredictionsFetchResult {
    * at most once per glasses session.
    */
   lastTrainToday: string | null;
+  /**
+   * Resolved live-position data for the pinned train (WP-I). Only
+   * populated when:
+   *   1. The user has a pin (`snapshot.pinned !== null`)
+   *   2. TrainPositions has a matching train (same Line +
+   *      DestinationStationCode)
+   *   3. StandardRoutes has resolved (lazy session cache)
+   *
+   * Otherwise `null` — the schematic + "N stops away" affordance
+   * hides.
+   */
+  pinnedPosition: PinnedPosition | null;
+}
+
+/** Resolved position info for the pinned train. */
+export interface PinnedPosition {
+  /** Schematic row, exactly LINE_WIDTH cols. Renders below the pin. */
+  schematic: string;
+  /** "<N> stops away" / "at this station" / "approaching" label. */
+  label: string;
 }
 
 /** Data the Predictions screen renders against. */
@@ -202,16 +228,27 @@ export interface PredictionsSnapshot {
    * "*" cursor in place of its line-glyph cell.
    *
    * WMATA predictions don't carry a stable `TrainId`, so a pin is
-   * identified by (Line + Destination). If multiple trains match
-   * (a busy commute window with two RD-Glenmont trains stacked),
-   * the FIRST match in the sorted list wins for cursor + summary
-   * display.
+   * identified by (Line + Destination). The optional
+   * `destinationCode` (from `Train.DestinationCode` at pin time)
+   * lets WP-I match against `/TrainPositions/TrainPositions` —
+   * which only carries the station code, not the short name.
    *
    * `null` = no pin. Reset on remount (the pin doesn't persist
    * across navigations — the user explicitly chose it for this
    * Predictions session).
    */
-  pinned: { line: string; destination: string } | null;
+  pinned: {
+    line: string;
+    destination: string;
+    destinationCode?: string | null;
+  } | null;
+  /**
+   * Live position of the pinned train, resolved via
+   * `/TrainPositions/TrainPositions` + `/StandardRoutes` (WP-I).
+   * `null` when no pin, no match, or StandardRoutes hasn't
+   * resolved yet.
+   */
+  pinnedPosition: PinnedPosition | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +478,82 @@ export function renderLastTrainRow(
 }
 
 /**
+ * Resolve a pinned train's live position from TrainPositions +
+ * StandardRoutes. Returns `null` when:
+ *
+ *   - no pin
+ *   - the pin's `destinationCode` is missing (legacy pin from a
+ *     pre-WP-I session)
+ *   - no TrainPositions entry matches (the train hasn't entered
+ *     service yet, or just left the system)
+ *   - StandardRoutes hasn't resolved
+ *
+ * On a hit, returns a `PinnedPosition` carrying:
+ *   - `label` — one of "at this station", "approaching",
+ *     "N stops away" (the distance is in revenue-station hops on
+ *     the line)
+ *   - `schematic` — the 1-row line diagram with the user's
+ *     station and train's nearest station marked
+ *
+ * Exported for the test suite + the `main.ts` fetcher.
+ */
+export function resolvePinnedPosition(
+  pin: PredictionsSnapshot["pinned"],
+  userStationCode: string,
+  positions: readonly import("../wmata").TrainPosition[] | null,
+  routes: readonly StandardRoute[] | null,
+): PinnedPosition | null {
+  if (!pin) return null;
+  if (!positions || !routes) return null;
+  const destCode = pin.destinationCode ?? null;
+  if (typeof destCode !== "string" || destCode.length === 0) return null;
+  // Find the matching train. Multiple trains can share a (line,
+  // destination) on a busy commute — pick the one with the smallest
+  // SecondsAtLocation as a proxy for "most recently moved", which
+  // is the one most likely to be approaching the user.
+  const candidates = positions.filter(
+    (p) =>
+      p.LineCode === pin.line && p.DestinationStationCode === destCode,
+  );
+  if (candidates.length === 0) return null;
+  const match = candidates.reduce((best, p) =>
+    p.SecondsAtLocation < best.SecondsAtLocation ? p : best,
+  );
+
+  const lineStations = buildLineStations(routes, pin.line);
+  if (lineStations.length === 0) return null;
+  const userIdx = lineStations.indexOf(userStationCode);
+
+  const trainStation = findNearestStationToCircuit(
+    routes,
+    pin.line,
+    match.CircuitId,
+  );
+  const trainIdx = trainStation ? lineStations.indexOf(trainStation) : -1;
+
+  // Label: "at this station" / "approaching" / "N stops away".
+  let label = `* ${pin.line} ${pin.destination}`;
+  if (trainIdx >= 0 && userIdx >= 0) {
+    const stops = stationsBetween(lineStations, userStationCode, trainStation!);
+    if (stops !== null) {
+      if (stops === 0) label = `* ${pin.line} at this station`;
+      else if (stops === 1) label = `* ${pin.line} approaching`;
+      else label = `* ${pin.line} ${stops} stops away`;
+    }
+  }
+  const schematic = renderLineSchematic(
+    pin.line,
+    lineStations,
+    userIdx,
+    trainIdx,
+  );
+  return {
+    label: truncate(label, LINE_WIDTH),
+    schematic,
+  };
+}
+
+/**
  * Sort + cap the train list for display. We sort by ETA ascending, with
  * BRD ahead of ARR ahead of any numeric, and unknown sentinels (`""`,
  * `"---"`) at the tail.
@@ -470,7 +583,14 @@ export function sortTrainsForDisplay(trains: readonly Train[]): Train[] {
  * re-renders.
  */
 export function makePredictionsScreen(
-  fetcher: () => Promise<PredictionsFetchResult>,
+  /**
+   * Fetcher accepts the CURRENT snapshot so the implementation can
+   * read `pinned` and conditionally fetch TrainPositions (skipping
+   * the extra round-trip when nothing is pinned).
+   */
+  fetcher: (
+    snapshot: PredictionsSnapshot,
+  ) => Promise<PredictionsFetchResult>,
   initialSnapshot: PredictionsSnapshot,
 ): Screen<PredictionsSnapshot> & {
   tick: (snapshot: PredictionsSnapshot) => Promise<PredictionsSnapshot>;
@@ -496,6 +616,16 @@ export function makePredictionsScreen(
       // train has rolled out of the predictions window).
       const pinRow = renderPinRow(snapshot, visible);
       if (pinRow !== null) lines.push(pinRow);
+
+      // Live-position rows (WP-I): only render when we have a pin
+      // AND TrainPositions has been resolved into a `PinnedPosition`.
+      // Skipped silently when StandardRoutes hasn't loaded yet so
+      // the first Predictions render isn't blocked.
+      if (snapshot.pinned !== null && snapshot.pinnedPosition !== null) {
+        const { label, schematic } = snapshot.pinnedPosition;
+        lines.push(truncate(label, LINE_WIDTH));
+        lines.push(schematic);
+      }
 
       if (visible.length === 0) {
         // Empty state — distinct copy depending on whether we have data
@@ -570,7 +700,15 @@ export function makePredictionsScreen(
         case "TAP": {
           if (visible.length === 0) return { nav };
           const t = visible[cursorIdx]!;
-          const candidate = { line: t.Line, destination: t.Destination };
+          const candidate = {
+            line: t.Line,
+            destination: t.Destination,
+            // Capture DestinationCode so WP-I's TrainPositions
+            // matcher can resolve the same train across ticks even
+            // though the short-name `Destination` may differ
+            // between rail predictions and live positions.
+            destinationCode: t.DestinationCode,
+          };
           // TAP on the already-pinned train toggles the pin off.
           const isAlreadyPinned =
             snapshot.pinned !== null &&
@@ -580,7 +718,9 @@ export function makePredictionsScreen(
             nav,
             snapshot: {
               ...snapshot,
+              // Unpinning clears the resolved live position too.
               pinned: isAlreadyPinned ? null : candidate,
+              pinnedPosition: isAlreadyPinned ? null : snapshot.pinnedPosition,
             },
           };
         }
@@ -606,7 +746,7 @@ export function makePredictionsScreen(
     async tick(snapshot: PredictionsSnapshot): Promise<PredictionsSnapshot> {
       const now = Date.now();
       try {
-        const result = await fetcher();
+        const result = await fetcher(snapshot);
         return {
           ...snapshot,
           trains: result.trains,
@@ -616,6 +756,13 @@ export function makePredictionsScreen(
           // user doesn't see the row blink off if the fetcher only
           // populates it on the first call.
           lastTrainToday: result.lastTrainToday ?? snapshot.lastTrainToday,
+          // Pinned position: same "carry-forward" rule. When the
+          // fetcher reports a fresh `null` (e.g. the user just
+          // unpinned), the reducer already cleared the snapshot
+          // value at TAP time — the fetcher's null is informational,
+          // not authoritative. So preserve the prior when null.
+          pinnedPosition:
+            result.pinnedPosition ?? snapshot.pinnedPosition,
           fetchedAt: now,
           fetchError: null,
           consecutiveFetchFailures: 0,

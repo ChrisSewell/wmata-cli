@@ -38,7 +38,12 @@ import {
   makeInitialJourneySnapshot,
   makeJourneyScreen,
 } from "./screens/journey";
-import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions";
+import {
+  makePredictionsScreen,
+  pickLastTrainTime,
+  resolvePinnedPosition,
+  type PredictionsSnapshot,
+} from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
 import {
@@ -298,7 +303,9 @@ async function bootGlasses(): Promise<void> {
             );
           }
 
-          const fetcher = async () => {
+          const fetcher = async (
+            snapshot: PredictionsSnapshot,
+          ) => {
             const url = buildRailPredictionsUrl(intent.stationCode);
             // Fire predictions + cache-refresh in sequence (not parallel)
             // to keep the request rate under WMATA's 10 req/s ceiling
@@ -316,10 +323,28 @@ async function bootGlasses(): Promise<void> {
               session,
               intent.stationCode,
             );
+            // WP-I live-position lookup. Only burns a fetch when
+            // the user has a pin active — otherwise null. The two
+            // calls run in parallel (StandardRoutes is cached after
+            // the first hit so it's free thereafter).
+            let pinnedPosition = null;
+            if (snapshot.pinned !== null) {
+              const [positions, routes] = await Promise.all([
+                session.getTrainPositions(),
+                session.getStandardRoutes(),
+              ]);
+              pinnedPosition = resolvePinnedPosition(
+                snapshot.pinned,
+                intent.stationCode,
+                positions,
+                routes,
+              );
+            }
             return {
               trains: data.Trains ?? [],
               incidentHeadline: readFirstIncidentHeadline(session),
               lastTrainToday,
+              pinnedPosition,
             };
           };
 
@@ -345,6 +370,10 @@ async function bootGlasses(): Promise<void> {
             // they navigate back to Predictions. This avoids stale
             // pins surviving across station changes.
             pinned: null,
+            // WP-I: resolved once the user pins a train AND the
+            // first TrainPositions tick lands. `null` hides the
+            // schematic + "stops away" rows.
+            pinnedPosition: null,
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);
