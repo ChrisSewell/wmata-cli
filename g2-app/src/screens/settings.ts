@@ -41,6 +41,7 @@ import {
 import {
   loadSettings,
   saveApiKey,
+  saveSttApiKey,
   addFavorite,
   removeFavorite,
   reorderFavorites,
@@ -68,6 +69,8 @@ interface ScreenState {
    * also flips this on success.
    */
   keyAccepted: boolean;
+  /** Deepgram STT API key (optional). */
+  sttApiKey: string;
   favorites: FavoriteStation[];
   /** Debounce timer id for the search input. */
   searchTimer: ReturnType<typeof setTimeout> | null;
@@ -185,6 +188,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     // could never reach the favorites card after a reload without
     // re-validating, which would be hostile UX.
     keyAccepted: initial.apiKey.length > 0,
+    sttApiKey: initial.sttApiKey,
     favorites: initial.favorites,
     searchTimer: null,
     searchResults: [],
@@ -229,8 +233,13 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     class: 'wmata-settings__card',
     'aria-labelledby': 'wmata-settings-favs-title',
   });
+  const sttMount = el('section', {
+    class: 'wmata-settings__card',
+    'aria-labelledby': 'wmata-settings-stt-title',
+  });
   container.appendChild(apiKeyMount);
   container.appendChild(favoritesMount);
+  container.appendChild(sttMount);
 
   // Footer
   const footerResetBtn = el(
@@ -249,6 +258,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     // Full re-init: easiest way to reset every card's local DOM state.
     state.apiKey = '';
     state.keyAccepted = false;
+    state.sttApiKey = '';
     state.favorites = [];
     state.searchResults = [];
     state.searchError = null;
@@ -257,6 +267,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     state.favoritesCountAtLastRender = 0;
     renderApiKeyCard();
     renderFavoritesCard();
+    renderSttCard();
   };
   footerResetBtn.addEventListener('click', onReset);
   container.appendChild(
@@ -382,14 +393,17 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
           state.apiKey = trimmed;
           state.keyAccepted = true;
           setStatus('✓ Key accepted', 'ok');
-          // Favorites card was disabled — re-render so it activates.
+          // Favorites + STT cards were disabled — re-render so they
+          // activate. The STT card shares the favorites-card gating.
           renderFavoritesCard();
+          renderSttCard();
         } else {
           state.keyAccepted = false;
           setStatus('✕ Key rejected — check the value or your network.', 'bad');
-          // Re-render the favorites card so it shows as disabled if it
-          // was previously enabled.
+          // Re-render so the gated cards show as disabled if they
+          // were previously enabled.
           renderFavoritesCard();
+          renderSttCard();
         }
       } finally {
         validateBtn.disabled = false;
@@ -408,6 +422,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
       input.value = '';
       setStatus('', 'info');
       renderFavoritesCard();
+      renderSttCard();
     };
     clearBtn.addEventListener('click', onClear);
 
@@ -799,9 +814,132 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     state.favoritesCountAtLastRender = state.favorites.length;
   }
 
+  // -----------------------------------------------------------------------
+  // STT (Deepgram) card
+  // -----------------------------------------------------------------------
+  //
+  // The card is gated by the same condition as the favorites card
+  // (`keyAccepted && apiKey.length > 0`). It is intentionally
+  // optional — without a Deepgram key the VOICE LOOKUP row on the
+  // glasses fails with a clear "Voice unavailable" message and
+  // bounces back to Home (see `main.ts` → router → 'voice' case).
+  //
+  // There is no validate / probe button. Deepgram doesn't have a
+  // cheap "is this key valid?" endpoint — the cheapest validation is
+  // opening a real streaming WebSocket, which would burn a couple of
+  // hundred ms of audio quota every time the user hits a button.
+  // We rely on implicit validation: if the user's key is wrong, the
+  // first voice attempt will surface a "WebSocket error" on the HUD,
+  // which is sufficient signal to send them back here.
+  function renderSttCard(): void {
+    sttMount.replaceChildren();
+    const gated = !state.keyAccepted || state.apiKey.length === 0;
+    sttMount.setAttribute('aria-disabled', gated ? 'true' : 'false');
+
+    const title = el(
+      'h2',
+      {
+        id: 'wmata-settings-stt-title',
+        class: 'wmata-settings__card-title',
+      },
+      ['Voice (Deepgram STT) — optional'],
+    );
+    sttMount.appendChild(title);
+
+    if (gated) {
+      // Same gating as the favorites card: hide everything but the
+      // title row until the WMATA key is accepted. The user's mental
+      // model is "settings unlock in order" — the STT key is useless
+      // without the WMATA key (no station list to search against),
+      // so deferring it is no worse than the existing favorites flow.
+      sttMount.appendChild(
+        el('p', { class: 'wmata-settings__card-help' }, [
+          'Validate your WMATA API key above to configure voice.',
+        ]),
+      );
+      return;
+    }
+
+    sttMount.appendChild(
+      el('p', { class: 'wmata-settings__card-help' }, [
+        'Optional. Without a key, the VOICE LOOKUP row on the glasses will ' +
+          'fail with a clear error. Get a key from console.deepgram.com.',
+      ]),
+    );
+
+    const label = el(
+      'label',
+      { class: 'wmata-settings__label', for: 'wmata-settings-stt-key' },
+      ['Deepgram API key'],
+    );
+
+    const input = el('input', {
+      id: 'wmata-settings-stt-key',
+      class: 'wmata-settings__input',
+      type: 'password',
+      inputmode: 'text',
+      autocomplete: 'off',
+      autocapitalize: 'off',
+      spellcheck: 'false',
+      placeholder: 'Paste your Deepgram key',
+      value: state.sttApiKey,
+    });
+    input.value = state.sttApiKey;
+
+    const onInput = (): void => {
+      state.sttApiKey = input.value;
+    };
+    input.addEventListener('input', onInput);
+
+    const status = el('div', {
+      class: 'wmata-settings__status wmata-settings__status--info',
+      'aria-live': 'polite',
+      role: 'status',
+    });
+
+    const setStatus = (text: string, kind: 'ok' | 'bad' | 'info'): void => {
+      status.textContent = text;
+      status.className = `wmata-settings__status wmata-settings__status--${kind}`;
+    };
+
+    const saveBtn = el(
+      'button',
+      {
+        type: 'button',
+        class:
+          'wmata-settings__button wmata-settings__button--primary',
+      },
+      ['Save'],
+    );
+
+    const onSave = (): void => {
+      const trimmed = input.value.trim();
+      // Empty is the documented "no STT" state — we intentionally
+      // allow it so the user can clear a previously-saved key by
+      // emptying the input and hitting Save.
+      saveSttApiKey(trimmed);
+      state.sttApiKey = trimmed;
+      setStatus(trimmed.length === 0 ? 'Cleared.' : 'Saved.', 'ok');
+    };
+    saveBtn.addEventListener('click', onSave);
+
+    sttMount.appendChild(
+      el('div', { class: 'wmata-settings__field' }, [label, input]),
+    );
+    sttMount.appendChild(
+      el('div', { class: 'wmata-settings__button-row' }, [saveBtn]),
+    );
+    sttMount.appendChild(status);
+
+    if (state.sttApiKey.length > 0) {
+      setStatus('✓ Key saved', 'ok');
+    }
+  }
+
   // Initial render --------------------------------------------------------
   renderApiKeyCard();
   renderFavoritesCard();
+  renderSttCard();
 
   // -----------------------------------------------------------------------
   // Unmount

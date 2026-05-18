@@ -221,15 +221,21 @@ async function bootGlasses(): Promise<void> {
             unmount = null;
           }
           // The STT engine is the only WMATA-unrelated dependency this
-          // screen needs. `createSttEngine` intentionally throws today
-          // — see `src/screens/voice.ts` for the wiring TODO. We catch
-          // here so the user gets a clear error phase on the HUD
-          // rather than an uncaught exception in the router.
+          // screen needs. `createSttEngine` throws when the user has
+          // not yet entered a Deepgram API key in the companion
+          // settings UI. We catch here so the user gets a clear error
+          // message on the HUD rather than an uncaught exception in
+          // the router, and bounce back to Home.
+          const settings = loadSettings();
           let stt;
           try {
-            stt = createSttEngine(loadSettings().apiKey);
+            stt = createSttEngine(settings.sttApiKey);
           } catch (err) {
-            console.warn(`[router] createSttEngine failed:`, err);
+            console.warn(
+              "[router] Voice unavailable — Deepgram API key not configured. " +
+                "Open the phone app to add one.",
+              err,
+            );
             // Bounce back to Home rather than mounting a half-broken
             // page. The Home screen's footer is the natural recovery
             // surface (and the user can re-attempt or change settings).

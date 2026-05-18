@@ -50,6 +50,13 @@ export type FavoriteStation = {
 export interface Settings {
   apiKey: string;
   favorites: FavoriteStation[];
+  /**
+   * Deepgram streaming-STT API key. Empty string is the documented
+   * "no STT" state (same convention as `apiKey`). With no key the
+   * VOICE LOOKUP row on the glasses will fail with a clear error and
+   * bounce back to Home.
+   */
+  sttApiKey: string;
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -61,6 +68,7 @@ const SCHEMA_VERSION = 1;
 /** Namespaced storage keys so we don't collide with the host app. */
 const KEY_API_KEY = "wmata.g2.apiKey";
 const KEY_FAVORITES = "wmata.g2.favorites";
+const KEY_STT_API_KEY = "wmata.g2.sttApiKey";
 
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -192,6 +200,11 @@ function readApiKey(): string {
   return typeof value === "string" ? value : "";
 }
 
+function readSttApiKey(): string {
+  const value = parseEnvelope(safeGet(KEY_STT_API_KEY));
+  return typeof value === "string" ? value : "";
+}
+
 function readFavorites(): FavoriteStation[] {
   const value = parseEnvelope(safeGet(KEY_FAVORITES));
   return asFavoritesArray(value);
@@ -218,6 +231,7 @@ export function loadSettings(): Settings {
   return {
     apiKey: readApiKey(),
     favorites: readFavorites(),
+    sttApiKey: readSttApiKey(),
   };
 }
 
@@ -232,6 +246,21 @@ export function saveApiKey(key: string): void {
     value: trimmed,
   };
   safeSet(KEY_API_KEY, JSON.stringify(envelope));
+}
+
+/**
+ * Persist the Deepgram STT API key. Whitespace is trimmed. Passing
+ * `""` is allowed and is the documented "no STT" state — the Voice
+ * screen will then fail with a clear error and bounce back to Home,
+ * matching the `saveApiKey("")` convention.
+ */
+export function saveSttApiKey(key: string): void {
+  const trimmed = key.trim();
+  const envelope: Envelope<string> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: trimmed,
+  };
+  safeSet(KEY_STT_API_KEY, JSON.stringify(envelope));
 }
 
 /**
@@ -290,4 +319,5 @@ export function reorderFavorites(newOrder: FavoriteStation[]): FavoriteStation[]
 export function clearSettings(): void {
   safeRemove(KEY_API_KEY);
   safeRemove(KEY_FAVORITES);
+  safeRemove(KEY_STT_API_KEY);
 }

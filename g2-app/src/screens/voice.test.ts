@@ -720,17 +720,40 @@ describe("voice onMount / onUnmount lifecycle", () => {
    */
   function makeBridgeDouble(): {
     audioCalls: boolean[];
+    /**
+     * Latest callback registered through `onEvenHubEvent`. Tests can
+     * drive raw audio events into the screen by invoking this.
+     */
+    emitAudio: (pcm: Uint8Array) => void;
+    /** True after the screen's `onEvenHubEvent` unsubscribe ran. */
+    audioUnsubCalled: () => boolean;
     bridge: import("@evenrealities/even_hub_sdk").EvenAppBridge;
   } {
     const audioCalls: boolean[] = [];
+    let audioCb: ((event: { audioEvent?: { audioPcm: Uint8Array } }) => void) | null =
+      null;
+    let unsubCalled = false;
     const fake = {
       audioControl: (on: boolean): Promise<boolean> => {
         audioCalls.push(on);
         return Promise.resolve(true);
       },
+      onEvenHubEvent: (
+        cb: (event: { audioEvent?: { audioPcm: Uint8Array } }) => void,
+      ): (() => void) => {
+        audioCb = cb;
+        return () => {
+          unsubCalled = true;
+          audioCb = null;
+        };
+      },
     };
     return {
       audioCalls,
+      emitAudio: (pcm: Uint8Array): void => {
+        audioCb?.({ audioEvent: { audioPcm: pcm } });
+      },
+      audioUnsubCalled: () => unsubCalled,
       bridge: fake as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge,
     };
   }
@@ -847,10 +870,32 @@ describe("voice onMount / onUnmount lifecycle", () => {
     expect(stt.stopCount).toBe(1);
   });
 
+  it("forwards raw audioPcm bridge events into pipe.write", async () => {
+    const { screen, stt } = makeRig();
+    const { bridge, emitAudio, audioUnsubCalled } = makeBridgeDouble();
+    const dispatch = (_event: ScreenEvent): void => {
+      /* no-op */
+    };
+    await screen.onMount!(bridge, dispatch);
+    const frameA = new Uint8Array([1, 2, 3, 4]);
+    const frameB = new Uint8Array([5, 6, 7, 8]);
+    emitAudio(frameA);
+    emitAudio(frameB);
+    expect(stt.writes.length).toBe(2);
+    expect(stt.writes[0]).toBe(frameA);
+    expect(stt.writes[1]).toBe(frameB);
+
+    await screen.onUnmount!(bridge);
+    expect(audioUnsubCalled()).toBe(true);
+  });
+
   it("surfaces an audioControl(true) failure as an error-phase event", async () => {
     const failingBridge = {
       audioControl: (_on: boolean): Promise<boolean> =>
         Promise.reject(new Error("mic blocked")),
+      onEvenHubEvent: (_cb: unknown): (() => void) => () => {
+        /* never called — audio control failed */
+      },
     } as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge;
     const { screen } = makeRig();
     const dispatched: ScreenEvent[] = [];
@@ -871,13 +916,57 @@ describe("voice onMount / onUnmount lifecycle", () => {
 // ---------------------------------------------------------------------------
 
 describe("createSttEngine production factory", () => {
-  it("throws a grep-able 'not configured' error mentioning voice.ts", () => {
-    expect(() => createSttEngine("dummy-key")).toThrowError(
-      /voice\.ts/,
-    );
-    expect(() => createSttEngine("dummy-key")).toThrowError(
+  it("throws a grep-able 'not configured' error when the key is empty", () => {
+    expect(() => createSttEngine("")).toThrowError(/voice\.ts/);
+    expect(() => createSttEngine("")).toThrowError(
       /STT provider not configured/,
     );
+  });
+
+  it("throws on whitespace-only keys (treated as empty)", () => {
+    expect(() => createSttEngine("   ")).toThrowError(
+      /STT provider not configured/,
+    );
+  });
+
+  it("returns an SttEngine instance when the key is non-empty", () => {
+    // Stub WebSocket so the Deepgram constructor doesn't attempt a
+    // real network connection during construction. We only need to
+    // verify the factory returns something `start`-able; the deeper
+    // Deepgram tests live in `stt/deepgram.test.ts`.
+    const originalWS = globalThis.WebSocket;
+    class StubWS {
+      static CONNECTING = 0;
+      static OPEN = 1;
+      static CLOSING = 2;
+      static CLOSED = 3;
+      readyState = 0;
+      binaryType = "blob";
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      send(_data: unknown): void {
+        /* no-op */
+      }
+      close(): void {
+        /* no-op */
+      }
+    }
+    (globalThis as unknown as { WebSocket: unknown }).WebSocket = StubWS;
+    try {
+      const engine = createSttEngine("test-key");
+      const pipe = engine.start({
+        onTranscript: () => {},
+        onSilence: () => {},
+        onError: () => {},
+      });
+      expect(typeof pipe.write).toBe("function");
+      expect(typeof pipe.close).toBe("function");
+      pipe.close();
+    } finally {
+      (globalThis as unknown as { WebSocket: unknown }).WebSocket = originalWS;
+    }
   });
 });
 
@@ -895,6 +984,9 @@ describe("voice onMount: in-flight search generation counter", () => {
   function okBridge(): import("@evenrealities/even_hub_sdk").EvenAppBridge {
     const fake = {
       audioControl: (_on: boolean): Promise<boolean> => Promise.resolve(true),
+      onEvenHubEvent: (_cb: unknown): (() => void) => () => {
+        /* test double */
+      },
     };
     return fake as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge;
   }
@@ -962,6 +1054,9 @@ describe("voice onMount: in-flight search generation counter", () => {
   it("dispatches RESOLVE_ERROR + skips STT when audioControl(true) resolves to false", async () => {
     const failingBridge = {
       audioControl: (_on: boolean): Promise<boolean> => Promise.resolve(false),
+      onEvenHubEvent: (_cb: unknown): (() => void) => () => {
+        /* never called — audio control failed */
+      },
     } as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge;
     const { screen, stt } = makeRig();
     const dispatched: ScreenEvent[] = [];
@@ -1003,6 +1098,9 @@ describe("voice onMount: in-flight search generation counter", () => {
       audioControl: (on: boolean): Promise<boolean> => {
         audioCalls.push(on);
         return Promise.resolve(true);
+      },
+      onEvenHubEvent: (_cb: unknown): (() => void) => () => {
+        /* test double */
       },
     } as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge;
     const dispatched: ScreenEvent[] = [];
