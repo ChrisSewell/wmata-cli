@@ -97,6 +97,12 @@ export function readCachedIncidents(): CachedIncidents {
  * occasionally double-space or pad with leading whitespace on the
  * first token. Greedy `\s*` is robust to all of those.
  *
+ * Case normalization: WMATA's contract is uppercase line codes, but we
+ * defensively `.toUpperCase()` each token before the VALID_LINE_CODES
+ * lookup so a future API quirk (or a stray test fixture) doesn't cause
+ * the parser to silently drop a valid line code that arrived in mixed
+ * or lower case.
+ *
  * Result is order-preserving and deduped (the wire format occasionally
  * repeats a code, and we don't want to inflate the affected-lines count).
  */
@@ -107,7 +113,11 @@ export function parseLinesAffected(s: string): LineCode[] {
   // Trim leading whitespace so a string like "  ;BL;" doesn't yield a
   // first token of "  " that fails the LineCode check redundantly.
   for (const raw of s.split(/;\s*/)) {
-    const code = raw.trim();
+    // Normalize to uppercase BEFORE the lookup. The wire contract is
+    // already uppercase per WMATA's docs, but the cost of being robust
+    // is one `.toUpperCase()` per token — well worth it to avoid a
+    // silent data-loss bug if the contract ever slips.
+    const code = raw.trim().toUpperCase();
     if (code.length === 0) continue;
     if (!VALID_LINE_CODES.has(code)) continue;
     if (seen.has(code)) continue;

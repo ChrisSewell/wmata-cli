@@ -15,6 +15,7 @@ import {
   padRight,
   row,
   scrollWindow,
+  scrollWindowWithMarkers,
   truncate,
   withEdgeMarkers,
 } from "./render";
@@ -292,6 +293,85 @@ describe("withEdgeMarkers", () => {
     expect(out).toEqual(["▴", "b", "c", "▾"]);
     // Each marker consumes one row of the caller's budget.
     expect(out.length).toBe(4);
+  });
+});
+
+describe("scrollWindowWithMarkers", () => {
+  // The Reviewer asked for this helper to be promoted out of the
+  // Incidents screen so future scrolling screens don't get the
+  // marker-budget arithmetic wrong. The cases below pin the contract:
+  //   - fits-entirely:        budget rows, no markers.
+  //   - overflow-below-only:  N-1 content rows + `▾` = budget.
+  //   - overflow-above-only:  `▴` + N-1 content rows = budget.
+  //   - overflow-both:        `▴` + N-2 content rows + `▾` = budget.
+  //   - exact-fit edge:       budget rows, no markers.
+  //   - just-over edge:       markers reappear when content > budget.
+  //   - empty / zero-budget:  empty result.
+
+  it("returns all rows with no markers when content fits the budget", () => {
+    const rows = ["a", "b", "c", "d", "e"];
+    const out = scrollWindowWithMarkers(rows, 0, 7);
+    expect(out).toEqual(["a", "b", "c", "d", "e"]);
+    expect(out.length).toBe(5);
+    expect(out.includes("▴")).toBe(false);
+    expect(out.includes("▾")).toBe(false);
+  });
+
+  it("shows 6 rows + `▾` when content overflows below (idx 0, 10 rows, budget 7)", () => {
+    const rows = Array.from({ length: 10 }, (_, i) => `r${i}`);
+    const out = scrollWindowWithMarkers(rows, 0, 7);
+    expect(out.length).toBe(7);
+    expect(out[out.length - 1]).toBe("▾");
+    expect(out.includes("▴")).toBe(false);
+    // 6 content rows, then the marker.
+    expect(out.slice(0, 6)).toEqual(["r0", "r1", "r2", "r3", "r4", "r5"]);
+  });
+
+  it("shows `▴` + 6 rows when content overflows above (idx 9, 10 rows, budget 7)", () => {
+    const rows = Array.from({ length: 10 }, (_, i) => `r${i}`);
+    const out = scrollWindowWithMarkers(rows, 9, 7);
+    expect(out.length).toBe(7);
+    expect(out[0]).toBe("▴");
+    expect(out.includes("▾")).toBe(false);
+    // After the marker: the 6 trailing content rows.
+    expect(out.slice(1)).toEqual(["r4", "r5", "r6", "r7", "r8", "r9"]);
+  });
+
+  it("shows `▴` + 5 rows + `▾` when content overflows in both directions (idx 5, 10 rows, budget 7)", () => {
+    const rows = Array.from({ length: 10 }, (_, i) => `r${i}`);
+    const out = scrollWindowWithMarkers(rows, 5, 7);
+    expect(out.length).toBe(7);
+    expect(out[0]).toBe("▴");
+    expect(out[out.length - 1]).toBe("▾");
+    // 5 content rows between the markers.
+    expect(out.slice(1, -1).length).toBe(5);
+  });
+
+  it("returns 7 rows exactly with no markers at the exact-fit edge (7 rows, budget 7)", () => {
+    const rows = Array.from({ length: 7 }, (_, i) => `r${i}`);
+    const out = scrollWindowWithMarkers(rows, 0, 7);
+    expect(out.length).toBe(7);
+    expect(out.includes("▴")).toBe(false);
+    expect(out.includes("▾")).toBe(false);
+    expect(out).toEqual(["r0", "r1", "r2", "r3", "r4", "r5", "r6"]);
+  });
+
+  it("markers reappear when content is just one row over budget (8 rows, budget 7)", () => {
+    const rows = Array.from({ length: 8 }, (_, i) => `r${i}`);
+    const out = scrollWindowWithMarkers(rows, 0, 7);
+    expect(out.length).toBe(7);
+    expect(out[out.length - 1]).toBe("▾");
+    expect(out.includes("▴")).toBe(false);
+    expect(out.slice(0, 6)).toEqual(["r0", "r1", "r2", "r3", "r4", "r5"]);
+  });
+
+  it("returns [] for an empty rows list at any budget", () => {
+    expect(scrollWindowWithMarkers([], 0, 7)).toEqual([]);
+    expect(scrollWindowWithMarkers([], 5, 1)).toEqual([]);
+  });
+
+  it("returns [] for a zero budget", () => {
+    expect(scrollWindowWithMarkers(["a", "b", "c"], 0, 0)).toEqual([]);
   });
 });
 

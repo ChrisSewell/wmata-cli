@@ -95,6 +95,16 @@ describe("parseLinesAffected", () => {
   it("returns [] when every separator is empty (`;;;`)", () => {
     expect(parseLinesAffected(";;;")).toEqual([]);
   });
+
+  it("normalizes all-lowercase line codes via toUpperCase", () => {
+    // Defensive: WMATA's contract is uppercase but a future API quirk
+    // (or a stray test fixture) shouldn't silently drop valid codes.
+    expect(parseLinesAffected("rd; bl;")).toEqual(["RD", "BL"]);
+  });
+
+  it("normalizes mixed-case line codes via toUpperCase", () => {
+    expect(parseLinesAffected("RD; bl;")).toEqual(["RD", "BL"]);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -178,3 +178,51 @@ export function withEdgeMarkers(window: ScrollWindow): string[] {
 export function highlightPrefix(isHighlighted: boolean): string {
   return isHighlighted ? "> " : "  ";
 }
+
+/**
+ * Resolved scroll-window math: returns the slice of `rows` that fits in
+ * `budget` rows, including ▴/▾ edge markers (each costing 1 row) when
+ * content overflows above/below. Uses the same "minimum-scroll,
+ * top-anchored" strategy as `scrollWindow`.
+ *
+ * The fixed-point step: edge markers consume from the budget, so when
+ * they appear they reduce the visible content; when they don't appear
+ * the content can grow back. Iterates once.
+ *
+ * Why one helper instead of asking callers to compose `scrollWindow` +
+ * `withEdgeMarkers` themselves: the budget arithmetic ("how much room
+ * does the window get after we reserve marker rows?") is fiddly enough
+ * that the first two callers got it wrong. Centralizing the math here
+ * means any future scrolling screen — Incidents today, others later —
+ * gets the same correct behaviour.
+ *
+ * @param rows the full list of body rows (already formatted).
+ * @param highlightedIndex the row to keep in view; clamped to range.
+ * @param budget total row budget INCLUDING any markers we add.
+ * @returns an array of strings, length <= budget, ready to render.
+ */
+export function scrollWindowWithMarkers(
+  rows: string[],
+  highlightedIndex: number,
+  budget: number,
+): string[] {
+  if (budget <= 0) return [];
+  if (rows.length === 0) return [];
+  // Fast path: everything fits, no markers needed.
+  if (rows.length <= budget) {
+    return scrollWindow(rows, highlightedIndex, budget).lines.slice();
+  }
+  // Worst-case pass: reserve 2 rows for both markers. Then check the
+  // actual edge state and grow back any unused marker rows.
+  let win = scrollWindow(rows, highlightedIndex, budget - 2);
+  if (!win.hasMoreAbove || !win.hasMoreBelow) {
+    // Only one edge needs a marker (at most); reclaim the other row.
+    win = scrollWindow(rows, highlightedIndex, budget - 1);
+  }
+  if (!win.hasMoreAbove && !win.hasMoreBelow) {
+    // After the resize the window hits both edges (content fits).
+    // Reclaim the second marker row too.
+    win = scrollWindow(rows, highlightedIndex, budget);
+  }
+  return withEdgeMarkers(win);
+}

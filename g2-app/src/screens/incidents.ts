@@ -46,11 +46,11 @@ import {
   ELLIPSIS,
   LINE_WIDTH,
   USABLE_ROWS,
-  scrollWindow,
+  scrollWindowWithMarkers,
   truncate,
-  withEdgeMarkers,
 } from "../ui/render";
 import { lineGlyph } from "../ui/format";
+import { parseLinesAffected } from "../wmata/incidents-cache";
 import type { LineCode, RailIncident } from "../wmata";
 import type {
   FavoriteStation,
@@ -141,6 +141,12 @@ export interface IncidentsSnapshot {
 export function wrap(text: string, width: number): string[] {
   if (!text) return [];
   if (width <= 0) return [];
+  // Degenerate single-column wraps are not supported: the hard-break
+  // branch would do `slice(0, 0)` -> "" and `slice(0)` -> the same
+  // string, looping forever. Callers always pass BODY_TEXT_WIDTH = 22,
+  // so a safe-return-empty here is the right semantics — throwing
+  // would be more disruptive (it'd surface as a render crash).
+  if (width <= 1) return [];
   const words = text.split(/\s+/).filter((w) => w.length > 0);
   const lines: string[] = [];
   let current = "";
@@ -227,41 +233,16 @@ export function renderGlyphRow(lines: readonly LineCode[]): string {
  * Empty-description incidents collapse to a single row (the glyphs).
  */
 export function formatIncidentBlock(incident: RailIncident): string[] {
-  const lines = parseLineCodesForGlyphRow(incident.LinesAffected);
+  // We import `parseLinesAffected` from the cache module rather than
+  // re-implementing it here. The cache's runtime imports are clean
+  // (a constant, an error class, and types), so the screen module
+  // stays pure — no SDK or network code is pulled in transitively.
+  const lines = parseLinesAffected(incident.LinesAffected ?? "");
   const glyphRow = renderGlyphRow(lines);
   const desc = (incident.Description ?? "").trim();
   if (desc.length === 0) return [glyphRow];
   const wrapped = capDescription(wrap(desc, BODY_TEXT_WIDTH));
   return [glyphRow, ...wrapped];
-}
-
-/**
- * Local mirror of the cache's `parseLinesAffected`. We keep a private
- * copy here so the screen module doesn't reach into the cache (which
- * imports the WMATA client — a transitive dependency we want the pure
- * view module to avoid).
- */
-function parseLineCodesForGlyphRow(s: string): LineCode[] {
-  if (!s) return [];
-  const seen = new Set<string>();
-  const out: LineCode[] = [];
-  const valid: ReadonlySet<string> = new Set<string>([
-    "RD",
-    "BL",
-    "YL",
-    "OR",
-    "GR",
-    "SV",
-  ]);
-  for (const raw of s.split(/;\s*/)) {
-    const code = raw.trim();
-    if (code.length === 0) continue;
-    if (!valid.has(code)) continue;
-    if (seen.has(code)) continue;
-    seen.add(code);
-    out.push(code as LineCode);
-  }
-  return out;
 }
 
 /**
@@ -431,38 +412,13 @@ export function makeIncidentsScreen(
       }
 
       // Body: flatten the pre-formatted blocks and scroll within the
-      // 7-row budget. Edge markers (`▴`/`▾`) consume from that budget,
-      // so we have to size `scrollWindow` accounting for them BEFORE
-      // we know which ones it will need — which is circular. We resolve
-      // it with a tiny fixed-point: compute the window once at the
-      // smaller budget that assumes both markers might be present, then
-      // grow back if the window itself doesn't need a marker on the
-      // appropriate side.
+      // USABLE_ROWS budget. Edge markers (▴/▾) consume from that
+      // budget; `scrollWindowWithMarkers` resolves the circularity
+      // (markers shrink the window which can then need fewer markers)
+      // with a tiny fixed-point so we don't reinvent it per-screen.
       const body = flattenBlocks(snapshot.preformatted);
       const offset = clamp(nav.highlightedIndex, Math.max(0, body.length - 1));
-      // First pass: assume scrolling is needed if body > USABLE_ROWS.
-      let maxBody = USABLE_ROWS;
-      if (body.length > USABLE_ROWS) {
-        // Two markers possible -> shrink budget by 2 in the worst case.
-        // Then check the actual edge state and grow back if a side has
-        // no marker (we never use the marker row for a missing edge).
-        let win = scrollWindow(body, offset, USABLE_ROWS - 2);
-        // If only one side has more content, we can reclaim a row.
-        if (!win.hasMoreAbove || !win.hasMoreBelow) {
-          maxBody = USABLE_ROWS - 1;
-          win = scrollWindow(body, offset, maxBody);
-        }
-        // If, after the resize, the new window now hits both edges
-        // (i.e. fits entirely), we can reclaim the second marker row.
-        if (!win.hasMoreAbove && !win.hasMoreBelow) {
-          win = scrollWindow(body, offset, USABLE_ROWS);
-        }
-        const decorated = withEdgeMarkers(win);
-        for (const r of decorated) lines.push(truncate(r, LINE_WIDTH));
-        return lines;
-      }
-      const win = scrollWindow(body, offset, maxBody);
-      const decorated = withEdgeMarkers(win);
+      const decorated = scrollWindowWithMarkers(body, offset, USABLE_ROWS);
       for (const r of decorated) lines.push(truncate(r, LINE_WIDTH));
       return lines;
     },

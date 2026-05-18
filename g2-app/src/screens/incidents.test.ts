@@ -111,6 +111,32 @@ describe("wrap", () => {
     const out = wrap("a  b\t\nc", 22);
     expect(out).toEqual(["a b c"]);
   });
+
+  it("returns [] at the degenerate width=1 (avoids infinite-loop)", () => {
+    // The hard-break path would do slice(0, 0) -> "" and slice(0) ->
+    // the same string, looping forever. Callers always use
+    // BODY_TEXT_WIDTH = 22; this guard makes the helper safe to call
+    // with a degenerate budget rather than crashing.
+    expect(wrap("Antidisestablishmentarianism", 1)).toEqual([]);
+  });
+
+  it("returns [] at width=0 as well", () => {
+    expect(wrap("anything at all", 0)).toEqual([]);
+  });
+
+  it("hard-breaks a giant word and then continues with following words on subsequent lines", () => {
+    // The hard-break path should leave the residue word in `current`
+    // (no trailing ellipsis on the last chunk) and the next short
+    // words must pack onto the line normally.
+    const out = wrap("Antidisestablishmentarianism more text", 22);
+    for (const l of out) expect(l.length).toBeLessThanOrEqual(22);
+    // First chunk is a 21-char prefix + "…" = 22 cols.
+    expect(out[0]).toBe("Antidisestablishmenta…");
+    // Subsequent lines must contain the trailing short words.
+    const tail = out.slice(1).join(" ");
+    expect(tail).toContain("more");
+    expect(tail).toContain("text");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -174,6 +200,36 @@ describe("formatIncidentBlock", () => {
     expect(block).toEqual(["! BL"]);
   });
 
+  it("drops the description block when Description is whitespace-only", () => {
+    // After trim() the string is empty, so we render just the glyph
+    // row — no all-blank description rows leaking into the body.
+    const block = formatIncidentBlock(
+      incident({ LinesAffected: "BL;", Description: "   \t  " }),
+    );
+    expect(block).toEqual(["! BL"]);
+  });
+
+  it("does not crash when Description is null (defensive)", () => {
+    // The wire type is `string`, but a defensive guard against
+    // corrupted upstream data keeps the screen from blanking. The
+    // result is a single glyph row, no description.
+    const inc = incident({ LinesAffected: "BL;" });
+    const corrupted = {
+      ...inc,
+      Description: null,
+    } as unknown as RailIncident;
+    expect(formatIncidentBlock(corrupted)).toEqual(["! BL"]);
+  });
+
+  it("does not crash when Description is undefined (defensive)", () => {
+    const inc = incident({ LinesAffected: "BL;" });
+    const corrupted = {
+      ...inc,
+      Description: undefined,
+    } as unknown as RailIncident;
+    expect(formatIncidentBlock(corrupted)).toEqual(["! BL"]);
+  });
+
   it("silently drops unknown line codes from the glyph row", () => {
     const block = formatIncidentBlock(
       incident({ LinesAffected: "BL;XX;SV;", Description: "" }),
@@ -228,6 +284,28 @@ describe("renderHeader", () => {
     );
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.endsWith("14:32*")).toBe(true);
+  });
+
+  it("fits at n=99 (two-digit count) in 24 cols with a clock", () => {
+    // ALERTS (99) is 11 cols; 14:32 is 5; spacing fills the rest.
+    const incs = Array.from({ length: 99 }, (_, i) =>
+      incident({ IncidentID: `${i}` }),
+    );
+    const out = renderHeader(makeSnap(incs), NOW);
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.startsWith("ALERTS (99)")).toBe(true);
+    expect(out.endsWith("14:32")).toBe(true);
+  });
+
+  it("fits at n=999 (three-digit count) in 24 cols with a clock", () => {
+    // ALERTS (999) is 12 cols; 14:32 is 5; spacing fills the rest.
+    const incs = Array.from({ length: 999 }, (_, i) =>
+      incident({ IncidentID: `${i}` }),
+    );
+    const out = renderHeader(makeSnap(incs), NOW);
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.startsWith("ALERTS (999)")).toBe(true);
+    expect(out.endsWith("14:32")).toBe(true);
   });
 });
 
@@ -363,6 +441,23 @@ describe("incidents view: 5 incidents — scrolling required", () => {
     }
     expect(nav.highlightedIndex).toBe(0);
   });
+
+  it("a mid-list scroll position shows BOTH `▴` and `▾` simultaneously", () => {
+    // FIVE_INCIDENTS yields 14 body rows. After ~5 SCROLL_DOWNs the
+    // window sits in the middle of the body, so both edge markers
+    // must be present in the same frame.
+    const screen = makeIncidentsScreen(noopFetcher, makeSnap(FIVE_INCIDENTS));
+    let nav = initialNav();
+    for (let i = 0; i < 5; i++) {
+      nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
+    }
+    const lines = screen.view(screen.init(), nav, CTX);
+    expectFits(lines);
+    expect(lines.some((l) => l === "▴")).toBe(true);
+    expect(lines.some((l) => l === "▾")).toBe(true);
+    // Whole frame still fits the budget: header + 7 body rows.
+    expect(lines.length).toBe(1 + 7);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -421,6 +516,29 @@ describe("incidents view: first-load fetch error", () => {
     expectFits(lines);
     expect(lines.some((l) => l.includes("Couldn't reach WMATA"))).toBe(true);
     expect(lines.some((l) => l.includes("No active alerts"))).toBe(false);
+  });
+
+  it("pins the EXACT 5-line first-load error body", () => {
+    // Symmetric with the empty-state pin: lock the lines verbatim so a
+    // future copy change has to update this test on purpose. The
+    // clock carries a trailing `*` because fetchedAt=0 means
+    // never-successful-fetch, which `isStale` reports as stale.
+    const snap = makeSnap([], {
+      fetchedAt: 0,
+      fetchError: "Could not connect.",
+    });
+    const screen = makeIncidentsScreen(noopFetcher, snap);
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expectFits(lines);
+    expect(lines).toEqual([
+      "ALERTS            14:32*",
+      "Couldn't reach WMATA.",
+      "Will retry shortly.",
+      "",
+      "(double-tap to return)",
+    ]);
+    expect(lines.length).toBe(5);
+    expect(lines[0]!.length).toBe(LINE_WIDTH);
   });
 });
 
