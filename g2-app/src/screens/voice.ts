@@ -176,6 +176,15 @@ export function resolveVoiceIntent(
     return { kind: "navigate", intent: { to: "elevator" } };
   }
 
+  // Journey / commute glance.
+  if (
+    normalised === "journey" ||
+    normalised === "commute" ||
+    normalised === "trip"
+  ) {
+    return { kind: "navigate", intent: { to: "journey" } };
+  }
+
   // Last-train glance. Routes to predictions at the home station
   // because that's where the late-night row will surface; the
   // station context matters more than the keyword itself.

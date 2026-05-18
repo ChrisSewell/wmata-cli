@@ -92,6 +92,12 @@ export interface Settings {
    * later without a schema change (the parser drops unknown keys).
    */
   voiceTargets: VoiceTargets;
+  /**
+   * Saved origin→destination pair for the Journey screen (WP-C).
+   * Both fields empty hides the Journey screen entirely. Setting
+   * either or both enables the screen.
+   */
+  journeyPlan: JourneyPlan;
 }
 
 /** Labelled station codes for voice navigation keywords. */
@@ -99,6 +105,22 @@ export interface VoiceTargets {
   /** Station code, e.g. "C01". Empty means unset. */
   home: string;
   work: string;
+}
+
+/**
+ * Saved origin→destination pair for the Journey / Commute screen.
+ * Both fields empty (the default) → the Journey screen is hidden.
+ *
+ * Per the WMATA jPath endpoint, both stations must be on the SAME
+ * line for the path lookup to return data. A cross-line journey
+ * returns an empty Path array and the screen surfaces a friendly
+ * "Not a same-line route" message.
+ */
+export interface JourneyPlan {
+  /** Origin station code, e.g. "C01". Empty = unset. */
+  origin: string;
+  /** Destination station code, e.g. "C04". Empty = unset. */
+  destination: string;
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -114,6 +136,7 @@ const KEY_STT_API_KEY = "wmata.g2.sttApiKey";
 const KEY_TUTORIAL_SEEN = "wmata.g2.tutorialSeen";
 const KEY_SCHEDULE = "wmata.g2.schedule";
 const KEY_VOICE_TARGETS = "wmata.g2.voiceTargets";
+const KEY_JOURNEY_PLAN = "wmata.g2.journeyPlan";
 
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -377,6 +400,25 @@ function writeVoiceTargets(targets: VoiceTargets): void {
   safeSet(KEY_VOICE_TARGETS, JSON.stringify(envelope));
 }
 
+function readJourneyPlan(): JourneyPlan {
+  const value = parseEnvelope(safeGet(KEY_JOURNEY_PLAN));
+  if (!isRecord(value)) return { origin: "", destination: "" };
+  const origin = value["origin"];
+  const destination = value["destination"];
+  return {
+    origin: typeof origin === "string" ? origin : "",
+    destination: typeof destination === "string" ? destination : "",
+  };
+}
+
+function writeJourneyPlan(plan: JourneyPlan): void {
+  const envelope: Envelope<JourneyPlan> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: plan,
+  };
+  safeSet(KEY_JOURNEY_PLAN, JSON.stringify(envelope));
+}
+
 /**
  * Read the tutorial-seen flag.
  *
@@ -425,7 +467,16 @@ export function loadSettings(): Settings {
     tutorialSeen: readTutorialSeen(),
     schedule: readSchedule(),
     voiceTargets: readVoiceTargets(),
+    journeyPlan: readJourneyPlan(),
   };
+}
+
+/** Persist the user's saved journey plan. Pass empty strings to clear. */
+export function saveJourneyPlan(plan: JourneyPlan): void {
+  writeJourneyPlan({
+    origin: plan.origin.trim().toUpperCase(),
+    destination: plan.destination.trim().toUpperCase(),
+  });
 }
 
 /** Persist the user's schedule rules. Pass `[]` to clear. */
@@ -545,4 +596,5 @@ export function clearSettings(): void {
   safeRemove(KEY_TUTORIAL_SEEN);
   safeRemove(KEY_SCHEDULE);
   safeRemove(KEY_VOICE_TARGETS);
+  safeRemove(KEY_JOURNEY_PLAN);
 }

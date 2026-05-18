@@ -75,6 +75,7 @@ export type NavIntent =
   | { to: "elevator" }
   | { to: "voice" }
   | { to: "tutorial" }
+  | { to: "journey" }
   | { to: "exit" };
 
 /**

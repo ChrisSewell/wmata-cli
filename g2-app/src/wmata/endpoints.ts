@@ -35,3 +35,17 @@ export function buildStationTimesUrl(stationCode: string): string {
   const params = new URLSearchParams({ StationCode: stationCode });
   return `${BASE}/Rail.svc/json/jStationTimes?${params.toString()}`;
 }
+
+/**
+ * Build the `jPath` URL for a same-line origin→destination pair.
+ * Per WMATA docs, jPath is single-line only — passing a cross-line
+ * pair returns an empty Path array. Callers can detect that by
+ * checking `path.length === 0`.
+ */
+export function buildPathUrl(from: string, to: string): string {
+  const params = new URLSearchParams({
+    FromStationCode: from,
+    ToStationCode: to,
+  });
+  return `${BASE}/Rail.svc/json/jPath?${params.toString()}`;
+}

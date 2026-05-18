@@ -22,6 +22,7 @@ export {
   RAIL_STATION_INFO,
   buildRailPredictionsUrl,
   buildStationTimesUrl,
+  buildPathUrl,
 } from "./endpoints";
 
 export type {
@@ -34,9 +35,11 @@ export type {
   StationTrainTime,
   DayStationTimes,
   StationTimes,
+  PathStep,
   PredictionsResponse,
   IncidentsResponse,
   ElevatorIncidentsResponse,
   StationsResponse,
   StationTimesResponse,
+  PathResponse,
 } from "./types";

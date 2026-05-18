@@ -32,12 +32,15 @@ import {
   WmataError,
   INCIDENTS_ELEVATOR,
   INCIDENTS_RAIL,
+  buildPathUrl,
   buildStationTimesUrl,
   getStations as fetchStations,
   type ElevatorIncident,
   type ElevatorIncidentsResponse,
   type IncidentsResponse,
   type LineCode,
+  type PathResponse,
+  type PathStep,
   type RailIncident,
   type Station,
   type StationTimes,
@@ -326,6 +329,46 @@ class StationTimesCache {
 }
 
 // ---------------------------------------------------------------------------
+// PathCache (internal)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazy origin→destination path cache. WMATA's `jPath` returns an
+ * ordered station list for any same-line pair and an empty list for
+ * cross-line pairs. Both outcomes are stable for the life of a
+ * glasses session — the WMATA network topology doesn't change
+ * mid-session — so we cache by `"FROM|TO"` and never refetch.
+ *
+ * Failure path: a network error is NOT cached. Returns `null` and
+ * the next call retries (same convention as `StationTimesCache`).
+ */
+class PathCache {
+  private readonly byPair = new Map<string, PathStep[]>();
+
+  constructor(private readonly client: WmataClient) {}
+
+  async get(from: string, to: string): Promise<PathStep[] | null> {
+    const a = from.toUpperCase().trim();
+    const b = to.toUpperCase().trim();
+    if (a.length === 0 || b.length === 0) return null;
+    const key = `${a}|${b}`;
+    const cached = this.byPair.get(key);
+    if (cached) return cached;
+    try {
+      const data = await this.client.get<PathResponse>(buildPathUrl(a, b));
+      const path = data.Path ?? [];
+      // Empty list means "cross-line pair" per WMATA docs. We still
+      // cache it as the canonical answer — the topology doesn't
+      // change — so a follow-up call doesn't re-hit the network.
+      this.byPair.set(key, path);
+      return path;
+    } catch {
+      return null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -342,6 +385,7 @@ export class Session {
   private readonly incidentsCache: IncidentsCache;
   private readonly elevatorIncidentsCache: ElevatorIncidentsCache;
   private readonly stationTimesCache: StationTimesCache;
+  private readonly pathCache: PathCache;
 
   /**
    * Build a Session from an API key (production path) or from a
@@ -360,6 +404,7 @@ export class Session {
     this.incidentsCache = new IncidentsCache(this.client);
     this.elevatorIncidentsCache = new ElevatorIncidentsCache(this.client);
     this.stationTimesCache = new StationTimesCache(this.client);
+    this.pathCache = new PathCache(this.client);
   }
 
   // -- Stations -------------------------------------------------------------
@@ -419,5 +464,19 @@ export class Session {
    */
   getStationTimes(code: string): Promise<StationTimes | null> {
     return this.stationTimesCache.get(code);
+  }
+
+  // -- Path (jPath) ---------------------------------------------------------
+
+  /**
+   * Lazy-load the same-line origin→destination path. Returns
+   *   - `null`  if the lookup failed (network error)
+   *   - `[]`    if the pair is cross-line (WMATA returns empty)
+   *   - `PathStep[]` otherwise (ordered, 1-based `SeqNum`)
+   *
+   * Cached for the rest of the session.
+   */
+  getPath(from: string, to: string): Promise<PathStep[] | null> {
+    return this.pathCache.get(from, to);
   }
 }

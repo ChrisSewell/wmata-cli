@@ -33,6 +33,10 @@ import {
   makeElevatorScreen,
   makeInitialElevatorSnapshot,
 } from "./screens/elevator";
+import {
+  makeInitialJourneySnapshot,
+  makeJourneyScreen,
+} from "./screens/journey";
 import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
@@ -392,6 +396,36 @@ async function bootGlasses(): Promise<void> {
               resolveVoiceIntent(transcript, loadSettings().voiceTargets),
           );
           router.current = "voice";
+          unmount = await mountGlassesScreen(screen, bridge, router);
+          return;
+        }
+        case "journey": {
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          const plan = loadSettings().journeyPlan;
+          const fetcher = async () => {
+            if (plan.origin.length === 0 || plan.destination.length === 0) {
+              return { path: null, originName: "", destinationName: "" };
+            }
+            // Resolve names + path in parallel — both come from cached
+            // session calls so this is essentially free after the
+            // first round trip.
+            const [origStation, destStation, path] = await Promise.all([
+              session.resolveStationCode(plan.origin),
+              session.resolveStationCode(plan.destination),
+              session.getPath(plan.origin, plan.destination),
+            ]);
+            return {
+              path,
+              originName: origStation?.Name ?? plan.origin,
+              destinationName: destStation?.Name ?? plan.destination,
+            };
+          };
+          const initial = makeInitialJourneySnapshot(plan);
+          const screen = makeJourneyScreen(fetcher, initial);
+          router.current = "journey";
           unmount = await mountGlassesScreen(screen, bridge, router);
           return;
         }

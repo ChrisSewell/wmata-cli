@@ -172,6 +172,24 @@ export interface StationTimesResponse {
   StationTimes: StationTimes[];
 }
 
+/**
+ * One station along a same-line path from `/Rail.svc/json/jPath`.
+ *
+ * `DistanceToPrev` is the distance (in feet) to the previous station
+ * in the sequence; the first entry returns 0. `SeqNum` is 1-based.
+ */
+export interface PathStep {
+  DistanceToPrev: number;
+  LineCode: string;
+  SeqNum: number;
+  StationCode: string;
+  StationName: string;
+}
+
+export interface PathResponse {
+  Path: PathStep[];
+}
+
 export interface StationsResponse {
   Stations: Station[];
 }
