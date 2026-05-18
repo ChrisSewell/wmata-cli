@@ -110,7 +110,6 @@ async function bootGlasses(): Promise<void> {
             fetchedAt: 0,
             fetchError: null,
             incidentHeadline: null,
-            nowMs: Date.now(),
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);

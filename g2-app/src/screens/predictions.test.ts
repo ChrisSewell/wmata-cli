@@ -13,11 +13,22 @@
 //     navigates BACK to Home (not exit).
 //   - tick() folds the fetcher result into a new snapshot and never
 //     throws — fetch errors land in `fetchError`.
+//   - The wall clock and stale check are driven by `ViewContext.nowMs`
+//     (host-supplied), NOT by the snapshot. A hung fetch must not
+//     freeze the on-glasses clock.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LINE_WIDTH } from "../ui/render";
 import type { Train } from "../wmata";
-import { initialNav } from "./router";
+import { initialNav, type ViewContext } from "./router";
+import { mountGlassesScreen } from "./glasses-host";
+import {
+  StartUpPageCreateResult,
+  type CreateStartUpPageContainer,
+  type EvenAppBridge,
+  type EvenHubEvent,
+  type TextContainerUpgrade,
+} from "@evenrealities/even_hub_sdk";
 import {
   MAX_VISIBLE_TRAINS,
   STALE_THRESHOLD_MS,
@@ -32,6 +43,7 @@ import {
   type PredictionsFetchResult,
   type PredictionsSnapshot,
 } from "./predictions";
+import type { NavIntent, Router } from "./router";
 
 // ---------------------------------------------------------------------------
 // Helpers / fixtures
@@ -62,6 +74,13 @@ function train(over: Partial<Train>): Train {
 /** A fixed wall clock — May 18 2026 14:32 local. */
 const NOW = new Date(2026, 4, 18, 14, 32, 0).getTime();
 
+/**
+ * Standard `ViewContext` used by every `view(...)` call in this suite.
+ * Held constant at `NOW` so the renders are deterministic; individual
+ * tests that need a different time pass an inline override.
+ */
+const CTX: ViewContext = { nowMs: NOW };
+
 function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
   return {
     stationCode: "A01",
@@ -70,7 +89,6 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     fetchedAt: NOW,
     fetchError: null,
     incidentHeadline: null,
-    nowMs: NOW,
     ...over,
   };
 }
@@ -106,23 +124,23 @@ describe("formatClock", () => {
 
 describe("isStale", () => {
   it("treats a never-fetched snapshot (fetchedAt=0) as stale", () => {
-    expect(isStale(snap({ fetchedAt: 0 }))).toBe(true);
+    expect(isStale(snap({ fetchedAt: 0 }), NOW)).toBe(true);
   });
 
   it("treats a fresh fetch (now - fetchedAt < threshold) as not stale", () => {
-    expect(isStale(snap({ fetchedAt: NOW - 5_000 }))).toBe(false);
+    expect(isStale(snap({ fetchedAt: NOW - 5_000 }), NOW)).toBe(false);
   });
 
   it("treats an old fetch (> STALE_THRESHOLD_MS) as stale", () => {
     expect(
-      isStale(snap({ fetchedAt: NOW - (STALE_THRESHOLD_MS + 1_000) })),
+      isStale(snap({ fetchedAt: NOW - (STALE_THRESHOLD_MS + 1_000) }), NOW),
     ).toBe(true);
   });
 
   it("treats any fetch error as stale, regardless of recency", () => {
-    expect(
-      isStale(snap({ fetchedAt: NOW, fetchError: "boom" })),
-    ).toBe(true);
+    expect(isStale(snap({ fetchedAt: NOW, fetchError: "boom" }), NOW)).toBe(
+      true,
+    );
   });
 });
 
@@ -132,7 +150,7 @@ describe("isStale", () => {
 
 describe("renderHeader", () => {
   it("renders a short station name + clock at exactly LINE_WIDTH cols", () => {
-    const out = renderHeader(snap({ stationName: "Metro Center" }));
+    const out = renderHeader(snap({ stationName: "Metro Center" }), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("Metro Center");
     expect(out).toContain("14:32");
@@ -141,6 +159,7 @@ describe("renderHeader", () => {
   it("abbreviates a long station name to fit the 18-col name budget", () => {
     const out = renderHeader(
       snap({ stationName: "U Street/African-Amer Civil War Memorial/Cardozo" }),
+      NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("U Street");
@@ -150,19 +169,23 @@ describe("renderHeader", () => {
   it("appends '*' when the snapshot is stale (old fetchedAt, no error)", () => {
     const out = renderHeader(
       snap({ fetchedAt: NOW - (STALE_THRESHOLD_MS + 1_000) }),
+      NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.endsWith("14:32*")).toBe(true);
   });
 
   it("appends '?' when there is an active fetch error", () => {
-    const out = renderHeader(snap({ fetchError: "Network down" }));
+    const out = renderHeader(snap({ fetchError: "Network down" }), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.endsWith("14:32?")).toBe(true);
   });
 
-  it("renders '--:--' placeholder when nowMs is zero", () => {
-    const out = renderHeader(snap({ nowMs: 0, fetchedAt: 0 }));
+  it("renders '--:--' placeholder when ctx.nowMs is zero", () => {
+    // The wall clock is now sourced from `ctx.nowMs` (passed via the
+    // 2nd arg here), not from the snapshot. A zero clock should still
+    // produce the canonical placeholder.
+    const out = renderHeader(snap({ fetchedAt: 0 }), 0);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("--:--");
   });
@@ -235,6 +258,47 @@ describe("renderTrainRow", () => {
 });
 
 // ---------------------------------------------------------------------------
+// renderTrainRow: Destination / DestinationName fallback (Reviewer Nit #3)
+// ---------------------------------------------------------------------------
+
+describe("renderTrainRow: Destination / DestinationName fallback", () => {
+  // WMATA's Next Train Predictions endpoint returns BOTH `Destination`
+  // (short abbreviation, e.g. "Vienna") and `DestinationName` (full,
+  // e.g. "Vienna/Fairfax-GMU"). For non-revenue/special-service trains
+  // `Destination` is occasionally returned as the empty string while
+  // `DestinationName` carries the only readable label. Our renderer
+  // therefore PREFERS `Destination` when non-empty and falls back to
+  // `DestinationName` only when the primary field is blank.
+  //
+  // Source for the dual-field contract: docs/wmata-api/predictions.md
+  // (also visible in `Train` in src/wmata/types.ts where both fields
+  // are typed `string`).
+
+  it("falls back to DestinationName when Destination is empty", () => {
+    const out = renderTrainRow(
+      train({ Destination: "", DestinationName: "Vienna" }),
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    // The dest cell should show "Vienna", not be blank.
+    expect(out).toContain("Vienna");
+  });
+
+  it("prefers Destination over DestinationName when both are non-empty", () => {
+    // The impl prefers the (short) `Destination` field even when it
+    // looks like an abbreviation — `DestinationName` is the fallback,
+    // not the override. We assert that here so a future refactor that
+    // flips the priority will fail this test loudly.
+    const out = renderTrainRow(
+      train({ Destination: "VN", DestinationName: "Vienna" }),
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out).toContain("VN");
+    // "Vienna" must NOT appear (it would imply DestinationName won).
+    expect(out).not.toContain("Vienna");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // sortTrainsForDisplay
 // ---------------------------------------------------------------------------
 
@@ -278,9 +342,9 @@ describe("sortTrainsForDisplay", () => {
 describe("predictions view: empty state", () => {
   it("renders header + 'No trains predicted.' + a (double-tap to exit) cue", () => {
     const screen = makePredictionsScreen(noopFetcher, snap({ trains: [] }));
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
-    expect(lines[0]).toBe(renderHeader(screen.init()));
+    expect(lines[0]).toBe(renderHeader(screen.init(), CTX.nowMs));
     expect(lines.some((l) => l.includes("No trains predicted"))).toBe(true);
     expect(lines.some((l) => l.includes("double-tap to exit"))).toBe(true);
   });
@@ -288,9 +352,35 @@ describe("predictions view: empty state", () => {
   it("renders a 'Loading…' cue when fetchedAt=0 and no fetchError", () => {
     const initial = snap({ trains: [], fetchedAt: 0, fetchError: null });
     const screen = makePredictionsScreen(noopFetcher, initial);
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines.some((l) => l.includes("Loading"))).toBe(true);
+  });
+
+  // Reviewer Nit #7: pin the never-fetched empty state to EXACT
+  // strings so the layout can't drift silently. Header line is built
+  // by `renderHeader` and includes the stale marker (since
+  // `fetchedAt === 0`); the body is the literal "Loading…" cue + a
+  // blank spacer + the double-tap cue.
+  it("pins the exact line array for the 'Loading…' never-fetched state", () => {
+    const initial = snap({
+      stationName: "Metro Center",
+      trains: [],
+      fetchedAt: 0,
+      fetchError: null,
+    });
+    const screen = makePredictionsScreen(noopFetcher, initial);
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    // Header: "Metro Center" + spaces + "14:32" + "*" (stale because
+    // never fetched). With the marker present the name cell shrinks
+    // from 18 to 17 cols, so total = 17 + 1 + 6 = 24.
+    expect(lines).toEqual([
+      "Metro Center      14:32*",
+      "Loading…",
+      "",
+      "(double-tap to exit)",
+    ]);
+    expect(lines[0]!.length).toBe(LINE_WIDTH);
   });
 });
 
@@ -304,7 +394,7 @@ describe("predictions view: 1, 3, 5 trains", () => {
       noopFetcher,
       snap({ trains: [train({ Min: "5" })] }),
     );
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expect(lines.length).toBe(2);
     expectFits(lines);
   });
@@ -316,7 +406,7 @@ describe("predictions view: 1, 3, 5 trains", () => {
       train({ Line: "OR", Destination: "Vienna/Fairfax-GMU", Min: "5" }),
     ];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expect(lines.length).toBe(4);
     expectFits(lines);
   });
@@ -330,7 +420,7 @@ describe("predictions view: 1, 3, 5 trains", () => {
       train({ Line: "BL", Destination: "Franconia-Springfield", Min: "9" }),
     ];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expect(lines.length).toBe(6);
     expectFits(lines);
   });
@@ -353,7 +443,7 @@ describe("predictions view: 8+ trains caps at MAX_VISIBLE_TRAINS", () => {
       train({ Destination: "T-7", Min: "7" }),
     ];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     // header + MAX_VISIBLE_TRAINS body rows = 6
     expect(lines.length).toBe(1 + MAX_VISIBLE_TRAINS);
     expectFits(lines);
@@ -415,7 +505,7 @@ describe("predictions view: adversarial fixtures", () => {
         trains,
       }),
     );
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     // Header carries the abbreviated station; every body row carries an
     // abbreviated destination — none of the raw long names should bleed
@@ -471,7 +561,7 @@ describe("predictions view: footer presence", () => {
       noopFetcher,
       snap({ trains, incidentHeadline: "Single-tracking RD" }),
     );
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     // header + 1 train + footer = 3
     expect(lines.length).toBe(3);
@@ -481,7 +571,7 @@ describe("predictions view: footer presence", () => {
   it("omits the footer row entirely when there is nothing to surface", () => {
     const trains: Train[] = [train({ Min: "ARR" })];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines.length).toBe(2); // header + 1 train, no footer
   });
@@ -539,8 +629,6 @@ describe("predictions tick", () => {
     expect(next.incidentHeadline).toBe("Single-tracking RD");
     expect(next.fetchError).toBeNull();
     expect(next.fetchedAt).toBeGreaterThan(0);
-    // nowMs is advanced to the wall clock so staleness is re-evaluated.
-    expect(next.nowMs).toBeGreaterThanOrEqual(next.fetchedAt);
   });
 
   it("never throws: a rejected fetcher stores the error on the snapshot", async () => {
@@ -560,6 +648,164 @@ describe("predictions tick", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Stale-check is driven by ctx.nowMs, not the snapshot
+// ---------------------------------------------------------------------------
+
+describe("predictions: stale check uses ctx.nowMs (not the snapshot)", () => {
+  it("recomputes the stale marker as ctx.nowMs advances and a tick later refreshes fetchedAt", async () => {
+    const T = NOW;
+    // 1) Snapshot fetched 70s ago — stale relative to T (threshold 60s).
+    const s1: PredictionsSnapshot = snap({ fetchedAt: T - 70_000 });
+    expect(isStale(s1, T)).toBe(true);
+    const h1 = renderHeader(s1, T);
+    expect(h1.endsWith("*")).toBe(true);
+
+    // 2) Same snapshot, 5s of wall-clock later (still no fetch). The
+    //    host has only run the 1Hz clock tick — the snapshot.fetchedAt
+    //    hasn't moved, so the marker MUST still be present.
+    expect(isStale(s1, T + 5_000)).toBe(true);
+    const h2 = renderHeader(s1, T + 5_000);
+    expect(h2.endsWith("*")).toBe(true);
+
+    // 3) A fetch tick finally lands and refreshes fetchedAt to T+5s.
+    //    From that moment the snapshot is fresh again, so the marker
+    //    disappears.
+    const fetcher = () =>
+      Promise.resolve<PredictionsFetchResult>({
+        trains: [],
+        incidentHeadline: null,
+      });
+    const screen = makePredictionsScreen(fetcher, s1);
+    // Pin Date.now() so the tick stamps fetchedAt deterministically.
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(T + 5_000);
+    try {
+      const s2 = await screen.tick(s1);
+      expect(s2.fetchedAt).toBe(T + 5_000);
+      expect(isStale(s2, T + 5_000)).toBe(false);
+      const h3 = renderHeader(s2, T + 5_000);
+      expect(h3.endsWith("*")).toBe(false);
+      expect(h3.endsWith("?")).toBe(false);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clock decoupled from fetch (hung-fetch regression test)
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal fake bridge that records every textContainerUpgrade payload.
+ * Mirrors the helper in `glasses-host.test.ts` — duplicated here so the
+ * Predictions test file can drive `mountGlassesScreen` for the hung-
+ * fetch regression case without cross-importing test helpers.
+ */
+function makeFakeBridge(): {
+  bridge: EvenAppBridge;
+  upgrades: string[];
+} {
+  const upgrades: string[] = [];
+  const fake = {
+    createStartUpPageContainer: (
+      _container: CreateStartUpPageContainer,
+    ): Promise<StartUpPageCreateResult> =>
+      Promise.resolve(StartUpPageCreateResult.success),
+    textContainerUpgrade: (
+      container: TextContainerUpgrade,
+    ): Promise<boolean> => {
+      const content =
+        (container as unknown as { content?: string }).content ?? "";
+      upgrades.push(content);
+      return Promise.resolve(true);
+    },
+    shutDownPageContainer: (_exitMode?: number): Promise<boolean> =>
+      Promise.resolve(true),
+    onEvenHubEvent: (_cb: (event: EvenHubEvent) => void): (() => void) => {
+      return () => {
+        /* no-op */
+      };
+    },
+  };
+  return { bridge: fake as unknown as EvenAppBridge, upgrades };
+}
+
+function makeStubRouter(): Router {
+  return {
+    current: "predictions" as NavIntent["to"],
+    navigate: (_intent: NavIntent): Promise<void> => Promise.resolve(),
+  };
+}
+
+describe("predictions: clock decoupled from fetch (hung-fetch regression)", () => {
+  it("the 1Hz clock tick re-renders the screen with progressing nowMs even when tick() never resolves", async () => {
+    vi.useFakeTimers();
+    try {
+      // Anchor wall-clock so the formatted "HH:MM" string is deterministic
+      // (the timer-driven render reads Date.now() inside the host).
+      vi.setSystemTime(new Date(2026, 4, 18, 14, 32, 0));
+
+      // A screen whose fetch is permanently stuck. `tick()` never
+      // resolves; we want to prove the on-screen clock still advances.
+      const initial = snap({
+        stationName: "Metro Center",
+        trains: [],
+        fetchedAt: 0,
+        fetchError: null,
+      });
+      const hungFetcher = (): Promise<PredictionsFetchResult> =>
+        new Promise(() => {
+          /* never resolves */
+        });
+      const screen = makePredictionsScreen(hungFetcher, initial);
+
+      const { bridge, upgrades } = makeFakeBridge();
+      const router = makeStubRouter();
+      const unmount = await mountGlassesScreen(screen, bridge, router);
+
+      // The initial mount renders once. Subsequent ticks fire on the
+      // 1000ms clock interval. Advance 5 seconds of fake time, allowing
+      // the awaited bridge promises to drain between each tick.
+      const renderedClocks: string[] = [];
+      const grab = (): void => {
+        const last = upgrades[upgrades.length - 1];
+        if (last) renderedClocks.push(last.split("\n")[0] ?? "");
+      };
+      grab();
+
+      for (let s = 1; s <= 5; s++) {
+        // Bump system clock so HH:MM changes; advance fake timers so
+        // the 1Hz interval callback fires.
+        vi.setSystemTime(new Date(2026, 4, 18, 14, 32 + s, 0));
+        await vi.advanceTimersByTimeAsync(1000);
+        grab();
+      }
+
+      // We should have at LEAST 4 re-renders (one per clock tick) on
+      // top of the initial render. In practice the dedupe filter passes
+      // every one because HH:MM changes each step.
+      expect(upgrades.length).toBeGreaterThanOrEqual(5);
+
+      // Each rendered first line is the header; pull the clock substring
+      // out and check they're strictly increasing in minutes. Header
+      // shape: "<name padded> HH:MM*"  (the snapshot is stale because
+      // `fetchedAt === 0`, so the `*` marker is present.)
+      const minutes = renderedClocks
+        .map((line) => line.match(/(\d{2}):(\d{2})/))
+        .filter((m): m is RegExpMatchArray => m !== null)
+        .map((m) => Number(m[1]) * 60 + Number(m[2]));
+      // At least 5 distinct clock values across the renders.
+      const distinct = new Set(minutes);
+      expect(distinct.size).toBeGreaterThanOrEqual(5);
+
+      await unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Snapshot pin: canonical 3-train render at Metro Center, no incident
 // ---------------------------------------------------------------------------
 
@@ -574,7 +820,7 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
       noopFetcher,
       snap({ stationName: "Metro Center", trains }),
     );
-    const lines = screen.view(screen.init(), initialNav());
+    const lines = screen.view(screen.init(), initialNav(), CTX);
 
     expectFits(lines);
     // Exact-pin against the canonical render. Cells (24 cols total):

@@ -56,6 +56,7 @@ import type {
   Router,
   Screen,
   ScreenEvent,
+  ViewContext,
 } from "./router";
 import { initialNav } from "./router";
 
@@ -68,6 +69,20 @@ const TEXT_CONTAINER_ID = 1;
  * renders any items; it exists only as an event source.
  */
 const LIST_CONTAINER_ID = 2;
+
+/**
+ * Cadence for the screen-independent clock-only re-render. Every
+ * 1000ms the host calls `screen.view(snapshot, nav, { nowMs:
+ * Date.now() })` and pushes the result through the bridge — without
+ * invoking `screen.tick`. This keeps the on-HUD clock (and any
+ * stale-marker logic) advancing even when a fetch has hung.
+ *
+ * Cheap: one `setInterval`, one `Date.now()`, one `view()` call per
+ * second. Output is de-duped against `lastRenderedContent` so a
+ * no-op clock tick (e.g. inside the same minute) does not retransmit
+ * an identical container payload.
+ */
+const CLOCK_TICK_MS = 1000;
 
 /** Map a raw SDK eventType to `OsEventTypeList`, defaulting to CLICK_EVENT (0). */
 function normalizeEventType(raw: OsEventTypeList | undefined): OsEventTypeList {
@@ -193,6 +208,19 @@ export async function mountGlassesScreen<S>(
   let nav: NavState = initialNav();
   let active = true;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Independent 1Hz timer that re-renders with a fresh wall clock.
+   * Decoupled from `tickTimer` (the fetch cadence) so a hung fetch
+   * cannot freeze the HUD clock or stall the stale-marker check.
+   */
+  let clockTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Last content string we successfully pushed to the bridge. Used
+   * to skip a redundant `textContainerUpgrade` when a clock tick
+   * lands inside the same minute (i.e. the rendered string is byte-
+   * identical to the previous one). Reset on unmount.
+   */
+  let lastRenderedContent: string | null = null;
 
   // Single-flight tick guard.
   //
@@ -220,16 +248,34 @@ export async function mountGlassesScreen<S>(
   let inFlightTick = false;
   let tickGeneration = 0;
 
+  /**
+   * Build a fresh `ViewContext` for the current render. The host is
+   * the single source of `Date.now()` — screens never reach for the
+   * wall clock themselves.
+   */
+  const makeCtx = (): ViewContext => ({ nowMs: Date.now() });
+
   // Render-loop guard: ignore events that arrive after unmount.
+  //
+  // De-duplication: if the rendered content is byte-identical to the
+  // last frame we pushed, skip the `textContainerUpgrade` entirely.
+  // This is the cheap optimisation that makes the 1Hz clock tick
+  // essentially free inside a minute (the only thing that can change
+  // within 60s of clock ticks is the HH:MM string, which only flips
+  // at the minute boundary; everything else in the snapshot is held
+  // steady between fetch ticks).
   const render = async (): Promise<void> => {
     if (!active) return;
-    const lines = screen.view(snapshot, nav);
+    const lines = screen.view(snapshot, nav, makeCtx());
+    const content = joinForRender(lines);
+    if (content === lastRenderedContent) return;
     const update = new TextContainerUpgrade({
       containerID: TEXT_CONTAINER_ID,
-      content: joinForRender(lines),
+      content,
     });
     try {
       await bridge.textContainerUpgrade(update);
+      lastRenderedContent = content;
     } catch (err) {
       console.warn(`[glasses-host] textContainerUpgrade failed:`, err);
     }
@@ -237,7 +283,8 @@ export async function mountGlassesScreen<S>(
 
   // Mount the page. A non-success result still leaves event handlers
   // wired so the user can double-tap out.
-  const initialContent = joinForRender(screen.view(snapshot, nav));
+  const initialContent = joinForRender(screen.view(snapshot, nav, makeCtx()));
+  lastRenderedContent = initialContent;
   try {
     const result = await bridge.createStartUpPageContainer(
       buildPage(initialContent),
@@ -298,6 +345,17 @@ export async function mountGlassesScreen<S>(
     }, screen.tickIntervalMs);
   }
 
+  // Wire up the always-on 1Hz clock tick. This is independent of the
+  // fetch interval (and runs whether or not the screen opted into a
+  // `tick`/`tickIntervalMs`). It calls `render()` with a freshly
+  // stamped `ctx.nowMs`; the de-dup cache means most ticks are no-ops
+  // (HH:MM doesn't change inside the same minute). The whole point
+  // is to keep the visible clock advancing even while a fetch is hung.
+  clockTimer = setInterval(() => {
+    if (!active) return;
+    void render();
+  }, CLOCK_TICK_MS);
+
   const unsubscribe = bridge.onEvenHubEvent((event: EvenHubEvent) => {
     if (!active) return;
 
@@ -336,6 +394,16 @@ export async function mountGlassesScreen<S>(
       clearInterval(tickTimer);
       tickTimer = null;
     }
+    // The clock tick is always-on regardless of `tickIntervalMs`, so
+    // its timer must be torn down here too — otherwise a stale 1Hz
+    // render would keep firing after the page is gone.
+    if (clockTimer !== null) {
+      clearInterval(clockTimer);
+      clockTimer = null;
+    }
+    // Forget the dedupe cache so a future re-mount of the same screen
+    // doesn't accidentally short-circuit its first render.
+    lastRenderedContent = null;
     try {
       unsubscribe();
     } catch (err) {

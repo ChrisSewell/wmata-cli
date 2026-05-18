@@ -46,15 +46,22 @@
 //              consumes one column from the name budget when present).
 //
 // PURITY: This module has no SDK imports and does no I/O of its own. The
-// `fetcher` is injected and the wall clock arrives in the snapshot as
-// `nowMs`, so `view()` and `reduce()` are fully deterministic and
-// trivially Vitest-friendly. The host (`glasses-host.ts`) owns the
-// `setInterval` and is the only file that touches `Date.now()`.
+// `fetcher` is injected and the wall clock arrives via `view(...)`'s
+// third `ctx: ViewContext` parameter (NEVER from the snapshot), so
+// `view()` and `reduce()` are fully deterministic and trivially
+// Vitest-friendly. The host (`glasses-host.ts`) owns the `setInterval`s
+// (a fetch tick AND an independent 1Hz clock tick) and is the only
+// file that touches `Date.now()`.
 
 import type { Train } from "../wmata";
 import { LINE_WIDTH, padLeft, padRight, truncate } from "../ui/render";
 import { abbreviateStation, formatEta, lineGlyph } from "../ui/format";
-import type { ReduceResult, Screen, ScreenEvent } from "./router";
+import type {
+  ReduceResult,
+  Screen,
+  ScreenEvent,
+  ViewContext,
+} from "./router";
 
 // ---------------------------------------------------------------------------
 // Column budget constants
@@ -108,8 +115,6 @@ export interface PredictionsSnapshot {
   fetchError: string | null;
   /** Optional headline for the footer alert row. WP8 will wire this in. */
   incidentHeadline: string | null;
-  /** Wall clock for the header. Pure-view: the host writes this on tick. */
-  nowMs: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +139,15 @@ export function formatClock(epochMs: number): string {
  * True if either the last fetch errored OR the last successful fetch is
  * older than `STALE_THRESHOLD_MS`. A snapshot that has never fetched
  * (`fetchedAt === 0`) is also considered stale — there's nothing to show.
+ *
+ * The wall clock comes from `nowMs` (the host's `ViewContext`), NOT from
+ * the snapshot — this is what makes the stale-marker tick forward even
+ * when a fetch is hung.
  */
-export function isStale(snapshot: PredictionsSnapshot): boolean {
+export function isStale(snapshot: PredictionsSnapshot, nowMs: number): boolean {
   if (snapshot.fetchError !== null) return true;
   if (snapshot.fetchedAt <= 0) return true;
-  return snapshot.nowMs - snapshot.fetchedAt > STALE_THRESHOLD_MS;
+  return nowMs - snapshot.fetchedAt > STALE_THRESHOLD_MS;
 }
 
 /**
@@ -148,10 +157,17 @@ export function isStale(snapshot: PredictionsSnapshot): boolean {
  * "this is old" cue (the panel is greyscale, so we can't actually dim).
  * The `*` consumes one column from the station-name budget — long names
  * lose one character of breathing room when stale, which is acceptable.
+ *
+ * `nowMs` is the host-supplied wall clock (`ViewContext.nowMs`). The
+ * header re-renders every second via the host's clock tick so the
+ * "HH:MM" string and stale marker stay live regardless of fetch state.
  */
-export function renderHeader(snapshot: PredictionsSnapshot): string {
-  const stale = isStale(snapshot);
-  const clockStr = formatClock(snapshot.nowMs);
+export function renderHeader(
+  snapshot: PredictionsSnapshot,
+  nowMs: number,
+): string {
+  const stale = isStale(snapshot, nowMs);
+  const clockStr = formatClock(nowMs);
   // Stale + a real fetch error get a distinct marker (`?` vs `*`) so the
   // user can tell "old data" from "no data".
   const marker = !stale ? "" : snapshot.fetchError !== null ? "?" : "*";
@@ -249,9 +265,13 @@ export function makePredictionsScreen(
   return {
     name: "predictions",
     init: () => initialSnapshot,
-    view(snapshot): string[] {
+    view(snapshot, _nav, ctx: ViewContext): string[] {
       const lines: string[] = [];
-      lines.push(renderHeader(snapshot));
+      // `ctx.nowMs` is freshly stamped by the host on EVERY render —
+      // including the 1Hz clock-only re-renders that fire independently
+      // of any fetch tick. That's what keeps the HUD clock and the
+      // stale-marker advancing even when the network has stalled.
+      lines.push(renderHeader(snapshot, ctx.nowMs));
 
       const sorted = sortTrainsForDisplay(snapshot.trains);
       const visible = sorted.slice(0, MAX_VISIBLE_TRAINS);
@@ -293,9 +313,11 @@ export function makePredictionsScreen(
     /**
      * Fetch fresh predictions and fold the result into a new snapshot.
      *
-     * Never throws — fetch errors land in `fetchError`. We always bump
-     * `nowMs` to the current wall clock (otherwise the staleness check
-     * would never re-arm even after we mark the snapshot errored).
+     * Never throws — fetch errors land in `fetchError`. The wall clock
+     * is NOT stored on the snapshot: the host injects it via
+     * `ViewContext.nowMs` on every render (including the independent
+     * 1Hz clock tick), so the staleness check re-evaluates correctly
+     * regardless of fetch cadence.
      */
     async tick(snapshot: PredictionsSnapshot): Promise<PredictionsSnapshot> {
       const now = Date.now();
@@ -307,7 +329,6 @@ export function makePredictionsScreen(
           incidentHeadline: result.incidentHeadline,
           fetchedAt: now,
           fetchError: null,
-          nowMs: now,
         };
       } catch (err) {
         const message =
@@ -315,7 +336,6 @@ export function makePredictionsScreen(
         return {
           ...snapshot,
           fetchError: message,
-          nowMs: now,
         };
       }
     },

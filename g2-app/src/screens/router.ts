@@ -8,10 +8,12 @@
 //        Build the initial data snapshot. Pure: no SDK calls, no I/O.
 //        Live data (e.g. predictions) gets injected by the host wiring
 //        after mount, not from `init`.
-//   - `view`   :: (Snapshot, NavState) => string[]
+//   - `view`   :: (Snapshot, NavState, ViewContext) => string[]
 //        Render the screen into ≤ TOTAL_ROWS lines. EACH LINE must be
 //        ≤ LINE_WIDTH columns. The host concatenates with `\n` and feeds
-//        the result into `bridge.textContainerUpgrade`.
+//        the result into `bridge.textContainerUpgrade`. The third `ctx`
+//        parameter supplies render-time data the host owns (currently
+//        just the wall clock — see `ViewContext`).
 //   - `reduce` :: (Snapshot, NavState, ScreenEvent) => { nav, navigate? }
 //        Pure reducer for touchpad events. Returning `navigate` tells the
 //        host to switch screens.
@@ -60,6 +62,30 @@ export interface ReduceResult {
 }
 
 /**
+ * Per-render context supplied by the host. Currently just the wall
+ * clock, but the interface is open for future additions (e.g. a
+ * "battery low" signal, a debug-mode flag).
+ *
+ * The host writes a fresh `nowMs` on every render call, including the
+ * cheap 1Hz clock-only re-renders that fire independently of any
+ * `tick()`. This is the load-bearing detail: it means a screen's
+ * wall-clock display (and any time-dependent UI like stale markers)
+ * can NEVER freeze due to a hung fetch — the clock interval is its
+ * own independent timer.
+ *
+ * Screens with no time-sensitive UI may simply ignore `ctx` in `view`.
+ */
+export interface ViewContext {
+  /**
+   * Wall-clock millis at the moment of rendering. Always
+   * `Date.now()` at render time, NEVER read from the snapshot. The
+   * host updates this once per second on its clock tick (and again
+   * on every fetch tick and event-driven re-render).
+   */
+  nowMs: number;
+}
+
+/**
  * The contract each screen implements. `Snapshot` is screen-specific
  * data (favorites for Home, predictions for the Predictions screen, etc.)
  * and stays opaque to the router.
@@ -70,14 +96,25 @@ export interface ReduceResult {
  * `setInterval(tickIntervalMs)` cadence, replacing the live snapshot
  * with the returned value and re-rendering. A screen that omits both
  * hooks (Home in WP6) never gets ticked.
+ *
+ * Independently, the host runs a 1Hz CLOCK tick that re-invokes `view`
+ * with a fresh `ctx.nowMs` but does NOT touch the snapshot. That tick
+ * runs whether or not the screen opts into `tick`/`tickIntervalMs`.
  */
 export interface Screen<Snapshot> {
   /** Stable identifier for logging / debugging. */
   readonly name: NavIntent["to"];
   /** Build the initial snapshot. Pure: no SDK, no I/O. */
   init(): Snapshot;
-  /** Render the screen into ≤ TOTAL_ROWS lines, each ≤ LINE_WIDTH cols. */
-  view(snapshot: Snapshot, nav: NavState): string[];
+  /**
+   * Render the screen into ≤ TOTAL_ROWS lines, each ≤ LINE_WIDTH cols.
+   *
+   * `ctx.nowMs` is freshly stamped by the host on EVERY render —
+   * including clock-only re-renders that don't touch the snapshot.
+   * Read the wall clock from `ctx.nowMs`, never from the snapshot.
+   * Screens with no time-sensitive UI can ignore `ctx`.
+   */
+  view(snapshot: Snapshot, nav: NavState, ctx: ViewContext): string[];
   /** Pure reducer over (snapshot, nav, event). */
   reduce(snapshot: Snapshot, nav: NavState, event: ScreenEvent): ReduceResult;
   /**
@@ -90,7 +127,8 @@ export interface Screen<Snapshot> {
   /**
    * Optional: refresh cadence in milliseconds. If both `tick` and
    * `tickIntervalMs > 0` are provided, the host auto-ticks; otherwise
-   * the screen is render-once.
+   * the screen is render-once. The independent 1Hz clock tick runs
+   * either way.
    */
   tickIntervalMs?: number;
 }

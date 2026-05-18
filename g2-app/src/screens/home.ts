@@ -196,7 +196,11 @@ export function makeHomeScreen(
   return {
     name: "home",
     init: loader,
-    view(snapshot, nav) {
+    // `ctx` (third param) carries the host-supplied wall clock for
+    // time-sensitive UI; Home has none, so we accept-and-ignore it.
+    // Prefixing with `_` quiets `noUnusedParameters` while still
+    // documenting the contract for future readers.
+    view(snapshot, nav, _ctx) {
       // Defensive clamp: if a future migration / data-corruption bug
       // hands us more than MAX_FAVORITES, render only the first slice
       // rather than throwing or producing an oversized list. The same

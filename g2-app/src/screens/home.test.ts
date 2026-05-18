@@ -11,7 +11,7 @@
 import { describe, expect, it } from "vitest";
 import { LINE_WIDTH } from "../ui/render";
 import type { FavoriteStation } from "../storage/settings";
-import { initialNav } from "./router";
+import { initialNav, type ViewContext } from "./router";
 import {
   VOICE_LABEL,
   makeHomeScreen,
@@ -20,6 +20,14 @@ import {
   renderLinesSuffix,
   rowCount,
 } from "./home";
+
+/**
+ * Fixed wall clock for view-call ctx. Home doesn't read it, but the
+ * `Screen<S>.view` contract requires a `ViewContext` argument now.
+ * Using a constant keeps the tests deterministic.
+ */
+const MOCK_NOW = 1_700_000_000_000;
+const CTX: ViewContext = { nowMs: MOCK_NOW };
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -121,7 +129,7 @@ describe("home view: empty favorites", () => {
   it("renders header + help text + a single VOICE LOOKUP row", () => {
     const screen = makeHomeScreen(loaderFor([]));
     const snap = screen.init();
-    const lines = screen.view(snap, initialNav());
+    const lines = screen.view(snap, initialNav(), CTX);
     expectFits(lines);
     // Exact line count is locked at 4 (per the WP6 Reviewer's "lock
     // per-screen line counts to exact integers" pattern). Drift fails CI.
@@ -136,7 +144,7 @@ describe("home view: empty favorites", () => {
   it("renders the highlighted VOICE LOOKUP row with '> ' prefix when selected", () => {
     const screen = makeHomeScreen(loaderFor([]));
     const snap = screen.init();
-    const lines = screen.view(snap, { highlightedIndex: 0 });
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
     expect(lines.length).toBe(4);
     // index 0 in the empty state is the voice row itself.
     expect(lines[3]!.startsWith("> ")).toBe(true);
@@ -147,7 +155,7 @@ describe("home view: empty favorites", () => {
     const snap = screen.init();
     // Force a non-zero highlight (which the reducer would normally clamp,
     // but `view` should still render the voice row as unselected).
-    const lines = screen.view(snap, { highlightedIndex: 99 });
+    const lines = screen.view(snap, { highlightedIndex: 99 }, CTX);
     expect(lines.length).toBe(4);
     expect(lines[3]!.startsWith("  ")).toBe(true);
   });
@@ -161,7 +169,7 @@ describe("home view: 1 favorite", () => {
   it("renders header + 1 favorite row + voice row, every line fits", () => {
     const screen = makeHomeScreen(loaderFor([F.metroCenter]));
     const snap = screen.init();
-    const lines = screen.view(snap, initialNav());
+    const lines = screen.view(snap, initialNav(), CTX);
     expect(lines.length).toBe(3); // header + 1 fav + voice
     expectFits(lines);
     expect(lines[0]).toContain("(1/5)");
@@ -181,7 +189,7 @@ describe("home view: 5 favorites (cap)", () => {
     ];
     const screen = makeHomeScreen(loaderFor(favs));
     const snap = screen.init();
-    const lines = screen.view(snap, { highlightedIndex: 0 });
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
     expect(lines.length).toBe(7);
     expectFits(lines);
     expect(lines[0]).toContain("(5/5)");
@@ -210,7 +218,7 @@ describe("home view: adversarial 5 favorites (longest names + many lines)", () =
     const screen = makeHomeScreen(loaderFor(favs));
     const snap = screen.init();
     for (let idx = 0; idx < rowCount(snap); idx++) {
-      const lines = screen.view(snap, { highlightedIndex: idx });
+      const lines = screen.view(snap, { highlightedIndex: idx }, CTX);
       expectFits(lines);
       for (const l of lines) {
         // Every favorite row contains a "+N" suffix.
@@ -318,7 +326,7 @@ describe("home view: edge cases", () => {
     };
     const screen = makeHomeScreen(loaderFor([fav]));
     const snap = screen.init();
-    const lines = screen.view(snap, { highlightedIndex: 0 });
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
     expectFits(lines);
     // The favorite row is exactly LINE_WIDTH cols wide, with the lines
     // cell filled with 11 spaces (LINES_WIDTH = 11).
@@ -335,7 +343,7 @@ describe("home view: edge cases", () => {
     };
     const screen = makeHomeScreen(loaderFor([fav]));
     const snap = screen.init();
-    const lines = screen.view(snap, { highlightedIndex: 0 });
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
     expectFits(lines);
     expect(lines.length).toBe(3);
     // After the 2-char highlight prefix, the next 10 chars are the
@@ -371,7 +379,7 @@ describe("home view: edge cases", () => {
     ];
     const screen = makeHomeScreen(loaderFor(corrupt));
     const snap = screen.init();
-    const lines = screen.view(snap, initialNav());
+    const lines = screen.view(snap, initialNav(), CTX);
     expectFits(lines);
     // header + 5 fav rows + voice = 7 lines (clamped). No throw.
     expect(lines.length).toBe(7);
@@ -399,7 +407,7 @@ describe("home view snapshot: 3 favorites, highlight idx 1", () => {
       loaderFor([F.metroCenter, F.galleryPl, F.unionStn]),
     );
     const snap = screen.init();
-    const lines = screen.view(snap, { highlightedIndex: 1 });
+    const lines = screen.view(snap, { highlightedIndex: 1 }, CTX);
     // Build expected lines using the helper to keep this in lockstep
     // with the rendering rules. The 'highlight at idx 1' shifts the
     // '> ' prefix to the second favorite (Gallery Pl).

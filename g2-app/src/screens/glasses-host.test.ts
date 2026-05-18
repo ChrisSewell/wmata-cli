@@ -12,7 +12,7 @@
 // `shutDownPageContainer`). The unused surface of the real bridge is
 // cast away via `unknown` (no `any`, no `@ts-ignore`).
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   StartUpPageCreateResult,
   type CreateStartUpPageContainer,
@@ -27,6 +27,7 @@ import type {
   Router,
   Screen,
   ScreenEvent,
+  ViewContext,
 } from "./router";
 
 // ---------------------------------------------------------------------------
@@ -129,7 +130,11 @@ function makeTicker(initial: TickerSnapshot, intervalMs: number): Ticker {
   ticker.screen = {
     name: "predictions",
     init: () => initial,
-    view(snapshot: TickerSnapshot): string[] {
+    view(
+      snapshot: TickerSnapshot,
+      _nav,
+      _ctx: ViewContext,
+    ): string[] {
       const lines = [`gen=${String(snapshot.generation)}`];
       ticker.latestRenderedLines = lines;
       return lines;
@@ -222,5 +227,117 @@ describe("glasses-host single-flight tick guard", () => {
     // And the rendered lines that view() last produced still reflect
     // the pre-unmount snapshot (generation 0), NOT 99.
     expect(ticker.latestRenderedLines.join("\n")).toContain("gen=0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clock tick fires independently of the fetch tick
+// ---------------------------------------------------------------------------
+//
+// The host runs a 1Hz clock interval that re-renders the current
+// snapshot with a fresh `ctx.nowMs` but does NOT invoke `tick()`. The
+// load-bearing property: even when `tick()` is permanently hung (a
+// network-stall regression), the clock keeps advancing on the HUD.
+//
+// To make the clock value observable in the rendered content (the
+// fake screen's `view` ignores `ctx` and just emits a snapshot-derived
+// string), we instead build a screen whose `view` writes `ctx.nowMs`
+// into the rendered content directly.
+
+/**
+ * A clock-only screen: never ticks, just renders the wall-clock value
+ * the host injects. Used to verify the 1Hz tick actually pumps `view`
+ * with fresh `nowMs` values.
+ */
+function makeHungClockScreen(): {
+  screen: Screen<{ marker: string }>;
+  hungTickCalls: { count: number };
+} {
+  const hungTickCalls = { count: 0 };
+  const screen: Screen<{ marker: string }> & {
+    tick: (s: { marker: string }) => Promise<{ marker: string }>;
+    tickIntervalMs: number;
+  } = {
+    name: "predictions",
+    init: () => ({ marker: "hung" }),
+    view(snapshot, _nav, ctx: ViewContext): string[] {
+      return [`now=${ctx.nowMs}`, snapshot.marker];
+    },
+    reduce(_s, nav, _e: ScreenEvent) {
+      return { nav };
+    },
+    tick: (_s: { marker: string }): Promise<{ marker: string }> => {
+      hungTickCalls.count += 1;
+      // Permanently hung — simulates a network-stall regression. The
+      // 1Hz clock tick MUST keep firing regardless.
+      return new Promise(() => {
+        /* never resolves */
+      });
+    },
+    // A long-ish fetch interval is fine: the fetch tick fires once at
+    // mount and never again (because the first one never settles, so
+    // the single-flight guard blocks subsequent interval firings).
+    tickIntervalMs: 20_000,
+  };
+  return { screen, hungTickCalls };
+}
+
+describe("glasses-host clock tick (decoupled from fetch)", () => {
+  it("re-renders with a fresh ctx.nowMs every second even when tick() is hung, and stops after unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      // Anchor wall-clock so `Date.now()` is deterministic across the
+      // host's clock-tick callbacks.
+      vi.setSystemTime(new Date(2026, 4, 18, 12, 0, 0));
+
+      const { bridge, record } = makeFakeBridge();
+      const router = makeStubRouter();
+      const { screen, hungTickCalls } = makeHungClockScreen();
+
+      const unmount = await mountGlassesScreen(screen, bridge, router);
+      // After mount: one initial render (from `view` directly) and one
+      // attempted fetch tick (gated forever).
+      await Promise.resolve();
+      expect(hungTickCalls.count).toBe(1);
+      const upgradesAfterMount = record.upgrades.length;
+
+      // Advance 5 wall-clock seconds, bumping `Date.now()` at each step
+      // so the rendered content (`now=...`) is distinct per tick — that
+      // way the host's dedupe cache doesn't swallow these renders.
+      for (let s = 1; s <= 5; s++) {
+        vi.setSystemTime(new Date(2026, 4, 18, 12, 0, s));
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+
+      // The clock tick should have fired at least 5 times and pushed
+      // at least 4 distinct text updates (the 5th may coincide with
+      // the unmount path on slower runners; we assert >=4 to keep the
+      // test stable). The fetch tick must NOT have been re-invoked.
+      const upgradesDelta = record.upgrades.length - upgradesAfterMount;
+      expect(upgradesDelta).toBeGreaterThanOrEqual(4);
+      expect(hungTickCalls.count).toBe(1);
+
+      // Every clock-driven render embeds `ctx.nowMs` in the first line.
+      // The series should be strictly increasing.
+      const nowValues = record.upgrades
+        .slice(upgradesAfterMount)
+        .map((c) => {
+          const m = c.match(/^now=(\d+)/);
+          return m ? Number(m[1]) : NaN;
+        })
+        .filter((n) => Number.isFinite(n));
+      for (let i = 1; i < nowValues.length; i++) {
+        expect(nowValues[i]!).toBeGreaterThan(nowValues[i - 1]!);
+      }
+
+      // After unmount the clock tick must STOP — no further upgrades.
+      await unmount();
+      const upgradesAtUnmount = record.upgrades.length;
+      vi.setSystemTime(new Date(2026, 4, 18, 12, 0, 10));
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(record.upgrades.length).toBe(upgradesAtUnmount);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
