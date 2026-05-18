@@ -100,6 +100,11 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     lastTrainToday: null,
     pinned: null,
     pinnedPosition: null,
+    // WP-M default — cursor visible to keep the v1.2 tests
+    // (cursor-on-row-0 expectations) passing. The first-mount
+    // boot path in main.ts initialises this to false.
+    cursorVisible: true,
+    pinnedGone: false,
     ...over,
   };
 }
@@ -1514,5 +1519,120 @@ describe("bucketLastTrainsByLine", () => {
       new Map<string, string>([["GLN", "RD"]]),
     );
     expect(out).toEqual([{ line: "RD", time: "23:47" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-M opt-in cursor
+// ---------------------------------------------------------------------------
+
+describe("predictions: opt-in cursor (WP-M)", () => {
+  function trains3(): Train[] {
+    return [
+      train({ Line: "RD", Destination: "Shady Grove", Min: "5" }),
+      train({ Line: "RD", Destination: "Glenmont", Min: "8" }),
+      train({ Line: "OR", Destination: "Vienna", Min: "10" }),
+    ];
+  }
+
+  it("hides the `>` cursor when cursorVisible is false", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: false }),
+    );
+    const lines = screen.view(screen.init(), { highlightedIndex: 0 }, CTX);
+    // None of the train rows should start with "R>".
+    expect(lines.some((l) => l.startsWith("R>"))).toBe(false);
+  });
+
+  it("shows the cursor again once cursorVisible is true", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: true }),
+    );
+    const lines = screen.view(screen.init(), { highlightedIndex: 0 }, CTX);
+    expect(lines.some((l) => l.startsWith("R>"))).toBe(true);
+  });
+
+  it("a first SCROLL flips cursorVisible to true via the reducer", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: false }),
+    );
+    const r = screen.reduce(
+      snap({ trains: trains3(), cursorVisible: false }),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.snapshot?.cursorVisible).toBe(true);
+  });
+
+  it("a TAP also flips cursorVisible (the user has engaged)", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: false }),
+    );
+    const r = screen.reduce(
+      snap({ trains: trains3(), cursorVisible: false }),
+      { highlightedIndex: 0 },
+      { type: "TAP" },
+    );
+    expect(r.snapshot?.cursorVisible).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-M "pinned-train gone" state machine
+// ---------------------------------------------------------------------------
+
+describe("predictions: pinned-train gone (WP-M)", () => {
+  function trainsWithGlenmont(): Train[] {
+    return [train({ Line: "RD", Destination: "Glenmont", Min: "5" })];
+  }
+  function trainsWithoutGlenmont(): Train[] {
+    return [train({ Line: "RD", Destination: "Shady Grove", Min: "5" })];
+  }
+
+  it("renders `(gone)` when the pinned train rolled off + pinnedGone is set", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: trainsWithoutGlenmont(),
+        pinned: { line: "RD", destination: "Glenmont" },
+        pinnedGone: true,
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expect(lines.some((l) => l.includes("(gone)"))).toBe(true);
+  });
+
+  it("the first tick after a roll-off sets pinnedGone (one-tick latch)", async () => {
+    // First tick: trains has the pinned train → no gone.
+    // Second tick: trains drops the pinned train → pinnedGone latched.
+    let mode: "have" | "gone" = "have";
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      Promise.resolve({
+        trains: mode === "have" ? trainsWithGlenmont() : trainsWithoutGlenmont(),
+        incidentHeadline: null,
+        lastTrainToday: null,
+        pinnedPosition: null,
+      });
+    const screen = makePredictionsScreen(
+      fetcher,
+      snap({ pinned: { line: "RD", destination: "Glenmont" } }),
+    );
+    let s = screen.init();
+    s = await screen.tick(s);
+    expect(s.pinnedGone).toBe(false);
+    expect(s.pinned).not.toBeNull();
+    // Roll off.
+    mode = "gone";
+    s = await screen.tick(s);
+    expect(s.pinnedGone).toBe(true);
+    expect(s.pinned).not.toBeNull(); // not yet cleared
+    // Second consecutive miss → auto-clear.
+    s = await screen.tick(s);
+    expect(s.pinnedGone).toBe(false);
+    expect(s.pinned).toBeNull();
   });
 });
