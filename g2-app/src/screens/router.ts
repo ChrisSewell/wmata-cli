@@ -46,7 +46,14 @@ export type ScreenEvent =
   | { type: "TRANSCRIPT"; text: string; isFinal: boolean }
   | { type: "TRANSCRIPT_SILENCE" }
   | { type: "RESOLVE_RESULT"; matches: import("../wmata").Station[] }
-  | { type: "RESOLVE_ERROR"; message: string };
+  | { type: "RESOLVE_ERROR"; message: string }
+  /**
+   * Voice intent resolved to a direct navigation target (e.g. the
+   * user said "alerts" or "home" with a configured home-station).
+   * The reducer routes this exactly like a unique station match —
+   * shortcut around the fuzzy-search round-trip.
+   */
+  | { type: "RESOLVE_NAVIGATE"; intent: NavIntent };
 
 /**
  * Per-screen UI cursor state. Lives outside the snapshot so we can
@@ -65,7 +72,10 @@ export type NavIntent =
   | { to: "home" }
   | { to: "predictions"; stationCode: string }
   | { to: "incidents" }
+  | { to: "elevator" }
   | { to: "voice" }
+  | { to: "tutorial" }
+  | { to: "journey" }
   | { to: "exit" };
 
 /**

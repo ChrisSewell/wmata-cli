@@ -91,6 +91,56 @@ export const STALE_THRESHOLD_MS = 60_000;
 /** Auto-refresh cadence handed back to the host via `tickIntervalMs`. */
 export const TICK_INTERVAL_MS = 20_000;
 
+/**
+ * Local-clock hour at and past which the "Last train" row is
+ * surfaced. WMATA service ends at midnight on most weeknights and
+ * 01:00–03:00 on weekend nights, so 21:00 gives a 3-hour heads-up
+ * window without cluttering the screen during normal commute hours.
+ *
+ * Exported so the test suite can pin the threshold rather than
+ * reaching into a constant from a `Date.now()` mock.
+ */
+export const LAST_TRAIN_HOUR = 21;
+
+/**
+ * True when the wall clock (in the runtime's local timezone) is at
+ * or past `LAST_TRAIN_HOUR` — at which point the last-train row is
+ * worth surfacing. Hidden during the morning rush and afternoon.
+ */
+export function shouldShowLastTrain(nowMs: number): boolean {
+  if (!Number.isFinite(nowMs) || nowMs <= 0) return false;
+  return new Date(nowMs).getHours() >= LAST_TRAIN_HOUR;
+}
+
+/**
+ * Pick the latest "HH:mm" string from a list of `StationTrainTime`s.
+ * Returns `null` for an empty list.
+ *
+ * Comparison is lexicographic-on-"HH:mm" because the format is
+ * zero-padded — `"08:32" < "23:47"` reads correctly as a string
+ * comparison. WMATA's `LastTrains` array may include AM times that
+ * actually mean "next day" (per docs), and those will sort EARLIEST
+ * by this comparison; we accept that for the v1.2 ship and just
+ * surface the latest PM time, which is the user-facing "last train".
+ */
+export function pickLastTrainTime(
+  times: ReadonlyArray<{ Time: string }>,
+): string | null {
+  let best: string | null = null;
+  for (const t of times) {
+    if (typeof t.Time !== "string" || t.Time.length === 0) continue;
+    // Skip AM times — they're "next day" per the WMATA docs, not
+    // "later today". A late-evening user wants the latest PM
+    // departure, not tomorrow morning's first AM run that happens
+    // to spill into the LastTrains array.
+    const hh = parseInt(t.Time.slice(0, 2), 10);
+    if (!Number.isFinite(hh)) continue;
+    if (hh < 12) continue;
+    if (best === null || t.Time > best) best = t.Time;
+  }
+  return best;
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot
 // ---------------------------------------------------------------------------
@@ -99,6 +149,14 @@ export const TICK_INTERVAL_MS = 20_000;
 export interface PredictionsFetchResult {
   trains: Train[];
   incidentHeadline: string | null;
+  /**
+   * "HH:mm" of today's last scheduled departure from this station,
+   * across all destinations served. `null` when the schedule fetch
+   * failed or the station isn't in the schedule data. Driven by the
+   * Session's lazy-cached `getStationTimes` so the wire fetch happens
+   * at most once per glasses session.
+   */
+  lastTrainToday: string | null;
 }
 
 /** Data the Predictions screen renders against. */
@@ -114,12 +172,46 @@ export interface PredictionsSnapshot {
   /** Last fetch error string, or `null` if the most recent fetch succeeded. */
   fetchError: string | null;
   /**
+   * Number of consecutive `tick()` failures since the last successful
+   * fetch. Reset to 0 on success. Drives the stale-marker escalation
+   * in `renderHeader` so users see a degrading network *before* the
+   * data goes blank: `*` after one failure, `**` after two, `?` once
+   * we have three in a row (or no successful fetch has ever landed).
+   */
+  consecutiveFetchFailures: number;
+  /**
    * Optional headline for the footer alert row. Sourced from the shared
    * incidents cache in `main.ts`'s predictions fetcher (the first
    * sentence of the freshest incident on a line this station serves).
    * `null` when there are no matching incidents — the footer hides.
    */
   incidentHeadline: string | null;
+  /**
+   * Last scheduled departure from this station today, `"HH:mm"`. Only
+   * rendered after the late-evening cutoff (see
+   * `shouldShowLastTrain`); rendered as a `"Last train: 23:47"` row
+   * appended to the body. `null` when the schedule lookup hasn't
+   * landed or the station isn't in the data.
+   */
+  lastTrainToday: string | null;
+  /**
+   * If non-null, the user has TAP-pinned a specific (line,
+   * destination) pair to track. The screen renders a single-line
+   * summary row at the top of the body, and the matching train (if
+   * still visible in the predictions list) is highlighted with a
+   * "*" cursor in place of its line-glyph cell.
+   *
+   * WMATA predictions don't carry a stable `TrainId`, so a pin is
+   * identified by (Line + Destination). If multiple trains match
+   * (a busy commute window with two RD-Glenmont trains stacked),
+   * the FIRST match in the sorted list wins for cursor + summary
+   * display.
+   *
+   * `null` = no pin. Reset on remount (the pin doesn't persist
+   * across navigations — the user explicitly chose it for this
+   * Predictions session).
+   */
+  pinned: { line: string; destination: string } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,12 +248,48 @@ export function isStale(snapshot: PredictionsSnapshot, nowMs: number): boolean {
 }
 
 /**
+ * Map (staleness × fetch-failure-count) onto a 3-state header marker.
+ *
+ * Semantics (matches the same helper in `incidents.ts`):
+ *
+ *   - `""`  — fresh data, 0 failures. Clean clock.
+ *   - `"*"` — stale by time only OR 1 failure since last success.
+ *             The data is plausibly old but the network may just be
+ *             slow; the user has data to look at.
+ *   - `"**"` — 2 consecutive failures. The network is degrading;
+ *              data is from before the failures started.
+ *   - `"?"` — ≥ 3 consecutive failures, OR `fetchedAt === 0` with an
+ *             active `fetchError` (we've never gotten data at all).
+ *
+ * Exported so the test suite can pin each branch directly.
+ */
+export function stalenessMarker(
+  snapshot: PredictionsSnapshot,
+  nowMs: number,
+): "" | "*" | "**" | "?" {
+  const failures = Math.max(0, snapshot.consecutiveFetchFailures);
+  // Total-failure-with-no-data path: we have nothing to show and a
+  // current error. Strongest marker.
+  if (snapshot.fetchedAt === 0 && snapshot.fetchError !== null) return "?";
+  if (failures >= 3) return "?";
+  if (failures === 2) return "**";
+  if (failures === 1) return "*";
+  // No active failure streak. Fall through to the time-based check
+  // (data may simply be older than threshold because the fetch tick
+  // hasn't fired yet on a slow connection).
+  if (isStale(snapshot, nowMs)) return "*";
+  return "";
+}
+
+/**
  * Render the header row: `<station name> <HH:MM>[stale-marker]`.
  *
- * When the data is stale we append a `*` after the clock as a glanceable
- * "this is old" cue (the panel is greyscale, so we can't actually dim).
- * The `*` consumes one column from the station-name budget — long names
- * lose one character of breathing room when stale, which is acceptable.
+ * When the data is stale or the fetch is degrading we append a 1- or
+ * 2-char marker after the clock as a glanceable "this is old" cue
+ * (the panel is greyscale, so we can't actually dim). The marker
+ * consumes its width from the station-name budget — long names lose
+ * one or two characters of breathing room while degraded, which is
+ * acceptable.
  *
  * `nowMs` is the host-supplied wall clock (`ViewContext.nowMs`). The
  * header re-renders every second via the host's clock tick so the
@@ -171,21 +299,17 @@ export function renderHeader(
   snapshot: PredictionsSnapshot,
   nowMs: number,
 ): string {
-  const stale = isStale(snapshot, nowMs);
+  const marker = stalenessMarker(snapshot, nowMs);
   const clockStr = formatClock(nowMs);
-  // Stale + a real fetch error get a distinct marker (`?` vs `*`) so the
-  // user can tell "old data" from "no data".
-  const marker = !stale ? "" : snapshot.fetchError !== null ? "?" : "*";
-  const clockCell = clockStr + marker; // 5 or 6 chars
-  // Steal one col from the name when the marker is present, so the total
-  // never exceeds LINE_WIDTH.
-  const nameBudget = HEADER_NAME_WIDTH - marker.length;
+  const clockCell = clockStr + marker; // 5, 6, or 7 chars
+  // Steal one col from the name per marker char so the total never
+  // exceeds LINE_WIDTH. `**` shrinks the name budget by 2.
+  const nameBudget = Math.max(1, HEADER_NAME_WIDTH - marker.length);
   const name = padRight(
     abbreviateStation(snapshot.stationName, nameBudget),
     nameBudget,
   );
-  // name(nameBudget) + " "(1) + clockCell(5 or 6) = 18 or 19 chars; with
-  // marker the name shrinks by 1 so the total stays at 24.
+  // name(nameBudget) + " "(1) + clockCell(5..7) = 24 by construction.
   return name + " " + clockCell;
 }
 
@@ -196,9 +320,29 @@ export function renderHeader(
  * destination cell is left-aligned (`padRight`), the cars and ETA cells
  * are right-aligned-or-padded so the visual rhythm of the column lines up
  * across rows.
+ *
+ * `marker` is an optional 1-char glyph that replaces the line code's
+ * SECOND character (so the line is still readable as just the first
+ * letter):
+ *   - undefined / "" → no marker; full 2-char line glyph
+ *   - "*"            → pinned train (kept across ticks)
+ *   - ">"            → cursor highlight (TAP target)
+ *
+ * Why steal the second glyph char and not pad somewhere else: the
+ * existing 24-col layout has no slack. The first letter of the line
+ * code is enough signal once the user knows they're on Red / Orange
+ * / Blue — and the marker is more informative than the second
+ * letter at the moment they need it (pinning / selecting a row).
  */
-export function renderTrainRow(train: Train): string {
-  const glyph = padRight(lineGlyph(train.Line), GLYPH_WIDTH);
+export function renderTrainRow(
+  train: Train,
+  marker: "" | "*" | ">" = "",
+): string {
+  const fullGlyph = lineGlyph(train.Line);
+  const glyph =
+    marker === ""
+      ? padRight(fullGlyph, GLYPH_WIDTH)
+      : fullGlyph.charAt(0) + marker;
   const dest = padRight(
     abbreviateStation(train.Destination || train.DestinationName, DEST_WIDTH),
     DEST_WIDTH,
@@ -211,6 +355,54 @@ export function renderTrainRow(train: Train): string {
   const eta = padLeft(formatEta(train.Min), ETA_WIDTH);
   // glyph(2) + " "(1) + dest(11) + " "(1) + cars(2) + " "(1) + eta(6) = 24
   return glyph + " " + dest + " " + cars + " " + eta;
+}
+
+/**
+ * Find the index of the first visible train whose (line, destination)
+ * matches the pin. Returns -1 when nothing matches. The destination
+ * field on a `Train` is the short form (e.g. "Vienna"); the pin
+ * captures it verbatim at TAP time so equality works directly.
+ */
+export function findPinnedTrainIndex(
+  trains: readonly Train[],
+  pin: { line: string; destination: string } | null,
+): number {
+  if (!pin) return -1;
+  for (let i = 0; i < trains.length; i++) {
+    const t = trains[i]!;
+    if (t.Line === pin.line && t.Destination === pin.destination) return i;
+  }
+  return -1;
+}
+
+/**
+ * Build the optional "pin summary" row that sits between the header
+ * and the train list. Returns `null` when no train is pinned, or
+ * when the pinned train is no longer visible in the predictions
+ * (e.g. it already departed). Width contract: ≤ LINE_WIDTH.
+ *
+ *   "* RD Glenmont   3 min"
+ *
+ * Layout: marker(1) + " "(1) + line(2) + " "(1) + dest(11) + " "(1) +
+ *         eta(6) = 23. Pad one trailing space to LINE_WIDTH.
+ */
+export function renderPinRow(
+  snapshot: PredictionsSnapshot,
+  visibleTrains: readonly Train[],
+): string | null {
+  if (!snapshot.pinned) return null;
+  const idx = findPinnedTrainIndex(visibleTrains, snapshot.pinned);
+  if (idx < 0) return null;
+  const t = visibleTrains[idx]!;
+  const line = padRight(lineGlyph(t.Line), GLYPH_WIDTH);
+  const dest = padRight(
+    abbreviateStation(t.Destination || t.DestinationName, DEST_WIDTH),
+    DEST_WIDTH,
+  );
+  const eta = padLeft(formatEta(t.Min), ETA_WIDTH);
+  // "*"(1) + " "(1) + line(2) + " "(1) + dest(11) + " "(1) + eta(6) = 23
+  const composed = "* " + line + " " + dest + " " + eta;
+  return padRight(composed, LINE_WIDTH);
 }
 
 /**
@@ -229,6 +421,23 @@ export function renderFooter(snapshot: PredictionsSnapshot): string | null {
     return truncate("? " + snapshot.fetchError, LINE_WIDTH);
   }
   return null;
+}
+
+/**
+ * Render the optional late-night last-train row. Returns `null` when
+ * the wall clock is before `LAST_TRAIN_HOUR` OR the schedule data
+ * isn't available — in either case the row is hidden.
+ *
+ *   "Last train: 23:47"  (always ≤ 24 cols)
+ */
+export function renderLastTrainRow(
+  snapshot: PredictionsSnapshot,
+  nowMs: number,
+): string | null {
+  if (!shouldShowLastTrain(nowMs)) return null;
+  const time = snapshot.lastTrainToday;
+  if (!time || time.length === 0) return null;
+  return truncate(`Last train: ${time}`, LINE_WIDTH);
 }
 
 /**
@@ -270,7 +479,7 @@ export function makePredictionsScreen(
   return {
     name: "predictions",
     init: () => initialSnapshot,
-    view(snapshot, _nav, ctx: ViewContext): string[] {
+    view(snapshot, nav, ctx: ViewContext): string[] {
       const lines: string[] = [];
       // `ctx.nowMs` is freshly stamped by the host on EVERY render —
       // including the 1Hz clock-only re-renders that fire independently
@@ -280,6 +489,13 @@ export function makePredictionsScreen(
 
       const sorted = sortTrainsForDisplay(snapshot.trains);
       const visible = sorted.slice(0, MAX_VISIBLE_TRAINS);
+
+      // Pin summary row sits directly under the header when an active
+      // pin matches a visible train. Renders nothing otherwise (e.g.
+      // before the user has pinned anything, or after the pinned
+      // train has rolled out of the predictions window).
+      const pinRow = renderPinRow(snapshot, visible);
+      if (pinRow !== null) lines.push(pinRow);
 
       if (visible.length === 0) {
         // Empty state — distinct copy depending on whether we have data
@@ -293,29 +509,81 @@ export function makePredictionsScreen(
         lines.push("");
         lines.push(truncate("(double-tap to exit)", LINE_WIDTH));
       } else {
-        for (const t of visible) {
-          lines.push(renderTrainRow(t));
+        // Cursor: `nav.highlightedIndex` is clamped to the visible
+        // range. The pinned train (if any) is marked with "*"; the
+        // cursor target (which may or may not be the pinned train)
+        // is marked with ">". When both coincide on the same row,
+        // the pin marker wins — the user has confirmed this is
+        // their tracked train, no need to also surface the cursor.
+        const pinnedIdx = findPinnedTrainIndex(visible, snapshot.pinned);
+        const cursorIdx = Math.max(
+          0,
+          Math.min(nav.highlightedIndex, visible.length - 1),
+        );
+        for (let i = 0; i < visible.length; i++) {
+          const t = visible[i]!;
+          const marker: "" | "*" | ">" =
+            i === pinnedIdx ? "*" : i === cursorIdx ? ">" : "";
+          lines.push(renderTrainRow(t, marker));
         }
       }
 
       const footer = renderFooter(snapshot);
       if (footer !== null) lines.push(footer);
+
+      // Late-night last-train row. Independent of the footer — both
+      // can be present simultaneously (e.g. midnight on a single-
+      // tracking day). Hidden outside the late-night window OR when
+      // the schedule fetch hasn't completed; in either case the
+      // existing line count stays unchanged.
+      const lastTrain = renderLastTrainRow(snapshot, ctx.nowMs);
+      if (lastTrain !== null) lines.push(lastTrain);
       return lines;
     },
-    reduce(_snapshot, nav, event: ScreenEvent): ReduceResult<PredictionsSnapshot> {
-      // Predictions is a glanceable screen: SCROLL_UP/DOWN and TAP have
-      // no meaning here. DOUBLE_TAP navigates BACK to Home (not "exit")
-      // — that's the new behaviour for non-root screens.
+    reduce(snapshot, nav, event: ScreenEvent): ReduceResult<PredictionsSnapshot> {
+      // Predictions added a cursor + pin model in v1.2. The cursor
+      // selects a row in the visible-trains slice; TAP toggles a pin
+      // on the cursor's target. DOUBLE_TAP still navigates Home.
       //
-      // The voice-flow event variants (TRANSCRIPT, RESOLVE_RESULT, etc.)
-      // are dispatched only by the Voice screen's `onMount` glue; they
-      // arrive at this reducer only via a programming error. The default
-      // branch absorbs them as a no-op so the contract stays total.
+      // The voice-flow event variants (TRANSCRIPT, RESOLVE_RESULT,
+      // etc.) are dispatched only by the Voice screen's `onMount`
+      // glue; they arrive at this reducer only via a programming
+      // error. The default branch absorbs them as a no-op so the
+      // contract stays total.
+      const visible = sortTrainsForDisplay(snapshot.trains).slice(
+        0,
+        MAX_VISIBLE_TRAINS,
+      );
+      const maxIdx = Math.max(0, visible.length - 1);
+      const cursorIdx = Math.max(0, Math.min(nav.highlightedIndex, maxIdx));
       switch (event.type) {
         case "SCROLL_UP":
+          if (visible.length === 0) return { nav };
+          return {
+            nav: { highlightedIndex: Math.max(0, cursorIdx - 1) },
+          };
         case "SCROLL_DOWN":
-        case "TAP":
-          return { nav };
+          if (visible.length === 0) return { nav };
+          return {
+            nav: { highlightedIndex: Math.min(maxIdx, cursorIdx + 1) },
+          };
+        case "TAP": {
+          if (visible.length === 0) return { nav };
+          const t = visible[cursorIdx]!;
+          const candidate = { line: t.Line, destination: t.Destination };
+          // TAP on the already-pinned train toggles the pin off.
+          const isAlreadyPinned =
+            snapshot.pinned !== null &&
+            snapshot.pinned.line === candidate.line &&
+            snapshot.pinned.destination === candidate.destination;
+          return {
+            nav,
+            snapshot: {
+              ...snapshot,
+              pinned: isAlreadyPinned ? null : candidate,
+            },
+          };
+        }
         case "DOUBLE_TAP":
           return { nav, navigate: { to: "home" } };
         default:
@@ -330,6 +598,10 @@ export function makePredictionsScreen(
      * `ViewContext.nowMs` on every render (including the independent
      * 1Hz clock tick), so the staleness check re-evaluates correctly
      * regardless of fetch cadence.
+     *
+     * Tracks `consecutiveFetchFailures` so the header marker can
+     * escalate `*` → `**` → `?` as the network degrades. Reset to 0
+     * on every successful fetch.
      */
     async tick(snapshot: PredictionsSnapshot): Promise<PredictionsSnapshot> {
       const now = Date.now();
@@ -339,8 +611,14 @@ export function makePredictionsScreen(
           ...snapshot,
           trains: result.trains,
           incidentHeadline: result.incidentHeadline,
+          // Carry the last-train field forward when the fetcher
+          // provides one; preserve the prior value when null so the
+          // user doesn't see the row blink off if the fetcher only
+          // populates it on the first call.
+          lastTrainToday: result.lastTrainToday ?? snapshot.lastTrainToday,
           fetchedAt: now,
           fetchError: null,
+          consecutiveFetchFailures: 0,
         };
       } catch (err) {
         const message =
@@ -348,6 +626,7 @@ export function makePredictionsScreen(
         return {
           ...snapshot,
           fetchError: message,
+          consecutiveFetchFailures: snapshot.consecutiveFetchFailures + 1,
         };
       }
     },

@@ -20,6 +20,7 @@
 
 import { waitForEvenAppBridge } from "@evenrealities/even_hub_sdk";
 
+import { recordOpen } from "./storage/history";
 import { loadSettings } from "./storage/settings";
 import { mountSettingsScreen } from "./screens/settings";
 import { mountGlassesScreen } from "./screens/glasses-host";
@@ -29,14 +30,31 @@ import {
   makeIncidentsScreen,
   makeInitialIncidentsSnapshot,
 } from "./screens/incidents";
-import { makePredictionsScreen } from "./screens/predictions";
+import {
+  makeElevatorScreen,
+  makeInitialElevatorSnapshot,
+} from "./screens/elevator";
+import {
+  makeInitialJourneySnapshot,
+  makeJourneyScreen,
+} from "./screens/journey";
+import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
-import { createSttEngine, makeVoiceScreen } from "./screens/voice";
+import { makeTutorialScreen } from "./screens/tutorial";
+import {
+  createSttEngine,
+  makeVoiceScreen,
+  resolveVoiceIntent,
+} from "./screens/voice";
+import { evaluateSchedule } from "./schedule/rules";
+import { findNearestFavorite } from "./geofence/geofence";
 import { Session } from "./session";
+import { parseLinesAffected } from "./wmata/incidents-cache";
 import {
   buildRailPredictionsUrl,
   type LineCode,
   type PredictionsResponse,
+  type RailIncident,
   type Station,
 } from "./wmata";
 
@@ -72,6 +90,96 @@ function readFirstIncidentHeadline(session: Session): string | null {
   return headline.length > 0 ? headline : null;
 }
 
+/**
+ * Compute the deduped set of line codes that have at least one active
+ * incident, intersected with the user's followed lines. Drives the
+ * Home screen's status glyph row.
+ */
+function computeAffectedLines(
+  incidents: readonly RailIncident[],
+  userLines: readonly LineCode[],
+): LineCode[] {
+  if (userLines.length === 0) return [];
+  const userSet = new Set<LineCode>(userLines);
+  const out = new Set<LineCode>();
+  for (const inc of incidents) {
+    for (const code of parseLinesAffected(inc.LinesAffected ?? "")) {
+      if (userSet.has(code)) out.add(code);
+    }
+  }
+  return Array.from(out);
+}
+
+/**
+ * Best-effort geolocation lookup. Returns `null` on any failure
+ * (permission denied, timeout, runtime without `navigator.geolocation`,
+ * any thrown error). The boot path treats null as "geofence didn't
+ * fire" — fall through to the normal nav flow.
+ *
+ * `timeoutMs` caps how long we wait before giving up; 5s is more
+ * than enough for a GPS-warm device and short enough not to delay
+ * the glasses HUD mount when GPS is unavailable.
+ */
+async function geolocateOnce(
+  timeoutMs: number = 5_000,
+): Promise<{ lat: number; lon: number } | null> {
+  if (typeof navigator === "undefined" || !navigator.geolocation) return null;
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (v: { lat: number; lon: number } | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    try {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => settle({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+        () => settle(null),
+        { timeout: timeoutMs, maximumAge: 60_000 },
+      );
+    } catch {
+      settle(null);
+    }
+    // Belt-and-suspenders timeout: getCurrentPosition's own timeout
+    // should fire, but some WebView implementations have been known
+    // to ignore it.
+    setTimeout(() => settle(null), timeoutMs + 500);
+  });
+}
+
+/** Day-of-week key for indexing into a `StationTimes` schedule. */
+const WEEKDAY_KEYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+] as const;
+
+/**
+ * Read the latest scheduled departure time from `code`'s
+ * `LastTrains[]` for today's day-of-week. Returns `null` on any
+ * failure (cache miss, unknown station, network blip). The session
+ * cache makes calls after the first one essentially free.
+ */
+async function readLastTrainToday(
+  session: Session,
+  code: string,
+): Promise<string | null> {
+  try {
+    const times = await session.getStationTimes(code);
+    if (!times) return null;
+    const today = WEEKDAY_KEYS[new Date().getDay()];
+    const day = times[today];
+    if (!day) return null;
+    return pickLastTrainTime(day.LastTrains ?? []);
+  } catch {
+    return null;
+  }
+}
+
 async function bootGlasses(): Promise<void> {
   const bridge = await waitForEvenAppBridge();
 
@@ -86,19 +194,43 @@ async function bootGlasses(): Promise<void> {
   // Build the Home screen with a fresh-load snapshot factory. We
   // call `loadSettings()` inside `init` so re-mounting the screen
   // (e.g. after a return-from-predictions) picks up any favorite-list
-  // changes made on the phone in the interim. The cached incident
-  // count is seeded from the session's cache so a re-mount doesn't
-  // blink the ALERTS row off-then-on while the first tick is in flight.
+  // changes made on the phone in the interim. The affected-lines set
+  // and the access outage count are seeded from the session caches so
+  // a re-mount doesn't blink the synthetic rows off-then-on while the
+  // first tick is in flight.
   const homeScreen = makeHomeScreen(
-    () => ({
-      favorites: loadSettings().favorites,
-      incidentCount: session.readCachedIncidents().incidents.length,
-    }),
+    () => {
+      const settings = loadSettings();
+      const favorites = settings.favorites;
+      const userLines = computeUserLines(favorites);
+      const cached = session.readCachedIncidents().incidents;
+      const cachedAccess =
+        session.readCachedElevatorIncidents().incidents.length;
+      const evaluation = evaluateSchedule(settings.schedule, Date.now());
+      return {
+        favorites,
+        affectedLines: computeAffectedLines(cached, userLines),
+        accessOutageCount: cachedAccess,
+        quietHours: evaluation.quietHours,
+      };
+    },
     {
-      refreshIncidentCount: async (): Promise<number> => {
+      refreshAffectedLines: async (): Promise<LineCode[]> => {
         const userLines = computeUserLines(loadSettings().favorites);
         const cache = await session.refreshIncidents(userLines);
+        return computeAffectedLines(cache.incidents, userLines);
+      },
+      refreshAccessOutageCount: async (): Promise<number> => {
+        const codes = loadSettings().favorites.map((f) => f.code);
+        const cache = await session.refreshElevatorIncidents(codes);
         return cache.incidents.length;
+      },
+      refreshQuietHours: async (): Promise<boolean> => {
+        const evaluation = evaluateSchedule(
+          loadSettings().schedule,
+          Date.now(),
+        );
+        return evaluation.quietHours;
       },
       tickIntervalMs: 60_000,
     },
@@ -136,6 +268,11 @@ async function bootGlasses(): Promise<void> {
             await unmount();
             unmount = null;
           }
+          // Travel-history hook: log the station code the user just
+          // opened. The companion's "Reorder favorites?" suggestion
+          // reads this to surface popular destinations. Stays purely
+          // on-device.
+          recordOpen(intent.stationCode, Date.now());
           // Resolve a human-readable station name for the header AND the
           // station's served lines. The lines drive the incident filter
           // so the footer only surfaces alerts relevant to *this* station,
@@ -170,9 +307,19 @@ async function bootGlasses(): Promise<void> {
             // Predictions — useful side effect.
             const data = await session.client.get<PredictionsResponse>(url);
             await session.refreshIncidents(stationServedLines);
+            // Last-train lookup is a separate HTTP call, but the
+            // session cache makes calls beyond the first one free —
+            // so a 20s refresh tick only pays the network cost on
+            // the very first tick of a glasses session for any given
+            // station.
+            const lastTrainToday = await readLastTrainToday(
+              session,
+              intent.stationCode,
+            );
             return {
               trains: data.Trains ?? [],
               incidentHeadline: readFirstIncidentHeadline(session),
+              lastTrainToday,
             };
           };
 
@@ -182,12 +329,22 @@ async function bootGlasses(): Promise<void> {
             trains: [],
             fetchedAt: 0,
             fetchError: null,
+            // Per-mount counter; the screen's own `tick()` bumps it
+            // on each catch and resets to 0 on a successful fetch.
+            consecutiveFetchFailures: 0,
             // Seed the headline from the session cache so the first
             // render shows any already-known incident (the cache is
             // shared with Home and the Incidents screen). Avoids a
             // one-tick blink between mount and the first fetcher
             // resolution.
             incidentHeadline: readFirstIncidentHeadline(session),
+            // null = not yet loaded; the first tick fills it in. The
+            // late-night row hides until then.
+            lastTrainToday: null,
+            // Pin is per-mount — the user re-engages with TAP when
+            // they navigate back to Predictions. This avoids stale
+            // pins surviving across station changes.
+            pinned: null,
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);
@@ -215,6 +372,33 @@ async function bootGlasses(): Promise<void> {
           );
           const screen = makeIncidentsScreen(fetcher, initial);
           router.current = "incidents";
+          unmount = await mountGlassesScreen(screen, bridge, router);
+          return;
+        }
+        case "elevator": {
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          // Filter the elevator outages to the user's favorite station
+          // codes — a network-wide list would overflow the HUD. The
+          // session-side cache also enforces this filter, so a
+          // re-mount of the Elevator screen and a Home tick converge
+          // on the same source of truth.
+          const codes = loadSettings().favorites.map((f) => f.code);
+          const fetcher = async () => {
+            const cache = await session.refreshElevatorIncidents(codes);
+            return {
+              incidents: cache.incidents,
+              fetchedAt: cache.fetchedAt,
+              fetchError: cache.fetchError,
+            };
+          };
+          const initial = makeInitialElevatorSnapshot(
+            session.readCachedElevatorIncidents(),
+          );
+          const screen = makeElevatorScreen(fetcher, initial);
+          router.current = "elevator";
           unmount = await mountGlassesScreen(screen, bridge, router);
           return;
         }
@@ -248,16 +432,117 @@ async function bootGlasses(): Promise<void> {
           const screen = makeVoiceScreen(
             stt,
             (q: string) => session.searchStations(q),
+            undefined,
+            // Read voiceTargets at intent-resolution time (not at
+            // screen-construction time) so a settings change is
+            // picked up on the next utterance without remounting.
+            (transcript: string) =>
+              resolveVoiceIntent(transcript, loadSettings().voiceTargets),
           );
           router.current = "voice";
           unmount = await mountGlassesScreen(screen, bridge, router);
+          return;
+        }
+        case "journey": {
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          const plan = loadSettings().journeyPlan;
+          const fetcher = async () => {
+            if (plan.origin.length === 0 || plan.destination.length === 0) {
+              return { path: null, originName: "", destinationName: "" };
+            }
+            // Resolve names + path in parallel — both come from cached
+            // session calls so this is essentially free after the
+            // first round trip.
+            const [origStation, destStation, path] = await Promise.all([
+              session.resolveStationCode(plan.origin),
+              session.resolveStationCode(plan.destination),
+              session.getPath(plan.origin, plan.destination),
+            ]);
+            return {
+              path,
+              originName: origStation?.Name ?? plan.origin,
+              destinationName: destStation?.Name ?? plan.destination,
+            };
+          };
+          const initial = makeInitialJourneySnapshot(plan);
+          const screen = makeJourneyScreen(fetcher, initial);
+          router.current = "journey";
+          unmount = await mountGlassesScreen(screen, bridge, router);
+          return;
+        }
+        case "tutorial": {
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          // The Tutorial screen persists `tutorialSeen = true` from
+          // its own `onUnmount`, so we don't need to mark it here.
+          // Every gesture inside the screen routes back to Home,
+          // and the unmount-side persistence runs before the next
+          // mount lands.
+          router.current = "tutorial";
+          unmount = await mountGlassesScreen(makeTutorialScreen(), bridge, router);
           return;
         }
       }
     },
   };
 
-  await router.navigate({ to: "home" });
+  // First-launch users land on the Tutorial; everyone else picks an
+  // initial nav intent from three signals (in priority order):
+  //
+  //   1. Geofence (WP-G): if enabled AND a favorite is within
+  //      MAX_RADIUS_METERS, mount predictions for that station.
+  //   2. Schedule auto-rotate (WP-B): a window-matching auto-rotate
+  //      rule mounts its configured target.
+  //   3. Default: Home.
+  //
+  // Quiet-hours rules from the same schedule suppress auto-rotate
+  // (handled inside `evaluateSchedule`); the geofence overrides
+  // BOTH because the user's physical position is the most
+  // immediate signal of intent.
+  //
+  // The inference inside `readTutorialSeen()` means existing v1.1
+  // users with a saved API key never see the tutorial on upgrade —
+  // only genuine clean-install users do.
+  const settings = loadSettings();
+  let initialIntent: NavIntent;
+  if (!settings.tutorialSeen) {
+    initialIntent = { to: "tutorial" };
+  } else {
+    initialIntent = await pickInitialIntent(settings);
+  }
+  await router.navigate(initialIntent);
+}
+
+/**
+ * Pick the boot-time nav intent from geofence / schedule / default.
+ * Extracted from `bootGlasses` so the geolocation round-trip is
+ * isolated to one async function the host can await once.
+ */
+async function pickInitialIntent(
+  settings: ReturnType<typeof loadSettings>,
+): Promise<NavIntent> {
+  // Geofence first (WP-G).
+  if (settings.geofenceEnabled && settings.favorites.length > 0) {
+    const pos = await geolocateOnce();
+    if (pos) {
+      const hit = findNearestFavorite(settings.favorites, pos.lat, pos.lon);
+      if (hit) {
+        return { to: "predictions", stationCode: hit.favorite.code };
+      }
+    }
+  }
+  // Schedule auto-rotate (WP-B).
+  const evaluation = evaluateSchedule(settings.schedule, Date.now());
+  const target = evaluation.autoRotateTarget;
+  if (target && target.kind === "predictions") {
+    return { to: "predictions", stationCode: target.stationCode };
+  }
+  return { to: "home" };
 }
 
 function bootCompanion(root: HTMLElement): void {

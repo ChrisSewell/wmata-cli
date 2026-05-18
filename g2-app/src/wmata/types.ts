@@ -50,6 +50,39 @@ export interface RailIncident {
   DateUpdated: string;
 }
 
+/**
+ * A single elevator or escalator outage entry from
+ * `/Incidents.svc/json/ElevatorIncidents`.
+ *
+ * Notes from the WMATA docs (docs/wmata-api/incidents.md):
+ *   - `UnitType` is one of `"ELEVATOR"` / `"ESCALATOR"`. Render as a
+ *     1-char glyph (`E` / `S`) on the HUD.
+ *   - `EstimatedReturnToService` may be `null` — WMATA often can't
+ *     forecast a return time.
+ *   - `StationName` sometimes includes the entrance ("Dupont Circle,
+ *     Q Street Entrance"); the screen abbreviates to the station
+ *     part only for the body row header.
+ *   - Deprecated fields are typed `string | null` (rather than
+ *     dropped) so a future re-instatement doesn't break the parser.
+ */
+export interface ElevatorIncident {
+  DateOutOfServ: string;
+  DateUpdated: string;
+  EstimatedReturnToService: string | null;
+  LocationDescription: string;
+  StationCode: string;
+  StationName: string;
+  SymptomDescription: string;
+  UnitName: string;
+  /** `"ELEVATOR"` or `"ESCALATOR"` — narrow at the call site if needed. */
+  UnitType: string;
+  /** Deprecated per WMATA docs; preserved so the parser is forward-compat. */
+  DisplayOrder?: number;
+  SymptomCode?: string | null;
+  TimeOutOfService?: string;
+  UnitStatus?: string | null;
+}
+
 /** Postal address sub-object on a Station. */
 export interface StationAddress {
   City: string;
@@ -80,6 +113,47 @@ export interface Station {
   Address: StationAddress;
 }
 
+/**
+ * One scheduled-departure entry inside a `DayStationTimes.FirstTrains`
+ * or `DayStationTimes.LastTrains` array. Both arrays have the same
+ * shape. `Time` is `"HH:mm"`; `DestinationStation` is a station code.
+ *
+ * Per WMATA docs: AM times that appear in `LastTrains` signify the
+ * *next* calendar day — the trains run past midnight.
+ */
+export interface StationTrainTime {
+  Time: string;
+  DestinationStation: string;
+}
+
+/** Per-day-of-week schedule sub-object. */
+export interface DayStationTimes {
+  /** Station opening time, `"HH:mm"`. */
+  OpeningTime: string;
+  FirstTrains: StationTrainTime[];
+  LastTrains: StationTrainTime[];
+}
+
+/**
+ * Schedule for one station from `/Rail.svc/json/jStationTimes`.
+ *
+ * The seven weekday keys mirror the wire shape verbatim. Reading a
+ * specific day requires `times[weekdayName]` — see
+ * `weekdayKey(epochMs)` in the screen-side helper for the canonical
+ * mapping.
+ */
+export interface StationTimes {
+  Code: string;
+  StationName: string;
+  Monday: DayStationTimes;
+  Tuesday: DayStationTimes;
+  Wednesday: DayStationTimes;
+  Thursday: DayStationTimes;
+  Friday: DayStationTimes;
+  Saturday: DayStationTimes;
+  Sunday: DayStationTimes;
+}
+
 // Response wrappers --------------------------------------------------------
 
 export interface PredictionsResponse {
@@ -88,6 +162,32 @@ export interface PredictionsResponse {
 
 export interface IncidentsResponse {
   Incidents: RailIncident[];
+}
+
+export interface ElevatorIncidentsResponse {
+  ElevatorIncidents: ElevatorIncident[];
+}
+
+export interface StationTimesResponse {
+  StationTimes: StationTimes[];
+}
+
+/**
+ * One station along a same-line path from `/Rail.svc/json/jPath`.
+ *
+ * `DistanceToPrev` is the distance (in feet) to the previous station
+ * in the sequence; the first entry returns 0. `SeqNum` is 1-based.
+ */
+export interface PathStep {
+  DistanceToPrev: number;
+  LineCode: string;
+  SeqNum: number;
+  StationCode: string;
+  StationName: string;
+}
+
+export interface PathResponse {
+  Path: PathStep[];
 }
 
 export interface StationsResponse {

@@ -30,15 +30,21 @@ import {
   type TextContainerUpgrade,
 } from "@evenrealities/even_hub_sdk";
 import {
+  LAST_TRAIN_HOUR,
   MAX_VISIBLE_TRAINS,
   STALE_THRESHOLD_MS,
   TICK_INTERVAL_MS,
+  findPinnedTrainIndex,
   formatClock,
   isStale,
   makePredictionsScreen,
+  pickLastTrainTime,
   renderFooter,
   renderHeader,
+  renderLastTrainRow,
+  renderPinRow,
   renderTrainRow,
+  shouldShowLastTrain,
   sortTrainsForDisplay,
   type PredictionsFetchResult,
   type PredictionsSnapshot,
@@ -88,14 +94,17 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     trains: [],
     fetchedAt: NOW,
     fetchError: null,
+    consecutiveFetchFailures: 0,
     incidentHeadline: null,
+    lastTrainToday: null,
+    pinned: null,
     ...over,
   };
 }
 
 /** A noop fetcher — handy for screens that we never tick in a test. */
 const noopFetcher = (): Promise<PredictionsFetchResult> =>
-  Promise.resolve({ trains: [], incidentHeadline: null });
+  Promise.resolve({ trains: [], incidentHeadline: null, lastTrainToday: null });
 
 // ---------------------------------------------------------------------------
 // formatClock
@@ -175,10 +184,61 @@ describe("renderHeader", () => {
     expect(out.endsWith("14:32*")).toBe(true);
   });
 
-  it("appends '?' when there is an active fetch error", () => {
-    const out = renderHeader(snap({ fetchError: "Network down" }), NOW);
+  // ----- 3-state stale-marker escalation -----
+  //
+  // The marker now reflects the *number of consecutive fetch failures*
+  // since the last success, not just a binary stale/error flag. We pin
+  // each branch verbatim so a future regression has to update the
+  // expected glyphs intentionally.
+
+  it("appends '*' after one consecutive fetch failure", () => {
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 1, fetchError: "Slow network" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.endsWith("14:32*")).toBe(true);
+  });
+
+  it("appends '**' after two consecutive fetch failures", () => {
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 2, fetchError: "Slow network" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.endsWith("14:32**")).toBe(true);
+  });
+
+  it("appends '?' after three or more consecutive fetch failures", () => {
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 3, fetchError: "Slow network" }),
+      NOW,
+    );
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.endsWith("14:32?")).toBe(true);
+  });
+
+  it("appends '?' when no successful fetch ever AND there's an error", () => {
+    // fetchedAt=0 with an active error means we've never had data at
+    // all. This is the strongest degraded state, marker = '?'.
+    const out = renderHeader(
+      snap({ fetchedAt: 0, fetchError: "Network down" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.endsWith("14:32?")).toBe(true);
+  });
+
+  it("steals 2 cols from the name budget when the marker is '**'", () => {
+    // "Metro Center" (12 chars) → with **, the name budget is 18-2=16,
+    // so the name still fits verbatim. The total line length stays at
+    // exactly LINE_WIDTH.
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 2, fetchError: "x" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out).toContain("Metro Center");
   });
 
   it("renders '--:--' placeholder when ctx.nowMs is zero", () => {
@@ -656,6 +716,7 @@ describe("predictions tick", () => {
       Promise.resolve<PredictionsFetchResult>({
         trains: fixture,
         incidentHeadline: "Single-tracking RD",
+        lastTrainToday: null,
       });
     const screen = makePredictionsScreen(
       fetcher,
@@ -677,10 +738,222 @@ describe("predictions tick", () => {
     expect(next.trains).toEqual(snap({}).trains);
   });
 
+  it("increments consecutiveFetchFailures on each rejected fetcher", async () => {
+    const fetcher = () => Promise.reject(new Error("boom"));
+    const screen = makePredictionsScreen(fetcher, snap({}));
+    let s = screen.init();
+    expect(s.consecutiveFetchFailures).toBe(0);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(1);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(2);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(3);
+  });
+
+  it("resets consecutiveFetchFailures to 0 on a successful fetch", async () => {
+    let shouldFail = true;
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      shouldFail
+        ? Promise.reject(new Error("boom"))
+        : Promise.resolve({
+            trains: [],
+            incidentHeadline: null,
+            lastTrainToday: null,
+          });
+    const screen = makePredictionsScreen(
+      fetcher,
+      snap({ consecutiveFetchFailures: 2 }),
+    );
+    let s = screen.init();
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(3);
+    // Network recovers.
+    shouldFail = false;
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(0);
+    expect(s.fetchError).toBeNull();
+  });
+
   it("exposes a tickIntervalMs of 20_000 (20s) for the host", () => {
     const screen = makePredictionsScreen(noopFetcher, snap({}));
     expect(screen.tickIntervalMs).toBe(TICK_INTERVAL_MS);
     expect(screen.tickIntervalMs).toBe(20_000);
+  });
+
+  it("folds lastTrainToday into the snapshot from the fetcher result", async () => {
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      Promise.resolve({
+        trains: [],
+        incidentHeadline: null,
+        lastTrainToday: "23:47",
+      });
+    const screen = makePredictionsScreen(fetcher, snap({}));
+    const next = await screen.tick(screen.init());
+    expect(next.lastTrainToday).toBe("23:47");
+  });
+
+  it("preserves prior lastTrainToday when the fetcher reports null", async () => {
+    // Use case: the schedule cache is warm from a prior tick; the
+    // current tick's fetcher couldn't update it (e.g. transient
+    // jStationTimes blip) and returns null. We should keep the
+    // last-known time rather than blinking the row off.
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      Promise.resolve({
+        trains: [],
+        incidentHeadline: null,
+        lastTrainToday: null,
+      });
+    const screen = makePredictionsScreen(
+      fetcher,
+      snap({ lastTrainToday: "23:47" }),
+    );
+    const next = await screen.tick(screen.init());
+    expect(next.lastTrainToday).toBe("23:47");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Last-train glance (A3)
+// ---------------------------------------------------------------------------
+
+describe("shouldShowLastTrain", () => {
+  it("returns false during the morning rush (08:00)", () => {
+    const t = new Date(2026, 4, 18, 8, 0, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(false);
+  });
+
+  it("returns false at 20:59 (just before the threshold)", () => {
+    const t = new Date(2026, 4, 18, 20, 59, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(false);
+  });
+
+  it("returns true exactly at LAST_TRAIN_HOUR (21:00)", () => {
+    const t = new Date(2026, 4, 18, LAST_TRAIN_HOUR, 0, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(true);
+  });
+
+  it("returns true at 23:30", () => {
+    const t = new Date(2026, 4, 18, 23, 30, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(true);
+  });
+
+  it("returns false for epoch-0 / NaN", () => {
+    expect(shouldShowLastTrain(0)).toBe(false);
+    expect(shouldShowLastTrain(Number.NaN)).toBe(false);
+  });
+});
+
+describe("pickLastTrainTime", () => {
+  it("returns null for an empty list", () => {
+    expect(pickLastTrainTime([])).toBeNull();
+  });
+
+  it("returns the latest PM time across the list", () => {
+    expect(
+      pickLastTrainTime([
+        { Time: "21:30" },
+        { Time: "23:47" },
+        { Time: "22:15" },
+      ]),
+    ).toBe("23:47");
+  });
+
+  it("ignores AM times (they signify the next day per WMATA docs)", () => {
+    // 01:30 is an AM entry — WMATA puts these in LastTrains[] when
+    // service crosses midnight. We want the latest PM entry, not
+    // tomorrow morning.
+    expect(
+      pickLastTrainTime([
+        { Time: "23:47" },
+        { Time: "01:30" },
+      ]),
+    ).toBe("23:47");
+  });
+
+  it("returns null when every entry is AM", () => {
+    expect(
+      pickLastTrainTime([{ Time: "01:30" }, { Time: "02:15" }]),
+    ).toBeNull();
+  });
+
+  it("ignores malformed entries", () => {
+    expect(
+      pickLastTrainTime([
+        { Time: "" },
+        { Time: "not-a-time" },
+        { Time: "22:15" },
+      ]),
+    ).toBe("22:15");
+  });
+});
+
+describe("renderLastTrainRow", () => {
+  const EVENING = new Date(2026, 4, 18, 22, 30, 0).getTime();
+  const MORNING = new Date(2026, 4, 18, 8, 30, 0).getTime();
+
+  it("returns null before the late-night window", () => {
+    expect(
+      renderLastTrainRow(snap({ lastTrainToday: "23:47" }), MORNING),
+    ).toBeNull();
+  });
+
+  it("returns null when lastTrainToday is missing", () => {
+    expect(renderLastTrainRow(snap({ lastTrainToday: null }), EVENING)).toBeNull();
+    expect(renderLastTrainRow(snap({ lastTrainToday: "" }), EVENING)).toBeNull();
+  });
+
+  it("renders `Last train: HH:MM` when both conditions are met", () => {
+    const out = renderLastTrainRow(
+      snap({ lastTrainToday: "23:47" }),
+      EVENING,
+    );
+    expect(out).toBe("Last train: 23:47");
+    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+  });
+});
+
+describe("predictions view: late-night last-train row", () => {
+  const EVENING = new Date(2026, 4, 18, 22, 30, 0).getTime();
+  const EVENING_CTX: ViewContext = { nowMs: EVENING };
+
+  it("appends the row at the end of the body when after LAST_TRAIN_HOUR", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: [train({ Line: "RD", Min: "5" })],
+        lastTrainToday: "23:47",
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
+    expectFits(lines);
+    expect(lines[lines.length - 1]).toBe("Last train: 23:47");
+  });
+
+  it("does NOT append the row before LAST_TRAIN_HOUR", () => {
+    // CTX (above) is the canonical 14:32 fixture.
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: [train({ Line: "RD", Min: "5" })],
+        lastTrainToday: "23:47",
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expectFits(lines);
+    expect(lines.some((l) => l.includes("Last train"))).toBe(false);
+  });
+
+  it("does NOT append the row when lastTrainToday is null (data not loaded yet)", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: [train({ Line: "RD", Min: "5" })],
+        lastTrainToday: null,
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
+    expect(lines.some((l) => l.includes("Last train"))).toBe(false);
   });
 });
 
@@ -711,6 +984,7 @@ describe("predictions: stale check uses ctx.nowMs (not the snapshot)", () => {
       Promise.resolve<PredictionsFetchResult>({
         trains: [],
         incidentHeadline: null,
+        lastTrainToday: null,
       });
     const screen = makePredictionsScreen(fetcher, s1);
     // Pin Date.now() so the tick stamps fetchedAt deterministically.
@@ -863,9 +1137,12 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
     // Exact-pin against the canonical render. Cells (24 cols total):
     //   header:    name(18) + " " + clock(5)
     //   body row:  glyph(2) + " " + dest(11) + " " + cars(2) + " " + eta(6)
+    //
+    // The first train carries the `>` cursor in place of its second
+    // glyph char (v1.2 pin-a-train default cursor — TAP affordance).
     expect(lines).toEqual([
       "Metro Center       14:32",
-      "RD Shady Grove 6c    ARR",
+      "R> Shady Grove 6c    ARR",
       "RD Glenmont    8c  3 min",
       "OR Vienna      6c  5 min",
     ]);
@@ -903,7 +1180,7 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
     expectFits(lines);
     expect(lines).toEqual([
       "Metro Center       14:32",
-      "RD Shady Grove 6c    ARR",
+      "R> Shady Grove 6c    ARR",
       "RD Glenmont    8c  3 min",
       "OR Vienna      6c  5 min",
       "! Single-tracking on RD…",
@@ -911,5 +1188,221 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
     expect(lines[4]!.length).toBe(LINE_WIDTH);
     expect(lines[4]!.startsWith("! ")).toBe(true);
     expect(lines[4]!.endsWith("…")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pin-a-train (cursor + TAP-to-pin)
+// ---------------------------------------------------------------------------
+
+describe("renderTrainRow: cursor + pin markers", () => {
+  it("renders the full line glyph when no marker is supplied", () => {
+    const out = renderTrainRow(train({ Line: "RD" }));
+    expect(out.startsWith("RD")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+
+  it("replaces the second glyph char with `*` for a pinned train", () => {
+    const out = renderTrainRow(train({ Line: "RD" }), "*");
+    expect(out.startsWith("R*")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+
+  it("replaces the second glyph char with `>` for the cursor target", () => {
+    const out = renderTrainRow(train({ Line: "OR" }), ">");
+    expect(out.startsWith("O>")).toBe(true);
+    expect(out.length).toBe(LINE_WIDTH);
+  });
+});
+
+describe("findPinnedTrainIndex", () => {
+  it("returns -1 when nothing matches", () => {
+    const trains = [
+      train({ Line: "RD", Destination: "Glenmont" }),
+      train({ Line: "OR", Destination: "Vienna" }),
+    ];
+    expect(
+      findPinnedTrainIndex(trains, { line: "BL", destination: "Largo" }),
+    ).toBe(-1);
+  });
+
+  it("returns the first matching index", () => {
+    const trains = [
+      train({ Line: "RD", Destination: "Shady Grove" }),
+      train({ Line: "RD", Destination: "Glenmont" }),
+      train({ Line: "RD", Destination: "Glenmont" }), // duplicate
+    ];
+    expect(
+      findPinnedTrainIndex(trains, { line: "RD", destination: "Glenmont" }),
+    ).toBe(1);
+  });
+
+  it("returns -1 when the pin is null", () => {
+    expect(findPinnedTrainIndex([], null)).toBe(-1);
+  });
+});
+
+describe("renderPinRow", () => {
+  it("returns null when no train is pinned", () => {
+    expect(renderPinRow(snap({}), [])).toBeNull();
+  });
+
+  it("returns null when the pinned train is no longer visible", () => {
+    const visible = [train({ Line: "RD", Destination: "Glenmont", Min: "3" })];
+    const out = renderPinRow(
+      snap({ pinned: { line: "BL", destination: "Largo" } }),
+      visible,
+    );
+    expect(out).toBeNull();
+  });
+
+  it("renders `* <line> <dest> <eta>` at exactly LINE_WIDTH", () => {
+    const visible = [
+      train({ Line: "RD", Destination: "Glenmont", Min: "3" }),
+    ];
+    const out = renderPinRow(
+      snap({ pinned: { line: "RD", destination: "Glenmont" } }),
+      visible,
+    );
+    expect(out).not.toBeNull();
+    expect(out!.length).toBe(LINE_WIDTH);
+    expect(out!).toContain("RD");
+    expect(out!).toContain("Glenmont");
+    expect(out!).toContain("3 min");
+    expect(out!.startsWith("* ")).toBe(true);
+  });
+});
+
+describe("predictions view: pin + cursor rendering", () => {
+  function trains(): Train[] {
+    return [
+      train({ Line: "RD", Destination: "Shady Grove", Min: "5" }),
+      train({ Line: "RD", Destination: "Glenmont", Min: "8" }),
+      train({ Line: "OR", Destination: "Vienna", Min: "10" }),
+    ];
+  }
+
+  it("marks the cursor target with `>` and no pin when nothing pinned", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const lines = screen.view(
+      screen.init(),
+      { highlightedIndex: 1 },
+      CTX,
+    );
+    // header at 0; trains start at index 1 with no pin row.
+    const cursorRow = lines.find((l) => l.startsWith("R>"));
+    expect(cursorRow).toBeDefined();
+    expect(cursorRow).toContain("Glenmont");
+  });
+
+  it("marks the pinned train with `*` regardless of cursor position", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: trains(),
+        pinned: { line: "OR", destination: "Vienna" },
+      }),
+    );
+    const lines = screen.view(
+      screen.init(),
+      { highlightedIndex: 0 },
+      CTX,
+    );
+    // Pin row appears under the header (line index 1).
+    expect(lines[1]).toMatch(/^\* /);
+    expect(lines[1]).toContain("Vienna");
+    // The OR/Vienna row in the body carries `O*` marker.
+    expect(lines.some((l) => l.startsWith("O*") && l.includes("Vienna"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("predictions reduce: pin + cursor", () => {
+  function trains(): Train[] {
+    return [
+      train({ Line: "RD", Destination: "Shady Grove", Min: "5" }),
+      train({ Line: "RD", Destination: "Glenmont", Min: "8" }),
+      train({ Line: "OR", Destination: "Vienna", Min: "10" }),
+    ];
+  }
+
+  it("SCROLL_DOWN advances the cursor", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.nav.highlightedIndex).toBe(1);
+  });
+
+  it("SCROLL_DOWN clamps at the last visible train", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 99 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.nav.highlightedIndex).toBe(2); // 3 visible trains -> max idx 2
+  });
+
+  it("SCROLL_UP clamps at 0", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_UP" },
+    );
+    expect(r.nav.highlightedIndex).toBe(0);
+  });
+
+  it("TAP pins the cursor target", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 1 },
+      { type: "TAP" },
+    );
+    expect(r.snapshot?.pinned).toEqual({
+      line: "RD",
+      destination: "Glenmont",
+    });
+  });
+
+  it("TAP on the already-pinned train UNPINS it", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: trains(),
+        pinned: { line: "RD", destination: "Glenmont" },
+      }),
+    );
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 1 },
+      { type: "TAP" },
+    );
+    expect(r.snapshot?.pinned).toBeNull();
+  });
+
+  it("DOUBLE_TAP still navigates Home", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 1 },
+      { type: "DOUBLE_TAP" },
+    );
+    expect(r.navigate).toEqual({ to: "home" });
+  });
+
+  it("SCROLL with empty trains is a no-op", () => {
+    const screen = makePredictionsScreen(noopFetcher, snap({ trains: [] }));
+    const r = screen.reduce(
+      screen.init(),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.nav.highlightedIndex).toBe(0);
   });
 });

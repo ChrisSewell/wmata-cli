@@ -22,11 +22,14 @@ import {
   addFavorite,
   clearSettings,
   loadSettings,
+  markTutorialSeen,
   removeFavorite,
   reorderFavorites,
   saveApiKey,
+  saveSchedule,
   type FavoriteStation,
 } from "./settings";
+import type { ScheduleRule } from "../schedule/rules";
 
 // ---------------------------------------------------------------------------
 // Mock localStorage
@@ -235,6 +238,147 @@ describe("clearSettings", () => {
     const s = loadSettings();
     expect(s.apiKey).toBe("");
     expect(s.favorites).toEqual([]);
+  });
+
+  it("also clears tutorialSeen so a reset truly returns to first-launch state", () => {
+    markTutorialSeen();
+    expect(loadSettings().tutorialSeen).toBe(true);
+    clearSettings();
+    expect(loadSettings().tutorialSeen).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tutorialSeen + markTutorialSeen
+// ---------------------------------------------------------------------------
+//
+// The flag is its own storage key with its own schema-versioned
+// envelope, so adding it did NOT require bumping `SCHEMA_VERSION`
+// (which would have nuked every v1 user's favorites + key). The
+// inference rule replaces a schema migration: on an absent
+// `wmata.g2.tutorialSeen`, infer `true` for users with a saved
+// apiKey (existing v1.1 user) and `false` for clean installs.
+
+describe("loadSettings.tutorialSeen: default + inference", () => {
+  it("returns false on a clean install (no apiKey, no stored flag)", () => {
+    expect(loadSettings().tutorialSeen).toBe(false);
+  });
+
+  it("infers true when a non-empty apiKey is already stored (v1 upgrade path)", () => {
+    saveApiKey("legacy-v1-key");
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("explicit markTutorialSeen() wins over the inference rule", () => {
+    // Clean install + explicit mark → true (no inference involved).
+    markTutorialSeen();
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("a saved empty apiKey does NOT infer 'seen' (the user explicitly cleared)", () => {
+    // saveApiKey('') is the documented "clear key" path. A user who
+    // cleared their key is back to a first-launch-like state for
+    // tutorial purposes — there's no other state worth inferring from.
+    saveApiKey("");
+    expect(loadSettings().tutorialSeen).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// schedule storage
+// ---------------------------------------------------------------------------
+
+describe("loadSettings.schedule + saveSchedule", () => {
+  it("returns an empty array on a fresh install", () => {
+    expect(loadSettings().schedule).toEqual([]);
+  });
+
+  it("round-trips a typical auto-rotate + quiet-hours pair", () => {
+    const rules: ScheduleRule[] = [
+      {
+        kind: "auto-rotate",
+        days: ["mon", "tue", "wed", "thu", "fri"],
+        startHHMM: "08:00",
+        endHHMM: "09:30",
+        target: { kind: "predictions", stationCode: "C01" },
+      },
+      {
+        kind: "quiet-hours",
+        days: ["sat", "sun"],
+        startHHMM: "00:00",
+        endHHMM: "07:00",
+      },
+    ];
+    saveSchedule(rules);
+    expect(loadSettings().schedule).toEqual(rules);
+  });
+
+  it("drops malformed rules from the parsed list", () => {
+    mockStorage.store.set(
+      "wmata.g2.schedule",
+      JSON.stringify({
+        schemaVersion: 1,
+        value: [
+          { kind: "auto-rotate", days: ["mon"], startHHMM: "08:00" }, // missing endHHMM
+          { kind: "auto-rotate", days: [], startHHMM: "08:00", endHHMM: "09:00", target: { kind: "home" } }, // empty days
+          {
+            kind: "quiet-hours",
+            days: ["mon"],
+            startHHMM: "23:00",
+            endHHMM: "07:00",
+          }, // valid
+        ],
+      }),
+    );
+    const loaded = loadSettings().schedule;
+    expect(loaded.length).toBe(1);
+    expect(loaded[0]!.kind).toBe("quiet-hours");
+  });
+
+  it("normalises an unknown weekday code out of the days list", () => {
+    mockStorage.store.set(
+      "wmata.g2.schedule",
+      JSON.stringify({
+        schemaVersion: 1,
+        value: [
+          {
+            kind: "auto-rotate",
+            days: ["mon", "funday", "fri"],
+            startHHMM: "08:00",
+            endHHMM: "09:00",
+            target: { kind: "home" },
+          },
+        ],
+      }),
+    );
+    const loaded = loadSettings().schedule;
+    expect(loaded[0]!.days).toEqual(["mon", "fri"]);
+  });
+});
+
+describe("markTutorialSeen + loadSettings roundtrip", () => {
+  it("a marked flag survives across loads", () => {
+    expect(loadSettings().tutorialSeen).toBe(false);
+    markTutorialSeen();
+    expect(loadSettings().tutorialSeen).toBe(true);
+    // Sanity: a second load returns the same value.
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("ignores a corrupt envelope and falls back to the inference rule", () => {
+    saveApiKey("legacy-v1-key");
+    mockStorage.store.set("wmata.g2.tutorialSeen", "{not valid json}");
+    // Falls through to inference: apiKey is set → true.
+    expect(loadSettings().tutorialSeen).toBe(true);
+  });
+
+  it("ignores a wrong-typed envelope value and falls back to the inference rule", () => {
+    saveApiKey("legacy-v1-key");
+    mockStorage.store.set(
+      "wmata.g2.tutorialSeen",
+      JSON.stringify({ schemaVersion: 1, value: "not-a-bool" }),
+    );
+    expect(loadSettings().tutorialSeen).toBe(true);
   });
 });
 

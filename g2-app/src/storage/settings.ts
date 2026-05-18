@@ -34,6 +34,14 @@
 //   in-memory fallback — callers that need that should layer it on top.
 
 import type { LineCode } from "../wmata";
+import type {
+  AutoRotateRule,
+  QuietHoursRule,
+  ScheduleRule,
+  Weekday,
+} from "../schedule/rules";
+import { WEEKDAYS } from "../schedule/rules";
+import { clearHistory } from "./history";
 
 // ---------------------------------------------------------------------------
 // Types & constants
@@ -44,6 +52,16 @@ export type FavoriteStation = {
   code: string;
   name: string;
   lines: LineCode[];
+  /**
+   * Geocoded coordinates of the station entrance. Optional —
+   * v1.1 favorites stored before WP-G don't carry these fields,
+   * and the parser tolerates their absence. Populated by the
+   * companion when adding new favorites (lat/lon come from
+   * WMATA's `jStations` response). Used only by the WP-G
+   * geofence boot path.
+   */
+  lat?: number;
+  lon?: number;
 };
 
 /** Public shape returned by `loadSettings`. */
@@ -57,6 +75,71 @@ export interface Settings {
    * bounce back to Home.
    */
   sttApiKey: string;
+  /**
+   * True once the user has seen the first-launch gesture cheat sheet.
+   *
+   * Migration rule (rather than bumping SCHEMA_VERSION, which would
+   * invalidate every v1 user's stored value): when the
+   * `wmata.g2.tutorialSeen` key is absent, infer `true` if the user
+   * has any prior stored state (an `apiKey` was set) and `false`
+   * otherwise. Net effect: existing v1.1 users do NOT see the
+   * tutorial on upgrade (they're already configured), and only
+   * genuine first-launchers do.
+   */
+  tutorialSeen: boolean;
+  /**
+   * User's schedule rules (auto-rotate + quiet hours). Empty array
+   * is the default — no auto-rotate, no quiet hours; the app boots
+   * straight to Home. Evaluated by `evaluateSchedule` in
+   * `src/schedule/rules.ts`.
+   */
+  schedule: ScheduleRule[];
+  /**
+   * Labelled station codes for voice-intent commands. Empty strings
+   * mean "not configured" — the corresponding voice keyword falls
+   * through to the fuzzy station match instead of a direct nav.
+   *
+   * "home" and "work" are the canonical labels; more can be added
+   * later without a schema change (the parser drops unknown keys).
+   */
+  voiceTargets: VoiceTargets;
+  /**
+   * Saved origin→destination pair for the Journey screen (WP-C).
+   * Both fields empty hides the Journey screen entirely. Setting
+   * either or both enables the screen.
+   */
+  journeyPlan: JourneyPlan;
+  /**
+   * Boot-time geofence enable flag (WP-G). When true AND the
+   * runtime exposes `navigator.geolocation` AND favorites carry
+   * lat/lon, `bootGlasses` checks the user's current position and
+   * auto-mounts predictions for the nearest in-range favorite
+   * instead of Home. Default: false.
+   */
+  geofenceEnabled: boolean;
+}
+
+/** Labelled station codes for voice navigation keywords. */
+export interface VoiceTargets {
+  /** Station code, e.g. "C01". Empty means unset. */
+  home: string;
+  work: string;
+}
+
+/**
+ * Saved origin→destination pair for the Journey / Commute screen.
+ * Both fields empty (the default) → the Journey screen is hidden.
+ *
+ * Per the WMATA jPath endpoint, both stations must be on the SAME
+ * line for the path lookup to return data. A cross-line journey
+ * returns an empty Path array and the screen surfaces a friendly
+ * "Not a same-line route" message.
+ */
+export interface JourneyPlan {
+  /** Origin station code, e.g. "C01". Empty = unset. */
+  origin: string;
+  /** Destination station code, e.g. "C04". Empty = unset. */
+  destination: string;
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -69,6 +152,11 @@ const SCHEMA_VERSION = 1;
 const KEY_API_KEY = "wmata.g2.apiKey";
 const KEY_FAVORITES = "wmata.g2.favorites";
 const KEY_STT_API_KEY = "wmata.g2.sttApiKey";
+const KEY_TUTORIAL_SEEN = "wmata.g2.tutorialSeen";
+const KEY_SCHEDULE = "wmata.g2.schedule";
+const KEY_VOICE_TARGETS = "wmata.g2.voiceTargets";
+const KEY_JOURNEY_PLAN = "wmata.g2.journeyPlan";
+const KEY_GEOFENCE_ENABLED = "wmata.g2.geofenceEnabled";
 
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -163,7 +251,9 @@ function asLineCode(x: unknown): LineCode | null {
 
 /**
  * Narrow an unknown value to a `FavoriteStation`, dropping any malformed
- * `lines` entries. Returns null if `code`/`name` are missing.
+ * `lines` entries. Returns null if `code`/`name` are missing. The
+ * optional `lat` / `lon` fields are tolerated when present and ignored
+ * when malformed — v1.1 entries (no coords) keep working untouched.
  */
 function asFavorite(x: unknown): FavoriteStation | null {
   if (!isRecord(x)) return null;
@@ -177,7 +267,12 @@ function asFavorite(x: unknown): FavoriteStation | null {
     const lc = asLineCode(line);
     if (lc !== null) cleanedLines.push(lc);
   }
-  return { code, name, lines: cleanedLines };
+  const out: FavoriteStation = { code, name, lines: cleanedLines };
+  const lat = x["lat"];
+  const lon = x["lon"];
+  if (typeof lat === "number" && Number.isFinite(lat)) out.lat = lat;
+  if (typeof lon === "number" && Number.isFinite(lon)) out.lon = lon;
+  return out;
 }
 
 /** Narrow an unknown value to a `FavoriteStation[]`, dropping malformed rows. */
@@ -210,6 +305,183 @@ function readFavorites(): FavoriteStation[] {
   return asFavoritesArray(value);
 }
 
+/**
+ * Narrow an unknown value to a `Weekday`, or return null.
+ */
+function asWeekday(x: unknown): Weekday | null {
+  if (typeof x !== "string") return null;
+  return (WEEKDAYS as readonly string[]).includes(x) ? (x as Weekday) : null;
+}
+
+/**
+ * Narrow an unknown value to a `Weekday[]`, dropping anything that
+ * isn't a valid weekday code.
+ */
+function asWeekdayArray(x: unknown): Weekday[] {
+  if (!Array.isArray(x)) return [];
+  const out: Weekday[] = [];
+  for (const v of x) {
+    const wd = asWeekday(v);
+    if (wd && !out.includes(wd)) out.push(wd);
+  }
+  return out;
+}
+
+/**
+ * Narrow an unknown value to one of the auto-rotate `target`
+ * variants. Returns null on malformed input.
+ */
+function asAutoRotateTarget(
+  x: unknown,
+): AutoRotateRule["target"] | null {
+  if (!isRecord(x)) return null;
+  const kind = x["kind"];
+  if (kind === "home") return { kind: "home" };
+  if (kind === "predictions") {
+    const stationCode = x["stationCode"];
+    if (typeof stationCode !== "string" || stationCode.length === 0) {
+      return null;
+    }
+    return { kind: "predictions", stationCode };
+  }
+  return null;
+}
+
+/**
+ * Narrow an unknown value to a `ScheduleRule`. Drops any rule whose
+ * required fields are missing or malformed. The day-list is
+ * normalised through `asWeekdayArray` (unknown weekdays dropped).
+ */
+function asScheduleRule(x: unknown): ScheduleRule | null {
+  if (!isRecord(x)) return null;
+  const kind = x["kind"];
+  const days = asWeekdayArray(x["days"]);
+  const start = x["startHHMM"];
+  const end = x["endHHMM"];
+  if (typeof start !== "string" || typeof end !== "string") return null;
+  if (days.length === 0) return null;
+  if (kind === "auto-rotate") {
+    const target = asAutoRotateTarget(x["target"]);
+    if (!target) return null;
+    const rule: AutoRotateRule = {
+      kind: "auto-rotate",
+      days,
+      startHHMM: start,
+      endHHMM: end,
+      target,
+    };
+    return rule;
+  }
+  if (kind === "quiet-hours") {
+    const rule: QuietHoursRule = {
+      kind: "quiet-hours",
+      days,
+      startHHMM: start,
+      endHHMM: end,
+    };
+    return rule;
+  }
+  return null;
+}
+
+/** Narrow an unknown value to a `ScheduleRule[]`, dropping malformed entries. */
+function asScheduleArray(x: unknown): ScheduleRule[] {
+  if (!Array.isArray(x)) return [];
+  const out: ScheduleRule[] = [];
+  for (const item of x) {
+    const rule = asScheduleRule(item);
+    if (rule !== null) out.push(rule);
+  }
+  return out;
+}
+
+function readSchedule(): ScheduleRule[] {
+  const value = parseEnvelope(safeGet(KEY_SCHEDULE));
+  return asScheduleArray(value);
+}
+
+function writeSchedule(rules: ScheduleRule[]): void {
+  const envelope: Envelope<ScheduleRule[]> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: rules,
+  };
+  safeSet(KEY_SCHEDULE, JSON.stringify(envelope));
+}
+
+function readVoiceTargets(): VoiceTargets {
+  const value = parseEnvelope(safeGet(KEY_VOICE_TARGETS));
+  if (!isRecord(value)) return { home: "", work: "" };
+  const home = value["home"];
+  const work = value["work"];
+  return {
+    home: typeof home === "string" ? home : "",
+    work: typeof work === "string" ? work : "",
+  };
+}
+
+function writeVoiceTargets(targets: VoiceTargets): void {
+  const envelope: Envelope<VoiceTargets> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: targets,
+  };
+  safeSet(KEY_VOICE_TARGETS, JSON.stringify(envelope));
+}
+
+function readJourneyPlan(): JourneyPlan {
+  const value = parseEnvelope(safeGet(KEY_JOURNEY_PLAN));
+  if (!isRecord(value)) return { origin: "", destination: "" };
+  const origin = value["origin"];
+  const destination = value["destination"];
+  return {
+    origin: typeof origin === "string" ? origin : "",
+    destination: typeof destination === "string" ? destination : "",
+  };
+}
+
+function readGeofenceEnabled(): boolean {
+  const value = parseEnvelope(safeGet(KEY_GEOFENCE_ENABLED));
+  return typeof value === "boolean" ? value : false;
+}
+
+function writeGeofenceEnabled(enabled: boolean): void {
+  const envelope: Envelope<boolean> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: enabled,
+  };
+  safeSet(KEY_GEOFENCE_ENABLED, JSON.stringify(envelope));
+}
+
+function writeJourneyPlan(plan: JourneyPlan): void {
+  const envelope: Envelope<JourneyPlan> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: plan,
+  };
+  safeSet(KEY_JOURNEY_PLAN, JSON.stringify(envelope));
+}
+
+/**
+ * Read the tutorial-seen flag.
+ *
+ *   - Explicit `true` / `false` stored under `KEY_TUTORIAL_SEEN`
+ *     (schema-versioned envelope) wins.
+ *   - Absent: infer `true` for existing users (any non-empty
+ *     `KEY_API_KEY`), `false` for clean installs. This avoids
+ *     bumping `SCHEMA_VERSION` (which would discard every v1 user's
+ *     favorites + key on upgrade — see RISK #1 in the WP-A plan).
+ */
+function readTutorialSeen(): boolean {
+  const raw = safeGet(KEY_TUTORIAL_SEEN);
+  if (raw !== null) {
+    const value = parseEnvelope(raw);
+    if (typeof value === "boolean") return value;
+  }
+  // Inference path. `parseEnvelope` returns null for missing /
+  // corrupt / version-mismatched envelopes; in any of those cases
+  // we fall back to "existing user → seen, fresh install → unseen".
+  const apiKey = parseEnvelope(safeGet(KEY_API_KEY));
+  return typeof apiKey === "string" && apiKey.length > 0;
+}
+
 function writeFavorites(favorites: FavoriteStation[]): void {
   const envelope: Envelope<FavoriteStation[]> = {
     schemaVersion: SCHEMA_VERSION,
@@ -232,7 +504,54 @@ export function loadSettings(): Settings {
     apiKey: readApiKey(),
     favorites: readFavorites(),
     sttApiKey: readSttApiKey(),
+    tutorialSeen: readTutorialSeen(),
+    schedule: readSchedule(),
+    voiceTargets: readVoiceTargets(),
+    journeyPlan: readJourneyPlan(),
+    geofenceEnabled: readGeofenceEnabled(),
   };
+}
+
+/** Persist the geofence enable flag (WP-G). */
+export function saveGeofenceEnabled(enabled: boolean): void {
+  writeGeofenceEnabled(enabled);
+}
+
+/** Persist the user's saved journey plan. Pass empty strings to clear. */
+export function saveJourneyPlan(plan: JourneyPlan): void {
+  writeJourneyPlan({
+    origin: plan.origin.trim().toUpperCase(),
+    destination: plan.destination.trim().toUpperCase(),
+  });
+}
+
+/** Persist the user's schedule rules. Pass `[]` to clear. */
+export function saveSchedule(rules: ScheduleRule[]): void {
+  writeSchedule(rules);
+}
+
+/**
+ * Persist the user's labelled voice-target stations. Pass either
+ * field as `""` to clear that label (the corresponding voice keyword
+ * will fall through to the fuzzy station match).
+ */
+export function saveVoiceTargets(targets: VoiceTargets): void {
+  writeVoiceTargets({
+    home: targets.home.trim(),
+    work: targets.work.trim(),
+  });
+}
+
+/**
+ * Mark the first-launch gesture cheat sheet as seen. Called by the
+ * Tutorial screen's `onUnmount` exactly once.
+ */
+export function markTutorialSeen(): void {
+  const envelope: Envelope<boolean> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: true,
+  };
+  safeSet(KEY_TUTORIAL_SEEN, JSON.stringify(envelope));
 }
 
 /**
@@ -320,4 +639,10 @@ export function clearSettings(): void {
   safeRemove(KEY_API_KEY);
   safeRemove(KEY_FAVORITES);
   safeRemove(KEY_STT_API_KEY);
+  safeRemove(KEY_TUTORIAL_SEEN);
+  safeRemove(KEY_SCHEDULE);
+  safeRemove(KEY_VOICE_TARGETS);
+  safeRemove(KEY_JOURNEY_PLAN);
+  safeRemove(KEY_GEOFENCE_ENABLED);
+  clearHistory();
 }
