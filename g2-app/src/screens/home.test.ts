@@ -87,16 +87,19 @@ function expectFits(lines: string[]): void {
 
 // A stable loader so tests don't share state. The optional second
 // argument supplies the `affectedLines` field; the optional third
-// supplies `accessOutageCount`. Most tests use the empty defaults so
-// the row count assertions keep their original meanings. A non-empty
-// `affectedLines` surfaces the status glyph row; a positive
-// `accessOutageCount` adds the ACCESS row just beneath it.
+// supplies `accessOutageCount`; the optional fourth supplies
+// `quietHours`. Most tests use the empty defaults so the row count
+// assertions keep their original meanings. A non-empty `affectedLines`
+// surfaces the status glyph row; a positive `accessOutageCount` adds
+// the ACCESS row just beneath it; a true `quietHours` suppresses
+// BOTH synthetic alert surfaces.
 function loaderFor(
   favorites: FavoriteStation[],
   affectedLines: LineCode[] = [],
   accessOutageCount: number = 0,
+  quietHours: boolean = false,
 ) {
-  return () => ({ favorites, affectedLines, accessOutageCount });
+  return () => ({ favorites, affectedLines, accessOutageCount, quietHours });
 }
 
 // ---------------------------------------------------------------------------
@@ -795,5 +798,60 @@ describe("home tick: affected-lines refresh", () => {
     const snap = screen.init();
     const next = await screen.tick!(snap);
     expect(next.accessOutageCount).toBe(3);
+  });
+
+  it("refreshes quietHours on each tick", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 0, false), {
+      refreshQuietHours: () => Promise.resolve(true),
+      tickIntervalMs: 60_000,
+    });
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.quietHours).toBe(true);
+  });
+
+  it("preserves quietHours when ITS refresher rejects", async () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 0, true), {
+      refreshQuietHours: () => Promise.reject(new Error("boom")),
+      tickIntervalMs: 60_000,
+    });
+    const snap = screen.init();
+    const next = await screen.tick!(snap);
+    expect(next.quietHours).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Quiet hours suppression
+// ---------------------------------------------------------------------------
+
+describe("home view: quietHours suppression", () => {
+  it("suppresses the status glyph row even with active incidents", () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter], ["RD", "OR"], 0, true),
+    );
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    // header + fav + voice = 3 lines (the status row is hidden).
+    expect(lines.length).toBe(3);
+    expect(lines.some((l) => l.includes("RD!"))).toBe(false);
+  });
+
+  it("suppresses the ACCESS row even with outages", () => {
+    const screen = makeHomeScreen(loaderFor([F.metroCenter], [], 2, true));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    expect(lines.length).toBe(3); // header + fav + voice
+    expect(lines.some((l) => l.includes("ACCESS"))).toBe(false);
+  });
+
+  it("re-surfaces both rows once quietHours flips back to false", () => {
+    const screen = makeHomeScreen(
+      loaderFor([F.metroCenter], ["RD"], 2, false),
+    );
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 }, CTX);
+    // header + status + access + fav + voice = 5.
+    expect(lines.length).toBe(5);
   });
 });

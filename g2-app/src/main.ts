@@ -37,6 +37,7 @@ import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions"
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
 import { createSttEngine, makeVoiceScreen } from "./screens/voice";
+import { evaluateSchedule } from "./schedule/rules";
 import { Session } from "./session";
 import { parseLinesAffected } from "./wmata/incidents-cache";
 import {
@@ -152,15 +153,18 @@ async function bootGlasses(): Promise<void> {
   // first tick is in flight.
   const homeScreen = makeHomeScreen(
     () => {
-      const favorites = loadSettings().favorites;
+      const settings = loadSettings();
+      const favorites = settings.favorites;
       const userLines = computeUserLines(favorites);
       const cached = session.readCachedIncidents().incidents;
       const cachedAccess =
         session.readCachedElevatorIncidents().incidents.length;
+      const evaluation = evaluateSchedule(settings.schedule, Date.now());
       return {
         favorites,
         affectedLines: computeAffectedLines(cached, userLines),
         accessOutageCount: cachedAccess,
+        quietHours: evaluation.quietHours,
       };
     },
     {
@@ -173,6 +177,13 @@ async function bootGlasses(): Promise<void> {
         const codes = loadSettings().favorites.map((f) => f.code);
         const cache = await session.refreshElevatorIncidents(codes);
         return cache.incidents.length;
+      },
+      refreshQuietHours: async (): Promise<boolean> => {
+        const evaluation = evaluateSchedule(
+          loadSettings().schedule,
+          Date.now(),
+        );
+        return evaluation.quietHours;
       },
       tickIntervalMs: 60_000,
     },
@@ -388,13 +399,28 @@ async function bootGlasses(): Promise<void> {
     },
   };
 
-  // First-launch users land on the Tutorial; everyone else goes to
-  // Home. The inference inside `readTutorialSeen()` means existing
-  // v1.1 users with a saved API key never see the tutorial on
-  // upgrade — only genuine clean-install users do.
-  const initialIntent: NavIntent = loadSettings().tutorialSeen
-    ? { to: "home" }
-    : { to: "tutorial" };
+  // First-launch users land on the Tutorial; everyone else consults
+  // the schedule evaluator. The inference inside `readTutorialSeen()`
+  // means existing v1.1 users with a saved API key never see the
+  // tutorial on upgrade — only genuine clean-install users do.
+  //
+  // Schedule rules: if an auto-rotate window matches right now (and
+  // no quiet-hours rule overrides it), boot straight into the
+  // configured target screen instead of Home. The user keeps
+  // double-tap-to-Home as the manual escape hatch.
+  const settings = loadSettings();
+  let initialIntent: NavIntent;
+  if (!settings.tutorialSeen) {
+    initialIntent = { to: "tutorial" };
+  } else {
+    const evaluation = evaluateSchedule(settings.schedule, Date.now());
+    const target = evaluation.autoRotateTarget;
+    if (target && target.kind === "predictions") {
+      initialIntent = { to: "predictions", stationCode: target.stationCode };
+    } else {
+      initialIntent = { to: "home" };
+    }
+  }
   await router.navigate(initialIntent);
 }
 

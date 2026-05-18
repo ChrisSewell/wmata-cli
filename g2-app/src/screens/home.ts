@@ -130,6 +130,17 @@ export interface HomeSnapshot {
    * favorites list (TAP → Elevator screen).
    */
   accessOutageCount: number;
+  /**
+   * True when the user's configured quiet-hours window is currently
+   * active. Suppresses BOTH the status glyph row AND the ACCESS row
+   * — the user explicitly asked not to be disturbed. The data is
+   * still fetched in the background so the rows reappear instantly
+   * when quiet hours end.
+   *
+   * Refreshed on every Home tick via the same scheduler that
+   * `bootGlasses` consults for the initial mount.
+   */
+  quietHours: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,8 +276,13 @@ export function renderHeader(favoritesCount: number): string {
  *
  * Row position: the row sits ABOVE the favorites (the v1.1 ALERTS
  * row sat below them).
+ *
+ * Quiet-hours rule: even with active incidents the row is hidden
+ * during quiet hours. The user explicitly asked not to be
+ * disturbed; surfacing alerts would defeat the point.
  */
 export function hasAlertsRow(snapshot: HomeSnapshot): boolean {
+  if (snapshot.quietHours) return false;
   return snapshot.affectedLines.length > 0;
 }
 
@@ -276,8 +292,12 @@ export function hasAlertsRow(snapshot: HomeSnapshot): boolean {
  *
  * Position: just below the status glyph row (if present), above the
  * favorites. Tappable; TAP navigates to the Elevator screen.
+ *
+ * Quiet-hours rule: same as `hasAlertsRow` — both synthetic alert
+ * surfaces hide during quiet hours.
  */
 export function hasAccessRow(snapshot: HomeSnapshot): boolean {
+  if (snapshot.quietHours) return false;
   return snapshot.accessOutageCount > 0;
 }
 
@@ -382,6 +402,13 @@ export function makeHomeScreen(
      * simply linger rather than blinking).
      */
     refreshAccessOutageCount?: () => Promise<number>;
+    /**
+     * Re-evaluate the quiet-hours flag (the only schedule-driven
+     * piece Home needs at runtime — auto-rotate is a boot-time
+     * concern handled by `main.ts`). Cheap: pure date math against
+     * the stored schedule. Wired in `main.ts`.
+     */
+    refreshQuietHours?: () => Promise<boolean>;
     tickIntervalMs?: number;
   },
 ): Screen<HomeSnapshot> {
@@ -520,26 +547,36 @@ export function makeHomeScreen(
     },
   };
 
-  // Optional auto-refresh of the synthetic rows (affected-lines set
-  // and ACCESS outage count). Wired via `options` (in `main.ts`)
-  // rather than reaching into the cache modules directly, so the Home
-  // screen stays pure-testable: tests can omit `options` entirely and
-  // the screen never ticks.
+  // Optional auto-refresh of the synthetic rows + quiet-hours flag.
+  // Wired via `options` (in `main.ts`) rather than reaching into the
+  // cache modules directly, so the Home screen stays pure-testable:
+  // tests can omit `options` entirely and the screen never ticks.
   //
-  // Both refreshers fire in parallel on each tick so the rows update
-  // together. If either rejects the corresponding field is preserved
-  // (rather than blanked) — a transient network blip should NOT make
-  // a row disappear.
+  // All three refreshers fire in parallel on each tick so the rows
+  // update together. If any rejects the corresponding field is
+  // preserved (rather than blanked) — a transient network blip
+  // should NOT make a row disappear or flip quiet hours.
   const refreshLines = options?.refreshAffectedLines;
   const refreshAccess = options?.refreshAccessOutageCount;
-  if ((refreshLines || refreshAccess) && (options?.tickIntervalMs ?? 0) > 0) {
+  const refreshQuiet = options?.refreshQuietHours;
+  if (
+    (refreshLines || refreshAccess || refreshQuiet) &&
+    (options?.tickIntervalMs ?? 0) > 0
+  ) {
     screen.tick = async (snapshot: HomeSnapshot): Promise<HomeSnapshot> => {
-      const [linesResult, accessResult] = await Promise.allSettled([
-        refreshLines ? refreshLines() : Promise.resolve(snapshot.affectedLines),
-        refreshAccess
-          ? refreshAccess()
-          : Promise.resolve(snapshot.accessOutageCount),
-      ]);
+      const [linesResult, accessResult, quietResult] = await Promise.allSettled(
+        [
+          refreshLines
+            ? refreshLines()
+            : Promise.resolve(snapshot.affectedLines),
+          refreshAccess
+            ? refreshAccess()
+            : Promise.resolve(snapshot.accessOutageCount),
+          refreshQuiet
+            ? refreshQuiet()
+            : Promise.resolve(snapshot.quietHours),
+        ],
+      );
 
       const nextLines =
         linesResult.status === "fulfilled"
@@ -549,10 +586,15 @@ export function makeHomeScreen(
         accessResult.status === "fulfilled"
           ? accessResult.value
           : snapshot.accessOutageCount;
+      const nextQuiet =
+        quietResult.status === "fulfilled"
+          ? quietResult.value
+          : snapshot.quietHours;
 
       const linesUnchanged = sameLines(nextLines, snapshot.affectedLines);
       const accessUnchanged = nextAccess === snapshot.accessOutageCount;
-      if (linesUnchanged && accessUnchanged) return snapshot;
+      const quietUnchanged = nextQuiet === snapshot.quietHours;
+      if (linesUnchanged && accessUnchanged && quietUnchanged) return snapshot;
 
       return {
         ...snapshot,
@@ -560,6 +602,7 @@ export function makeHomeScreen(
         accessOutageCount: accessUnchanged
           ? snapshot.accessOutageCount
           : nextAccess,
+        quietHours: quietUnchanged ? snapshot.quietHours : nextQuiet,
       };
     };
     screen.tickIntervalMs = options!.tickIntervalMs;

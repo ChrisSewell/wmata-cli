@@ -26,8 +26,10 @@ import {
   removeFavorite,
   reorderFavorites,
   saveApiKey,
+  saveSchedule,
   type FavoriteStation,
 } from "./settings";
+import type { ScheduleRule } from "../schedule/rules";
 
 // ---------------------------------------------------------------------------
 // Mock localStorage
@@ -279,6 +281,78 @@ describe("loadSettings.tutorialSeen: default + inference", () => {
     // tutorial purposes — there's no other state worth inferring from.
     saveApiKey("");
     expect(loadSettings().tutorialSeen).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// schedule storage
+// ---------------------------------------------------------------------------
+
+describe("loadSettings.schedule + saveSchedule", () => {
+  it("returns an empty array on a fresh install", () => {
+    expect(loadSettings().schedule).toEqual([]);
+  });
+
+  it("round-trips a typical auto-rotate + quiet-hours pair", () => {
+    const rules: ScheduleRule[] = [
+      {
+        kind: "auto-rotate",
+        days: ["mon", "tue", "wed", "thu", "fri"],
+        startHHMM: "08:00",
+        endHHMM: "09:30",
+        target: { kind: "predictions", stationCode: "C01" },
+      },
+      {
+        kind: "quiet-hours",
+        days: ["sat", "sun"],
+        startHHMM: "00:00",
+        endHHMM: "07:00",
+      },
+    ];
+    saveSchedule(rules);
+    expect(loadSettings().schedule).toEqual(rules);
+  });
+
+  it("drops malformed rules from the parsed list", () => {
+    mockStorage.store.set(
+      "wmata.g2.schedule",
+      JSON.stringify({
+        schemaVersion: 1,
+        value: [
+          { kind: "auto-rotate", days: ["mon"], startHHMM: "08:00" }, // missing endHHMM
+          { kind: "auto-rotate", days: [], startHHMM: "08:00", endHHMM: "09:00", target: { kind: "home" } }, // empty days
+          {
+            kind: "quiet-hours",
+            days: ["mon"],
+            startHHMM: "23:00",
+            endHHMM: "07:00",
+          }, // valid
+        ],
+      }),
+    );
+    const loaded = loadSettings().schedule;
+    expect(loaded.length).toBe(1);
+    expect(loaded[0]!.kind).toBe("quiet-hours");
+  });
+
+  it("normalises an unknown weekday code out of the days list", () => {
+    mockStorage.store.set(
+      "wmata.g2.schedule",
+      JSON.stringify({
+        schemaVersion: 1,
+        value: [
+          {
+            kind: "auto-rotate",
+            days: ["mon", "funday", "fri"],
+            startHHMM: "08:00",
+            endHHMM: "09:00",
+            target: { kind: "home" },
+          },
+        ],
+      }),
+    );
+    const loaded = loadSettings().schedule;
+    expect(loaded[0]!.days).toEqual(["mon", "fri"]);
   });
 });
 

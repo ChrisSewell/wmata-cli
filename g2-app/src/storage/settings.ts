@@ -34,6 +34,13 @@
 //   in-memory fallback — callers that need that should layer it on top.
 
 import type { LineCode } from "../wmata";
+import type {
+  AutoRotateRule,
+  QuietHoursRule,
+  ScheduleRule,
+  Weekday,
+} from "../schedule/rules";
+import { WEEKDAYS } from "../schedule/rules";
 
 // ---------------------------------------------------------------------------
 // Types & constants
@@ -69,6 +76,13 @@ export interface Settings {
    * genuine first-launchers do.
    */
   tutorialSeen: boolean;
+  /**
+   * User's schedule rules (auto-rotate + quiet hours). Empty array
+   * is the default — no auto-rotate, no quiet hours; the app boots
+   * straight to Home. Evaluated by `evaluateSchedule` in
+   * `src/schedule/rules.ts`.
+   */
+  schedule: ScheduleRule[];
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -82,6 +96,7 @@ const KEY_API_KEY = "wmata.g2.apiKey";
 const KEY_FAVORITES = "wmata.g2.favorites";
 const KEY_STT_API_KEY = "wmata.g2.sttApiKey";
 const KEY_TUTORIAL_SEEN = "wmata.g2.tutorialSeen";
+const KEY_SCHEDULE = "wmata.g2.schedule";
 
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -224,6 +239,109 @@ function readFavorites(): FavoriteStation[] {
 }
 
 /**
+ * Narrow an unknown value to a `Weekday`, or return null.
+ */
+function asWeekday(x: unknown): Weekday | null {
+  if (typeof x !== "string") return null;
+  return (WEEKDAYS as readonly string[]).includes(x) ? (x as Weekday) : null;
+}
+
+/**
+ * Narrow an unknown value to a `Weekday[]`, dropping anything that
+ * isn't a valid weekday code.
+ */
+function asWeekdayArray(x: unknown): Weekday[] {
+  if (!Array.isArray(x)) return [];
+  const out: Weekday[] = [];
+  for (const v of x) {
+    const wd = asWeekday(v);
+    if (wd && !out.includes(wd)) out.push(wd);
+  }
+  return out;
+}
+
+/**
+ * Narrow an unknown value to one of the auto-rotate `target`
+ * variants. Returns null on malformed input.
+ */
+function asAutoRotateTarget(
+  x: unknown,
+): AutoRotateRule["target"] | null {
+  if (!isRecord(x)) return null;
+  const kind = x["kind"];
+  if (kind === "home") return { kind: "home" };
+  if (kind === "predictions") {
+    const stationCode = x["stationCode"];
+    if (typeof stationCode !== "string" || stationCode.length === 0) {
+      return null;
+    }
+    return { kind: "predictions", stationCode };
+  }
+  return null;
+}
+
+/**
+ * Narrow an unknown value to a `ScheduleRule`. Drops any rule whose
+ * required fields are missing or malformed. The day-list is
+ * normalised through `asWeekdayArray` (unknown weekdays dropped).
+ */
+function asScheduleRule(x: unknown): ScheduleRule | null {
+  if (!isRecord(x)) return null;
+  const kind = x["kind"];
+  const days = asWeekdayArray(x["days"]);
+  const start = x["startHHMM"];
+  const end = x["endHHMM"];
+  if (typeof start !== "string" || typeof end !== "string") return null;
+  if (days.length === 0) return null;
+  if (kind === "auto-rotate") {
+    const target = asAutoRotateTarget(x["target"]);
+    if (!target) return null;
+    const rule: AutoRotateRule = {
+      kind: "auto-rotate",
+      days,
+      startHHMM: start,
+      endHHMM: end,
+      target,
+    };
+    return rule;
+  }
+  if (kind === "quiet-hours") {
+    const rule: QuietHoursRule = {
+      kind: "quiet-hours",
+      days,
+      startHHMM: start,
+      endHHMM: end,
+    };
+    return rule;
+  }
+  return null;
+}
+
+/** Narrow an unknown value to a `ScheduleRule[]`, dropping malformed entries. */
+function asScheduleArray(x: unknown): ScheduleRule[] {
+  if (!Array.isArray(x)) return [];
+  const out: ScheduleRule[] = [];
+  for (const item of x) {
+    const rule = asScheduleRule(item);
+    if (rule !== null) out.push(rule);
+  }
+  return out;
+}
+
+function readSchedule(): ScheduleRule[] {
+  const value = parseEnvelope(safeGet(KEY_SCHEDULE));
+  return asScheduleArray(value);
+}
+
+function writeSchedule(rules: ScheduleRule[]): void {
+  const envelope: Envelope<ScheduleRule[]> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: rules,
+  };
+  safeSet(KEY_SCHEDULE, JSON.stringify(envelope));
+}
+
+/**
  * Read the tutorial-seen flag.
  *
  *   - Explicit `true` / `false` stored under `KEY_TUTORIAL_SEEN`
@@ -269,7 +387,13 @@ export function loadSettings(): Settings {
     favorites: readFavorites(),
     sttApiKey: readSttApiKey(),
     tutorialSeen: readTutorialSeen(),
+    schedule: readSchedule(),
   };
+}
+
+/** Persist the user's schedule rules. Pass `[]` to clear. */
+export function saveSchedule(rules: ScheduleRule[]): void {
+  writeSchedule(rules);
 }
 
 /**
@@ -370,4 +494,5 @@ export function clearSettings(): void {
   safeRemove(KEY_FAVORITES);
   safeRemove(KEY_STT_API_KEY);
   safeRemove(KEY_TUTORIAL_SEEN);
+  safeRemove(KEY_SCHEDULE);
 }
