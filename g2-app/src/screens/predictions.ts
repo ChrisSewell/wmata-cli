@@ -126,8 +126,9 @@ export function shouldShowLastTrain(nowMs: number): boolean {
  * zero-padded — `"08:32" < "23:47"` reads correctly as a string
  * comparison. WMATA's `LastTrains` array may include AM times that
  * actually mean "next day" (per docs), and those will sort EARLIEST
- * by this comparison; we accept that for the v1.2 ship and just
- * surface the latest PM time, which is the user-facing "last train".
+ * by this comparison; we skip AM entries — the user-facing "last
+ * train" is the latest PM departure, not tomorrow morning's first
+ * AM run that happens to spill into the array.
  */
 export function pickLastTrainTime(
   times: ReadonlyArray<{ Time: string }>,
@@ -135,16 +136,46 @@ export function pickLastTrainTime(
   let best: string | null = null;
   for (const t of times) {
     if (typeof t.Time !== "string" || t.Time.length === 0) continue;
-    // Skip AM times — they're "next day" per the WMATA docs, not
-    // "later today". A late-evening user wants the latest PM
-    // departure, not tomorrow morning's first AM run that happens
-    // to spill into the LastTrains array.
     const hh = parseInt(t.Time.slice(0, 2), 10);
     if (!Number.isFinite(hh)) continue;
     if (hh < 12) continue;
     if (best === null || t.Time > best) best = t.Time;
   }
   return best;
+}
+
+/**
+ * Bucket a list of `LastTrains[]` entries by their destination's
+ * primary line, then pick the latest PM time per bucket. The
+ * `destToLine` map resolves `LastTrains[].DestinationStation` (a
+ * station code) to the served-line that destination belongs to —
+ * usually `LineCode1`, walked-through-1..4 for multi-line termini.
+ *
+ * Returns one entry per line that has at least one PM departure
+ * for this station, sorted by time ascending so the earliest-out
+ * line surfaces first in the render.
+ *
+ * Used by `main.ts:readLastTrainToday` (WP-J).
+ */
+export function bucketLastTrainsByLine(
+  lastTrains: ReadonlyArray<{ Time: string; DestinationStation: string }>,
+  destToLine: ReadonlyMap<string, string>,
+): LastTrainByLine[] {
+  const byLine = new Map<string, string>();
+  for (const t of lastTrains) {
+    if (typeof t.Time !== "string" || t.Time.length === 0) continue;
+    const hh = parseInt(t.Time.slice(0, 2), 10);
+    if (!Number.isFinite(hh) || hh < 12) continue;
+    const line = destToLine.get(t.DestinationStation);
+    if (!line) continue;
+    const existing = byLine.get(line);
+    if (!existing || t.Time > existing) byLine.set(line, t.Time);
+  }
+  const out: LastTrainByLine[] = [];
+  for (const [line, time] of byLine) out.push({ line, time });
+  // Sort by time ascending — earliest-departing first.
+  out.sort((a, b) => a.time.localeCompare(b.time));
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,13 +187,16 @@ export interface PredictionsFetchResult {
   trains: Train[];
   incidentHeadline: string | null;
   /**
-   * "HH:mm" of today's last scheduled departure from this station,
-   * across all destinations served. `null` when the schedule fetch
-   * failed or the station isn't in the schedule data. Driven by the
-   * Session's lazy-cached `getStationTimes` so the wire fetch happens
-   * at most once per glasses session.
+   * Per-line last-train summary for tonight. Each entry is the
+   * latest PM departure on that line from this station. Empty
+   * array means "no schedule data tonight" (e.g. schedule fetch
+   * failed); `null` means "fetcher hasn't populated this yet".
+   *
+   * WP-J: this replaces v1.2's single-time form. Per-line gives
+   * commuters the right "which line is gone first" signal at a
+   * glance.
    */
-  lastTrainToday: string | null;
+  lastTrainToday: LastTrainByLine[] | null;
   /**
    * Resolved live-position data for the pinned train (WP-I). Only
    * populated when:
@@ -183,6 +217,12 @@ export interface PinnedPosition {
   schematic: string;
   /** "<N> stops away" / "at this station" / "approaching" label. */
   label: string;
+}
+
+/** Per-line last-train time. `line` is a `LineCode`; `time` is "HH:mm". */
+export interface LastTrainByLine {
+  line: string;
+  time: string;
 }
 
 /** Data the Predictions screen renders against. */
@@ -213,13 +253,14 @@ export interface PredictionsSnapshot {
    */
   incidentHeadline: string | null;
   /**
-   * Last scheduled departure from this station today, `"HH:mm"`. Only
-   * rendered after the late-evening cutoff (see
-   * `shouldShowLastTrain`); rendered as a `"Last train: 23:47"` row
-   * appended to the body. `null` when the schedule lookup hasn't
-   * landed or the station isn't in the data.
+   * Per-line last-train summary for tonight. Only rendered after
+   * the late-evening cutoff (see `shouldShowLastTrain`). `null`
+   * means "schedule fetch hasn't landed yet"; an empty array means
+   * "loaded but no data for tonight"; a populated array surfaces
+   * one cell per line. Sourced from `main.ts:readLastTrainToday`,
+   * which buckets `LastTrains[]` by destination → line.
    */
-  lastTrainToday: string | null;
+  lastTrainToday: LastTrainByLine[] | null;
   /**
    * If non-null, the user has TAP-pinned a specific (line,
    * destination) pair to track. The screen renders a single-line
@@ -489,16 +530,41 @@ export function formatLastTrainTime(hhmm: string): string {
  * the wall clock is before `LAST_TRAIN_HOUR` OR the schedule data
  * isn't available — in either case the row is hidden.
  *
- *   "Last train: 11:47p"  (always ≤ 24 cols)
+ * Layout (24 cols):
+ *
+ *   1 line:    "Last RD 23:47"          (13 chars)
+ *   2 lines:   "Last OR 22:50  RD 23:47" (23 chars, fits)
+ *   3+ lines:  "Last OR 22:50 +2"        (16 chars; drops cell #2
+ *              for the overflow count — `"Last XX HH:MM  XX HH:MM
+ *              +N"` would overflow 24 cols at 26 chars).
+ *
+ * Sorted by time ascending so the earliest-departing line is
+ * surfaced first (the line the user has to leave fastest for).
  */
 export function renderLastTrainRow(
   snapshot: PredictionsSnapshot,
   nowMs: number,
 ): string | null {
   if (!shouldShowLastTrain(nowMs)) return null;
-  const time = snapshot.lastTrainToday;
-  if (!time || time.length === 0) return null;
-  return truncate(`Last train: ${formatLastTrainTime(time)}`, LINE_WIDTH);
+  const lines = snapshot.lastTrainToday;
+  if (!lines || lines.length === 0) return null;
+  const sorted = [...lines].sort((a, b) => a.time.localeCompare(b.time));
+  if (sorted.length === 1) {
+    const e = sorted[0]!;
+    return truncate(`Last ${e.line} ${e.time}`, LINE_WIDTH);
+  }
+  if (sorted.length === 2) {
+    const cells = sorted.map((e) => `${e.line} ${e.time}`).join("  ");
+    return truncate(`Last ${cells}`, LINE_WIDTH);
+  }
+  // 3+ — drop cell #2; the +N marker takes the slot. Width 16 chars
+  // for single-digit N (always — we have 6 lines max in the network).
+  const head = sorted[0]!;
+  const overflow = sorted.length - 1;
+  return truncate(
+    `Last ${head.line} ${head.time} +${overflow}`,
+    LINE_WIDTH,
+  );
 }
 
 /**
