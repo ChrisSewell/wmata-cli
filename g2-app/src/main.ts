@@ -409,6 +409,11 @@ async function bootGlasses(): Promise<void> {
             // first TrainPositions tick lands. `null` hides the
             // schematic + "stops away" rows.
             pinnedPosition: null,
+            // WP-M opt-in cursor: hidden until the user scrolls.
+            cursorVisible: false,
+            // WP-M pin-gone latch: set by the tick when a pinned
+            // train rolls off; cleared on the next miss.
+            pinnedGone: false,
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);

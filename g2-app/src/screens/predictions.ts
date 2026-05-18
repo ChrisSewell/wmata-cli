@@ -290,6 +290,21 @@ export interface PredictionsSnapshot {
    * resolved yet.
    */
   pinnedPosition: PinnedPosition | null;
+  /**
+   * True iff the user has explicitly scrolled (or pinned) on this
+   * screen mount. The Predictions cursor is hidden by default
+   * (WP-M opt-in cursor) so the at-rest render stays glanceable;
+   * the first SCROLL or pin makes it visible.
+   */
+  cursorVisible: boolean;
+  /**
+   * True for one render after the pinned train rolled off the
+   * predictions list. Renders `* RD Glnmt (gone)` and clears the
+   * pin on the NEXT tick. Avoids silently dropping the pin —
+   * the user gets visual confirmation that their tracked train
+   * departed.
+   */
+  pinnedGone: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +490,21 @@ export function renderPinRow(
 ): string | null {
   if (!snapshot.pinned) return null;
   const idx = findPinnedTrainIndex(visibleTrains, snapshot.pinned);
-  if (idx < 0) return null;
+  if (idx < 0) {
+    // Pinned train no longer in the visible list. Render a "(gone)"
+    // indicator for one tick before the auto-clear in `tick()`
+    // wipes the pin. Without this the row would silently disappear.
+    if (snapshot.pinnedGone) {
+      const lineCode = padRight(lineGlyph(snapshot.pinned.line), GLYPH_WIDTH);
+      const dest = padRight(
+        abbreviateStation(snapshot.pinned.destination, DEST_WIDTH),
+        DEST_WIDTH,
+      );
+      const composed = "* " + lineCode + " " + dest + " (gone)";
+      return truncate(padRight(composed, LINE_WIDTH), LINE_WIDTH);
+    }
+    return null;
+  }
   const t = visibleTrains[idx]!;
   const line = padRight(lineGlyph(t.Line), GLYPH_WIDTH);
   const dest = padRight(
@@ -735,15 +764,24 @@ export function makePredictionsScreen(
         // is marked with ">". When both coincide on the same row,
         // the pin marker wins — the user has confirmed this is
         // their tracked train, no need to also surface the cursor.
+        //
+        // WP-M opt-in cursor: the ">" marker is suppressed until
+        // the user explicitly engages (first SCROLL or TAP), so
+        // the at-rest render stays glanceable.
         const pinnedIdx = findPinnedTrainIndex(visible, snapshot.pinned);
         const cursorIdx = Math.max(
           0,
           Math.min(nav.highlightedIndex, visible.length - 1),
         );
+        const showCursor = snapshot.cursorVisible;
         for (let i = 0; i < visible.length; i++) {
           const t = visible[i]!;
           const marker: "" | "*" | ">" =
-            i === pinnedIdx ? "*" : i === cursorIdx ? ">" : "";
+            i === pinnedIdx
+              ? "*"
+              : showCursor && i === cursorIdx
+                ? ">"
+                : "";
           lines.push(renderTrainRow(t, marker));
         }
       }
@@ -781,11 +819,18 @@ export function makePredictionsScreen(
           if (visible.length === 0) return { nav };
           return {
             nav: { highlightedIndex: Math.max(0, cursorIdx - 1) },
+            // First scroll surfaces the cursor (WP-M opt-in).
+            snapshot: snapshot.cursorVisible
+              ? snapshot
+              : { ...snapshot, cursorVisible: true },
           };
         case "SCROLL_DOWN":
           if (visible.length === 0) return { nav };
           return {
             nav: { highlightedIndex: Math.min(maxIdx, cursorIdx + 1) },
+            snapshot: snapshot.cursorVisible
+              ? snapshot
+              : { ...snapshot, cursorVisible: true },
           };
         case "TAP": {
           if (visible.length === 0) return { nav };
@@ -811,6 +856,10 @@ export function makePredictionsScreen(
               // Unpinning clears the resolved live position too.
               pinned: isAlreadyPinned ? null : candidate,
               pinnedPosition: isAlreadyPinned ? null : snapshot.pinnedPosition,
+              pinnedGone: false,
+              // Any TAP makes the cursor visible (the user has
+              // engaged with the screen).
+              cursorVisible: true,
             },
           };
         }
@@ -837,6 +886,34 @@ export function makePredictionsScreen(
       const now = Date.now();
       try {
         const result = await fetcher(snapshot);
+
+        // WP-M "pinned-train gone" detection + auto-clear. Two-tick
+        // state machine:
+        //   1. The user's pinned (line, destination) is no longer
+        //      in the freshly-fetched trains list → set
+        //      `pinnedGone = true` for this tick. The view renders
+        //      "* RD Glnmt (gone)".
+        //   2. Next tick (still no match): clear the pin entirely.
+        let nextPinned = snapshot.pinned;
+        let nextPinnedPosition =
+          result.pinnedPosition ?? snapshot.pinnedPosition;
+        let nextPinnedGone = false;
+        if (snapshot.pinned !== null) {
+          const stillPresent =
+            findPinnedTrainIndex(result.trains, snapshot.pinned) >= 0;
+          if (!stillPresent) {
+            if (snapshot.pinnedGone) {
+              // Second consecutive miss — clear the pin.
+              nextPinned = null;
+              nextPinnedPosition = null;
+              nextPinnedGone = false;
+            } else {
+              // First miss — surface the "(gone)" indicator.
+              nextPinnedGone = true;
+            }
+          }
+        }
+
         return {
           ...snapshot,
           trains: result.trains,
@@ -846,13 +923,9 @@ export function makePredictionsScreen(
           // user doesn't see the row blink off if the fetcher only
           // populates it on the first call.
           lastTrainToday: result.lastTrainToday ?? snapshot.lastTrainToday,
-          // Pinned position: same "carry-forward" rule. When the
-          // fetcher reports a fresh `null` (e.g. the user just
-          // unpinned), the reducer already cleared the snapshot
-          // value at TAP time — the fetcher's null is informational,
-          // not authoritative. So preserve the prior when null.
-          pinnedPosition:
-            result.pinnedPosition ?? snapshot.pinnedPosition,
+          pinned: nextPinned,
+          pinnedPosition: nextPinnedPosition,
+          pinnedGone: nextPinnedGone,
           fetchedAt: now,
           fetchError: null,
           consecutiveFetchFailures: 0,
