@@ -71,6 +71,7 @@ function makeSnap(
     incidents,
     fetchedAt: NOW,
     fetchError: null,
+    consecutiveFetchFailures: 0,
     preformatted: incidents.map(formatIncidentBlock),
     ...over,
   };
@@ -521,8 +522,8 @@ describe("incidents view: first-load fetch error", () => {
   it("pins the EXACT 5-line first-load error body", () => {
     // Symmetric with the empty-state pin: lock the lines verbatim so a
     // future copy change has to update this test on purpose. The
-    // clock carries a trailing `*` because fetchedAt=0 means
-    // never-successful-fetch, which `isStale` reports as stale.
+    // clock carries a trailing `?` because fetchedAt=0 with an active
+    // error is the strongest degraded state — see `stalenessMarker`.
     const snap = makeSnap([], {
       fetchedAt: 0,
       fetchError: "Could not connect.",
@@ -531,7 +532,7 @@ describe("incidents view: first-load fetch error", () => {
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines).toEqual([
-      "ALERTS            14:32*",
+      "ALERTS            14:32?",
       "Couldn't reach WMATA.",
       "Will retry shortly.",
       "",
@@ -539,6 +540,46 @@ describe("incidents view: first-load fetch error", () => {
     ]);
     expect(lines.length).toBe(5);
     expect(lines[0]!.length).toBe(LINE_WIDTH);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3-state stale-marker escalation
+// ---------------------------------------------------------------------------
+
+describe("incidents view: stale-marker escalation", () => {
+  // One incident in the snapshot so we exercise the "data exists, just
+  // degrading" branches (the no-data + error case is locked above).
+  const oneIncident = (): RailIncident => incident();
+
+  it("shows '*' after one consecutive failure", () => {
+    const snap = makeSnap([oneIncident()], {
+      consecutiveFetchFailures: 1,
+      fetchError: "transient",
+    });
+    const screen = makeIncidentsScreen(noopFetcher, snap);
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expect(lines[0]!.endsWith("14:32*")).toBe(true);
+  });
+
+  it("shows '**' after two consecutive failures", () => {
+    const snap = makeSnap([oneIncident()], {
+      consecutiveFetchFailures: 2,
+      fetchError: "transient",
+    });
+    const screen = makeIncidentsScreen(noopFetcher, snap);
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expect(lines[0]!.endsWith("14:32**")).toBe(true);
+  });
+
+  it("shows '?' after three or more consecutive failures", () => {
+    const snap = makeSnap([oneIncident()], {
+      consecutiveFetchFailures: 3,
+      fetchError: "transient",
+    });
+    const screen = makeIncidentsScreen(noopFetcher, snap);
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expect(lines[0]!.endsWith("14:32?")).toBe(true);
   });
 });
 
@@ -629,6 +670,51 @@ describe("incidents tick", () => {
     expect(next.fetchError).toBe("boom");
     // Prior incidents are preserved.
     expect(next.incidents.length).toBe(1);
+  });
+
+  it("increments consecutiveFetchFailures on each rejected fetcher", async () => {
+    const fetcher = () => Promise.reject(new Error("boom"));
+    const screen = makeIncidentsScreen(fetcher, makeSnap([incident()]));
+    let s = screen.init();
+    expect(s.consecutiveFetchFailures).toBe(0);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(1);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(2);
+  });
+
+  it("treats a fetcher result with fetchError !== null as a failure", async () => {
+    // The session-backed fetcher swallows network errors and surfaces
+    // them through the result shape rather than throwing. The tick
+    // must still treat that as a failure for the escalation counter.
+    const fetcher = () =>
+      Promise.resolve<IncidentsFetchResult>({
+        incidents: [],
+        fetchedAt: 0,
+        fetchError: "swallowed network error",
+      });
+    const screen = makeIncidentsScreen(fetcher, makeSnap([]));
+    let s = screen.init();
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(1);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(2);
+  });
+
+  it("resets consecutiveFetchFailures to 0 on a successful fetch", async () => {
+    const successfulFetcher = () =>
+      Promise.resolve<IncidentsFetchResult>({
+        incidents: [],
+        fetchedAt: NOW,
+        fetchError: null,
+      });
+    const screen = makeIncidentsScreen(
+      successfulFetcher,
+      makeSnap([], { consecutiveFetchFailures: 3 }),
+    );
+    const next = await screen.tick(screen.init());
+    expect(next.consecutiveFetchFailures).toBe(0);
+    expect(next.fetchError).toBeNull();
   });
 
   it("exposes a tickIntervalMs of 60_000 (60s) for the host", () => {

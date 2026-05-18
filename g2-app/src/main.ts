@@ -182,6 +182,9 @@ async function bootGlasses(): Promise<void> {
             trains: [],
             fetchedAt: 0,
             fetchError: null,
+            // Per-mount counter; the screen's own `tick()` bumps it
+            // on each catch and resets to 0 on a successful fetch.
+            consecutiveFetchFailures: 0,
             // Seed the headline from the session cache so the first
             // render shows any already-known incident (the cache is
             // shared with Home and the Incidents screen). Avoids a

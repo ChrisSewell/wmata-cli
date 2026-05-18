@@ -110,6 +110,14 @@ export interface IncidentsSnapshot {
   /** Last fetch error message; null when the most recent fetch succeeded. */
   fetchError: string | null;
   /**
+   * Number of consecutive `tick()` failures since the last successful
+   * fetch. Reset to 0 on success. Drives the 3-state header marker
+   * (`*` → `**` → `?`) — see `stalenessMarker` below. Mirrors the
+   * same field on `PredictionsSnapshot` so both screens degrade with
+   * the same UX vocabulary.
+   */
+  consecutiveFetchFailures: number;
+  /**
    * Pre-wrapped, ready-to-render body rows for the current `incidents`.
    * Each top-level array is one incident's lines (glyph row + wrapped
    * description lines), with a blank-string separator between incidents
@@ -286,14 +294,41 @@ export function isStale(snapshot: IncidentsSnapshot, nowMs: number): boolean {
 }
 
 /**
+ * Map (staleness × fetch-failure-count) onto a 3-state header marker.
+ *
+ * Identical contract to `stalenessMarker` in `predictions.ts`:
+ *
+ *   - `""`   — fresh, 0 failures.
+ *   - `"*"`  — stale by time only OR 1 failure since last success.
+ *   - `"**"` — 2 consecutive failures.
+ *   - `"?"`  — ≥ 3 consecutive failures, OR no successful fetch ever
+ *              with an active error.
+ *
+ * Exported for the test suite.
+ */
+export function stalenessMarker(
+  snapshot: IncidentsSnapshot,
+  nowMs: number,
+): "" | "*" | "**" | "?" {
+  const failures = Math.max(0, snapshot.consecutiveFetchFailures);
+  if (snapshot.fetchedAt === 0 && snapshot.fetchError !== null) return "?";
+  if (failures >= 3) return "?";
+  if (failures === 2) return "**";
+  if (failures === 1) return "*";
+  if (isStale(snapshot, nowMs)) return "*";
+  return "";
+}
+
+/**
  * Render the header row.
  *
  *   "ALERTS (n)              HH:MM"   (n > 0)
  *   "ALERTS                  HH:MM"   (n === 0, empty state)
  *
- * Adds a `*` after the clock when stale. The text on the left collapses
- * to a single "ALERTS" when there are no incidents (we don't want to
- * render "ALERTS (0)" — it looks like a button label).
+ * Adds a 1- or 2-char marker after the clock per `stalenessMarker`.
+ * The text on the left collapses to a single "ALERTS" when there are
+ * no incidents (we don't want to render "ALERTS (0)" — it looks like
+ * a button label).
  */
 export function renderHeader(
   snapshot: IncidentsSnapshot,
@@ -301,9 +336,8 @@ export function renderHeader(
 ): string {
   const count = snapshot.incidents.length;
   const left = count > 0 ? `ALERTS (${count})` : "ALERTS";
-  const stale = isStale(snapshot, nowMs);
+  const marker = stalenessMarker(snapshot, nowMs);
   const clockStr = formatClock(nowMs);
-  const marker = stale ? "*" : "";
   const clockCell = clockStr + marker;
   // total = left + spaces + clockCell == LINE_WIDTH
   const spaces = Math.max(1, LINE_WIDTH - left.length - clockCell.length);
@@ -348,6 +382,10 @@ export function makeInitialIncidentsSnapshot(cache: {
     incidents: cache.incidents.slice(),
     fetchedAt: cache.fetchedAt,
     fetchError: cache.fetchError,
+    // A fresh-from-cache snapshot has no failure history of its own.
+    // The cache's own `fetchError` field captures the LAST attempt;
+    // the host-tick counter starts at zero per-screen-mount.
+    consecutiveFetchFailures: 0,
     preformatted: cache.incidents.map(formatIncidentBlock),
   };
 }
@@ -450,14 +488,24 @@ export function makeIncidentsScreen(
      * Refresh the snapshot from the injected fetcher. Never throws —
      * fetch errors land in `fetchError`. On success the pre-formatted
      * blocks are rebuilt so subsequent renders stay cheap.
+     *
+     * Tracks `consecutiveFetchFailures` for the 3-state header marker.
+     * The fetcher's own `fetchError` is treated as a failure (the
+     * cache layer swallows network errors and surfaces them through
+     * the result shape rather than throwing), so a result with
+     * `fetchError !== null` still bumps the counter.
      */
     async tick(snapshot: IncidentsSnapshot): Promise<IncidentsSnapshot> {
       try {
         const result = await fetcher();
+        const failed = result.fetchError !== null;
         return {
           incidents: result.incidents,
           fetchedAt: result.fetchedAt,
           fetchError: result.fetchError,
+          consecutiveFetchFailures: failed
+            ? snapshot.consecutiveFetchFailures + 1
+            : 0,
           preformatted: result.incidents.map(formatIncidentBlock),
         };
       } catch (err) {
@@ -469,6 +517,7 @@ export function makeIncidentsScreen(
         return {
           ...snapshot,
           fetchError: message,
+          consecutiveFetchFailures: snapshot.consecutiveFetchFailures + 1,
         };
       }
     },

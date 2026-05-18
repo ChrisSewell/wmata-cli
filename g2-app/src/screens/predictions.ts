@@ -114,6 +114,14 @@ export interface PredictionsSnapshot {
   /** Last fetch error string, or `null` if the most recent fetch succeeded. */
   fetchError: string | null;
   /**
+   * Number of consecutive `tick()` failures since the last successful
+   * fetch. Reset to 0 on success. Drives the stale-marker escalation
+   * in `renderHeader` so users see a degrading network *before* the
+   * data goes blank: `*` after one failure, `**` after two, `?` once
+   * we have three in a row (or no successful fetch has ever landed).
+   */
+  consecutiveFetchFailures: number;
+  /**
    * Optional headline for the footer alert row. Sourced from the shared
    * incidents cache in `main.ts`'s predictions fetcher (the first
    * sentence of the freshest incident on a line this station serves).
@@ -156,12 +164,48 @@ export function isStale(snapshot: PredictionsSnapshot, nowMs: number): boolean {
 }
 
 /**
+ * Map (staleness × fetch-failure-count) onto a 3-state header marker.
+ *
+ * Semantics (matches the same helper in `incidents.ts`):
+ *
+ *   - `""`  — fresh data, 0 failures. Clean clock.
+ *   - `"*"` — stale by time only OR 1 failure since last success.
+ *             The data is plausibly old but the network may just be
+ *             slow; the user has data to look at.
+ *   - `"**"` — 2 consecutive failures. The network is degrading;
+ *              data is from before the failures started.
+ *   - `"?"` — ≥ 3 consecutive failures, OR `fetchedAt === 0` with an
+ *             active `fetchError` (we've never gotten data at all).
+ *
+ * Exported so the test suite can pin each branch directly.
+ */
+export function stalenessMarker(
+  snapshot: PredictionsSnapshot,
+  nowMs: number,
+): "" | "*" | "**" | "?" {
+  const failures = Math.max(0, snapshot.consecutiveFetchFailures);
+  // Total-failure-with-no-data path: we have nothing to show and a
+  // current error. Strongest marker.
+  if (snapshot.fetchedAt === 0 && snapshot.fetchError !== null) return "?";
+  if (failures >= 3) return "?";
+  if (failures === 2) return "**";
+  if (failures === 1) return "*";
+  // No active failure streak. Fall through to the time-based check
+  // (data may simply be older than threshold because the fetch tick
+  // hasn't fired yet on a slow connection).
+  if (isStale(snapshot, nowMs)) return "*";
+  return "";
+}
+
+/**
  * Render the header row: `<station name> <HH:MM>[stale-marker]`.
  *
- * When the data is stale we append a `*` after the clock as a glanceable
- * "this is old" cue (the panel is greyscale, so we can't actually dim).
- * The `*` consumes one column from the station-name budget — long names
- * lose one character of breathing room when stale, which is acceptable.
+ * When the data is stale or the fetch is degrading we append a 1- or
+ * 2-char marker after the clock as a glanceable "this is old" cue
+ * (the panel is greyscale, so we can't actually dim). The marker
+ * consumes its width from the station-name budget — long names lose
+ * one or two characters of breathing room while degraded, which is
+ * acceptable.
  *
  * `nowMs` is the host-supplied wall clock (`ViewContext.nowMs`). The
  * header re-renders every second via the host's clock tick so the
@@ -171,21 +215,17 @@ export function renderHeader(
   snapshot: PredictionsSnapshot,
   nowMs: number,
 ): string {
-  const stale = isStale(snapshot, nowMs);
+  const marker = stalenessMarker(snapshot, nowMs);
   const clockStr = formatClock(nowMs);
-  // Stale + a real fetch error get a distinct marker (`?` vs `*`) so the
-  // user can tell "old data" from "no data".
-  const marker = !stale ? "" : snapshot.fetchError !== null ? "?" : "*";
-  const clockCell = clockStr + marker; // 5 or 6 chars
-  // Steal one col from the name when the marker is present, so the total
-  // never exceeds LINE_WIDTH.
-  const nameBudget = HEADER_NAME_WIDTH - marker.length;
+  const clockCell = clockStr + marker; // 5, 6, or 7 chars
+  // Steal one col from the name per marker char so the total never
+  // exceeds LINE_WIDTH. `**` shrinks the name budget by 2.
+  const nameBudget = Math.max(1, HEADER_NAME_WIDTH - marker.length);
   const name = padRight(
     abbreviateStation(snapshot.stationName, nameBudget),
     nameBudget,
   );
-  // name(nameBudget) + " "(1) + clockCell(5 or 6) = 18 or 19 chars; with
-  // marker the name shrinks by 1 so the total stays at 24.
+  // name(nameBudget) + " "(1) + clockCell(5..7) = 24 by construction.
   return name + " " + clockCell;
 }
 
@@ -330,6 +370,10 @@ export function makePredictionsScreen(
      * `ViewContext.nowMs` on every render (including the independent
      * 1Hz clock tick), so the staleness check re-evaluates correctly
      * regardless of fetch cadence.
+     *
+     * Tracks `consecutiveFetchFailures` so the header marker can
+     * escalate `*` → `**` → `?` as the network degrades. Reset to 0
+     * on every successful fetch.
      */
     async tick(snapshot: PredictionsSnapshot): Promise<PredictionsSnapshot> {
       const now = Date.now();
@@ -341,6 +385,7 @@ export function makePredictionsScreen(
           incidentHeadline: result.incidentHeadline,
           fetchedAt: now,
           fetchError: null,
+          consecutiveFetchFailures: 0,
         };
       } catch (err) {
         const message =
@@ -348,6 +393,7 @@ export function makePredictionsScreen(
         return {
           ...snapshot,
           fetchError: message,
+          consecutiveFetchFailures: snapshot.consecutiveFetchFailures + 1,
         };
       }
     },

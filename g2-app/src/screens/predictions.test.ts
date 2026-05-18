@@ -88,6 +88,7 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     trains: [],
     fetchedAt: NOW,
     fetchError: null,
+    consecutiveFetchFailures: 0,
     incidentHeadline: null,
     ...over,
   };
@@ -175,10 +176,61 @@ describe("renderHeader", () => {
     expect(out.endsWith("14:32*")).toBe(true);
   });
 
-  it("appends '?' when there is an active fetch error", () => {
-    const out = renderHeader(snap({ fetchError: "Network down" }), NOW);
+  // ----- 3-state stale-marker escalation -----
+  //
+  // The marker now reflects the *number of consecutive fetch failures*
+  // since the last success, not just a binary stale/error flag. We pin
+  // each branch verbatim so a future regression has to update the
+  // expected glyphs intentionally.
+
+  it("appends '*' after one consecutive fetch failure", () => {
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 1, fetchError: "Slow network" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.endsWith("14:32*")).toBe(true);
+  });
+
+  it("appends '**' after two consecutive fetch failures", () => {
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 2, fetchError: "Slow network" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.endsWith("14:32**")).toBe(true);
+  });
+
+  it("appends '?' after three or more consecutive fetch failures", () => {
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 3, fetchError: "Slow network" }),
+      NOW,
+    );
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.endsWith("14:32?")).toBe(true);
+  });
+
+  it("appends '?' when no successful fetch ever AND there's an error", () => {
+    // fetchedAt=0 with an active error means we've never had data at
+    // all. This is the strongest degraded state, marker = '?'.
+    const out = renderHeader(
+      snap({ fetchedAt: 0, fetchError: "Network down" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.endsWith("14:32?")).toBe(true);
+  });
+
+  it("steals 2 cols from the name budget when the marker is '**'", () => {
+    // "Metro Center" (12 chars) → with **, the name budget is 18-2=16,
+    // so the name still fits verbatim. The total line length stays at
+    // exactly LINE_WIDTH.
+    const out = renderHeader(
+      snap({ consecutiveFetchFailures: 2, fetchError: "x" }),
+      NOW,
+    );
+    expect(out.length).toBe(LINE_WIDTH);
+    expect(out).toContain("Metro Center");
   });
 
   it("renders '--:--' placeholder when ctx.nowMs is zero", () => {
@@ -675,6 +727,39 @@ describe("predictions tick", () => {
     expect(next.fetchError).toBe("boom");
     // Trains are preserved across the failure — we don't blank the HUD.
     expect(next.trains).toEqual(snap({}).trains);
+  });
+
+  it("increments consecutiveFetchFailures on each rejected fetcher", async () => {
+    const fetcher = () => Promise.reject(new Error("boom"));
+    const screen = makePredictionsScreen(fetcher, snap({}));
+    let s = screen.init();
+    expect(s.consecutiveFetchFailures).toBe(0);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(1);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(2);
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(3);
+  });
+
+  it("resets consecutiveFetchFailures to 0 on a successful fetch", async () => {
+    let shouldFail = true;
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      shouldFail
+        ? Promise.reject(new Error("boom"))
+        : Promise.resolve({ trains: [], incidentHeadline: null });
+    const screen = makePredictionsScreen(
+      fetcher,
+      snap({ consecutiveFetchFailures: 2 }),
+    );
+    let s = screen.init();
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(3);
+    // Network recovers.
+    shouldFail = false;
+    s = await screen.tick(s);
+    expect(s.consecutiveFetchFailures).toBe(0);
+    expect(s.fetchError).toBeNull();
   });
 
   it("exposes a tickIntervalMs of 20_000 (20s) for the host", () => {
