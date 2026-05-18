@@ -289,6 +289,14 @@ export function makeVoiceScreen(
   let stopStream: (() => void) | null = null;
 
   /**
+   * Bump the generation counter that gates in-flight `searchFn`
+   * resolutions. Set by `onMount`, called by `onUnmount` so any
+   * `searchFn` promise still pending after teardown becomes a no-op
+   * when it settles. Null until `onMount` has wired the counter.
+   */
+  let bumpSearchGen: (() => void) | null = null;
+
+  /**
    * Closure-local mirror of the latest transcript. Updated whenever an
    * `onTranscript` callback fires. We hold this here (rather than
    * reading it from the snapshot on each STT callback) because the
@@ -521,13 +529,47 @@ export function makeVoiceScreen(
      * silence, we dispatch `TRANSCRIPT_SILENCE` (moves the reducer
      * into `'resolving'`), kick off the search, then dispatch
      * `RESOLVE_RESULT` / `RESOLVE_ERROR` when it settles.
+     *
+     * Race-safety:
+     *
+     *   The STT can fire `onSilence` twice in quick succession (some
+     *   engines do this on a long pause that crosses two windows). If
+     *   the FIRST `searchFn` resolves AFTER the SECOND, a naive `.then`
+     *   would let the older result clobber the newer one — flipping
+     *   `noMatch` ↔ `matches` in user-visible ways. We use a closure-
+     *   local `searchGen` counter (same pattern as the host's
+     *   `tickGeneration`): each silence-driven search captures its own
+     *   `myGen = ++searchGen`; on settle, if `myGen !== searchGen` we
+     *   drop the result. `onUnmount` bumps the counter too, so any
+     *   in-flight `searchFn` that settles after unmount becomes a
+     *   no-op (belt-and-suspenders — the host's `dispatch` already
+     *   short-circuits when `!active`).
      */
     async onMount(
       bridge: EvenAppBridge,
       dispatch: (event: ScreenEvent) => void,
     ): Promise<void> {
+      // Generation counter for in-flight `searchFn` calls. Each
+      // silence-triggered search captures its own value; only the
+      // newest call may write its result back via dispatch.
+      let searchGen = 0;
+
       try {
-        await bridge.audioControl(true);
+        // `audioControl` returns a `Promise<boolean>`: the SDK can
+        // either reject (network / IPC failure) OR resolve to `false`
+        // (the mic-permission gate denied us, or the device is
+        // already in use). Both must surface as a `RESOLVE_ERROR` —
+        // otherwise we'd start the STT stream over a dead mic and
+        // leave the user staring at a permanently-empty
+        // "Listening..." screen.
+        const ok = await bridge.audioControl(true);
+        if (!ok) {
+          dispatch({
+            type: "RESOLVE_ERROR",
+            message: "Microphone unavailable.",
+          });
+          return;
+        }
       } catch (err) {
         // If the mic can't open we can't do anything useful here.
         // Surface as an error phase so the user sees a clear message
@@ -550,14 +592,21 @@ export function makeVoiceScreen(
           // mirror that gate here so we don't waste a network round
           // trip.
           if (q.length < MIN_QUERY_LENGTH) return;
+          // Capture our generation BEFORE awaiting. If a second
+          // silence event fires while this search is in flight, it
+          // will bump `searchGen` and our `.then` / `.catch` below
+          // will detect the mismatch and drop the stale result.
+          const myGen = ++searchGen;
           void searchFn(q).then(
             (matches) => {
+              if (myGen !== searchGen) return; // stale — newer search in flight
               dispatch({
                 type: "RESOLVE_RESULT",
                 matches: matches.slice(0, MAX_MATCHES),
               });
             },
             (err: unknown) => {
+              if (myGen !== searchGen) return; // stale — drop the error too
               const message =
                 err instanceof Error
                   ? err.message
@@ -570,9 +619,26 @@ export function makeVoiceScreen(
           dispatch({ type: "RESOLVE_ERROR", message: err.message });
         },
       });
+
+      // Expose the generation bump for `onUnmount`. We stash it on
+      // the closure-local `bumpSearchGen` so `onUnmount` doesn't need
+      // to re-declare the counter (which would be a separate variable
+      // and miss in-flight searches).
+      bumpSearchGen = () => {
+        searchGen += 1;
+      };
     },
 
     async onUnmount(bridge: EvenAppBridge): Promise<void> {
+      // Bump the generation FIRST so any `searchFn` already in flight
+      // detects the mismatch when it settles and drops its result.
+      // The host's `dispatch` early-returns on `!active`, but we keep
+      // this gate local so future readers can see the intent at the
+      // call site.
+      if (bumpSearchGen) {
+        bumpSearchGen();
+        bumpSearchGen = null;
+      }
       if (stopStream) {
         try {
           stopStream();

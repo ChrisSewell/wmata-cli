@@ -818,3 +818,206 @@ describe("createSttEngine production factory", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Race-safety: stale RESOLVE_RESULT must not clobber a newer search
+// ---------------------------------------------------------------------------
+
+describe("voice onMount: in-flight search generation counter", () => {
+  /**
+   * Test-local bridge double — `audioControl` resolves to `true` by
+   * default. Kept here (rather than reusing the lifecycle-block
+   * helper) so the new tests are self-contained and the existing
+   * tests are untouched.
+   */
+  function okBridge(): import("@evenrealities/even_hub_sdk").EvenAppBridge {
+    const fake = {
+      audioControl: (_on: boolean): Promise<boolean> => Promise.resolve(true),
+    };
+    return fake as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge;
+  }
+
+  it("drops the FIRST search's result when a SECOND silence fires before it settles", async () => {
+    // Set up two manually-resolvable searches. The first resolves to
+    // a single match (would navigate); the second to zero (noMatch).
+    // We resolve the SECOND first, then the FIRST — the older
+    // result must be dropped silently.
+    let firstResolve: ((m: Station[]) => void) | null = null;
+    let secondResolve: ((m: Station[]) => void) | null = null;
+    let callIndex = 0;
+    const search = (_q: string): Promise<Station[]> => {
+      callIndex += 1;
+      if (callIndex === 1) {
+        return new Promise<Station[]>((res) => {
+          firstResolve = res;
+        });
+      }
+      return new Promise<Station[]>((res) => {
+        secondResolve = res;
+      });
+    };
+
+    const { screen, stt } = makeRig(search);
+    const dispatched: ScreenEvent[] = [];
+    const dispatch = (event: ScreenEvent): void => {
+      dispatched.push(event);
+    };
+    await screen.onMount!(okBridge(), dispatch);
+
+    // First utterance.
+    stt.simulatePartial("metro center");
+    stt.simulateSilence();
+    expect(callIndex).toBe(1);
+
+    // Second utterance arrives before the first search resolves.
+    stt.simulatePartial("gallery place");
+    stt.simulateSilence();
+    expect(callIndex).toBe(2);
+
+    // Resolve the SECOND first (noMatch).
+    secondResolve!([]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Now resolve the FIRST (would have been a unique match) — this
+    // is stale and must be dropped.
+    firstResolve!([station({ Code: "A01", Name: "Metro Center" })]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const resolveResults = dispatched.filter(
+      (e) => e.type === "RESOLVE_RESULT",
+    );
+    // Only ONE RESOLVE_RESULT must reach the dispatch — the newer
+    // (second) one. The older one is dropped by the generation gate.
+    expect(resolveResults.length).toBe(1);
+    const evt = resolveResults[0]!;
+    if (evt.type === "RESOLVE_RESULT") {
+      expect(evt.matches).toEqual([]);
+    }
+  });
+
+  it("dispatches RESOLVE_ERROR + skips STT when audioControl(true) resolves to false", async () => {
+    const failingBridge = {
+      audioControl: (_on: boolean): Promise<boolean> => Promise.resolve(false),
+    } as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge;
+    const { screen, stt } = makeRig();
+    const dispatched: ScreenEvent[] = [];
+    const dispatch = (event: ScreenEvent): void => {
+      dispatched.push(event);
+    };
+    await screen.onMount!(failingBridge, dispatch);
+
+    const err = dispatched.find((e) => e.type === "RESOLVE_ERROR");
+    expect(err).toBeDefined();
+    if (err && err.type === "RESOLVE_ERROR") {
+      expect(err.message).toBe("Microphone unavailable.");
+    }
+    // STT must NOT have been started — otherwise we'd be reading
+    // from a dead mic.
+    expect(stt.active).toBe(false);
+  });
+
+  it("STT onError callback dispatches RESOLVE_ERROR carrying the error message", async () => {
+    const { screen, stt } = makeRig();
+    const dispatched: ScreenEvent[] = [];
+    const dispatch = (event: ScreenEvent): void => {
+      dispatched.push(event);
+    };
+    await screen.onMount!(okBridge(), dispatch);
+
+    stt.simulateError("stt stream lost");
+    const err = dispatched.find((e) => e.type === "RESOLVE_ERROR");
+    expect(err).toBeDefined();
+    if (err && err.type === "RESOLVE_ERROR") {
+      expect(err.message).toBe("stt stream lost");
+    }
+  });
+
+  it("late STT callback after onUnmount is a no-op (no dispatch effect)", async () => {
+    const { screen, stt } = makeRig();
+    const audioCalls: boolean[] = [];
+    const bridge = {
+      audioControl: (on: boolean): Promise<boolean> => {
+        audioCalls.push(on);
+        return Promise.resolve(true);
+      },
+    } as unknown as import("@evenrealities/even_hub_sdk").EvenAppBridge;
+    const dispatched: ScreenEvent[] = [];
+    const dispatch = (event: ScreenEvent): void => {
+      dispatched.push(event);
+    };
+
+    await screen.onMount!(bridge, dispatch);
+    await screen.onUnmount!(bridge);
+    // `stt.stopCount` should be 1 — stream was torn down.
+    expect(stt.stopCount).toBe(1);
+    // Drop a stale callback. MockSttEngine clears its callback on
+    // stop, so simulate* are no-ops — no dispatch must follow.
+    const before = dispatched.length;
+    stt.simulatePartial("late text");
+    stt.simulateSilence();
+    stt.simulateError("late error");
+    expect(dispatched.length).toBe(before);
+  });
+
+  it("formatTranscriptWindow on an unbroken 100-char token slices to ≤ TRANSCRIPT_WINDOW", () => {
+    const out = formatTranscriptWindow("a".repeat(100));
+    expect(out.length).toBeLessThanOrEqual(TRANSCRIPT_WINDOW);
+    expect(out.length).toBe(TRANSCRIPT_WINDOW);
+    // Tail-slice with `…` prefix — the trailing run of "a"s is preserved.
+    expect(out.startsWith("…")).toBe(true);
+    expect(out.endsWith("a".repeat(TRANSCRIPT_WINDOW - 1))).toBe(true);
+  });
+
+  it("second onSilence while first search still resolving: only the newer result dispatches", async () => {
+    // Variant on the stale-race test that locks the chosen strategy
+    // (last-wins via gen counter rather than skip-while-resolving):
+    // BOTH searches are invoked, but only the newer one's result
+    // makes it through to dispatch. If a future implementer switches
+    // to skip-while-resolving, this test will need updating — that's
+    // intentional, the invariant is load-bearing.
+    let callCount = 0;
+    let firstResolve: ((m: Station[]) => void) | null = null;
+    let secondResolve: ((m: Station[]) => void) | null = null;
+    const search = (_q: string): Promise<Station[]> => {
+      callCount += 1;
+      return new Promise<Station[]>((res) => {
+        if (callCount === 1) firstResolve = res;
+        else secondResolve = res;
+      });
+    };
+    const { screen, stt } = makeRig(search);
+    const dispatched: ScreenEvent[] = [];
+    const dispatch = (event: ScreenEvent): void => {
+      dispatched.push(event);
+    };
+    await screen.onMount!(okBridge(), dispatch);
+
+    stt.simulatePartial("metro center");
+    stt.simulateSilence();
+    stt.simulatePartial("gallery place");
+    stt.simulateSilence();
+
+    // Both searches are in flight.
+    expect(callCount).toBe(2);
+
+    // Resolve in order (first then second). The first must be
+    // dropped because the second has already been initiated.
+    const newer = [station({ Code: "B01", Name: "Gallery Pl-Chinatown" })];
+    firstResolve!([station({ Code: "A01", Name: "Metro Center" })]);
+    await Promise.resolve();
+    await Promise.resolve();
+    secondResolve!(newer);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const results = dispatched.filter((e) => e.type === "RESOLVE_RESULT");
+    expect(results.length).toBe(1);
+    const r = results[0]!;
+    if (r.type === "RESOLVE_RESULT") {
+      expect(r.matches.length).toBe(1);
+      expect(r.matches[0]!.Code).toBe("B01");
+    }
+  });
+});
