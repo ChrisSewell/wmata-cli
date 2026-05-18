@@ -52,9 +52,11 @@
 //   preferred provider.
 
 import type { Station } from "../wmata";
+import type { VoiceTargets } from "../storage/settings";
 import { LINE_WIDTH, padRight, truncate } from "../ui/render";
 import { abbreviateStation, lineGlyph } from "../ui/format";
 import type {
+  NavIntent,
   ReduceResult,
   Screen,
   ScreenEvent,
@@ -62,6 +64,130 @@ import type {
 } from "./router";
 import type { EvenAppBridge } from "@evenrealities/even_hub_sdk";
 import { DeepgramSttEngine } from "../stt/deepgram";
+
+// ---------------------------------------------------------------------------
+// Intent resolver — keyword pre-pass before fuzzy station match
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of intent resolution. Either we recognized a navigation
+ * keyword (in which case the screen shortcut-navigates) or we fall
+ * through to the existing fuzzy-station search.
+ */
+export type VoiceIntent =
+  | { kind: "navigate"; intent: NavIntent }
+  | { kind: "station-match"; query: string };
+
+/**
+ * Strip common verbal prefixes ("go ", "take me ", "show me ", etc.)
+ * so phrasings like "take me home" map to the same intent as "home".
+ * The list is exact-stem only — no fuzzy matching, since STT noise
+ * is already lossy enough.
+ */
+const VERBAL_PREFIXES: readonly string[] = [
+  "take me ",
+  "take me to ",
+  "go to ",
+  "go ",
+  "show me ",
+  "show ",
+  "what's ",
+  "what is ",
+  "when is ",
+  "open ",
+];
+
+function stripVerbalPrefix(transcript: string): string {
+  let s = transcript;
+  for (const p of VERBAL_PREFIXES) {
+    if (s.startsWith(p)) {
+      s = s.slice(p.length);
+      // Don't loop — strip at most one prefix so "go take me home"
+      // still falls through to station match.
+      break;
+    }
+  }
+  return s.trim();
+}
+
+/**
+ * Map a transcript onto either a navigation intent (recognized
+ * keyword) or a station-match fallback. Pure: no side effects, no
+ * dependencies beyond the user's labelled `voiceTargets`.
+ *
+ * Keywords currently handled:
+ *
+ *   "home" / "office home" -> predictions(voiceTargets.home)
+ *   "work" / "office"      -> predictions(voiceTargets.work)
+ *   "alerts" / "incidents" / "delays"
+ *                          -> incidents
+ *   "elevators" / "outages" / "access"
+ *                          -> elevator
+ *   "last train"           -> predictions(voiceTargets.home)
+ *
+ * Anything else (including keywords whose target is unset) falls
+ * through to the station-match path so the user's existing
+ * fuzzy-search flow keeps working.
+ */
+export function resolveVoiceIntent(
+  transcript: string,
+  voiceTargets: VoiceTargets,
+): VoiceIntent {
+  const fallback: VoiceIntent = {
+    kind: "station-match",
+    query: transcript,
+  };
+  if (typeof transcript !== "string") return fallback;
+  const normalised = stripVerbalPrefix(transcript.trim().toLowerCase());
+  if (normalised.length === 0) return fallback;
+
+  // Home / work shortcuts (gated on the target being configured).
+  if (normalised === "home") {
+    if (voiceTargets.home.length === 0) return fallback;
+    return {
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: voiceTargets.home },
+    };
+  }
+  if (normalised === "work" || normalised === "office") {
+    if (voiceTargets.work.length === 0) return fallback;
+    return {
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: voiceTargets.work },
+    };
+  }
+
+  // Alerts / incidents.
+  if (
+    normalised === "alerts" ||
+    normalised === "incidents" ||
+    normalised === "delays"
+  ) {
+    return { kind: "navigate", intent: { to: "incidents" } };
+  }
+
+  // Elevator outages.
+  if (
+    normalised === "elevators" ||
+    normalised === "escalators" ||
+    normalised === "outages" ||
+    normalised === "access"
+  ) {
+    return { kind: "navigate", intent: { to: "elevator" } };
+  }
+
+  // Last-train glance. Routes to predictions at the home station
+  // because that's where the late-night row will surface; the
+  // station context matters more than the keyword itself.
+  if (normalised === "last train" && voiceTargets.home.length > 0) {
+    return {
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: voiceTargets.home },
+    };
+  }
+
+  return fallback;
+}
 
 // ---------------------------------------------------------------------------
 // Public contract: SttEngine
@@ -288,6 +414,13 @@ export function makeVoiceScreen(
   stt: SttEngine,
   searchFn: (query: string) => Promise<Station[]>,
   initial?: Partial<VoiceSnapshot>,
+  /**
+   * Optional pure intent resolver. When provided, `onMount` consults
+   * it before calling `searchFn` and short-circuits to a direct
+   * navigation when the resolver returns one. When omitted the
+   * screen behaves exactly like v1.1 (always fuzzy-search).
+   */
+  intentResolver?: (transcript: string) => VoiceIntent,
 ): Screen<VoiceSnapshot> {
   const base = initialVoiceSnapshot();
   const seeded: VoiceSnapshot = { ...base, ...(initial ?? {}) };
@@ -434,6 +567,12 @@ export function makeVoiceScreen(
               lastQuery: q,
             },
           };
+        }
+        case "RESOLVE_NAVIGATE": {
+          // Voice intent shortcut — fire the requested navigation
+          // immediately. The screen is about to be unmounted so we
+          // don't bother updating the snapshot.
+          return { nav, navigate: event.intent };
         }
         case "RESOLVE_RESULT": {
           // The host glue dispatched this after `searchFn` settled.
@@ -625,6 +764,24 @@ export function makeVoiceScreen(
           // mirror that gate here so we don't waste a network round
           // trip.
           if (q.length < MIN_QUERY_LENGTH) return;
+
+          // Intent resolution: keyword shortcuts (e.g. "home" /
+          // "alerts") bypass the fuzzy search entirely. If the
+          // resolver returns a navigation intent, dispatch it
+          // straight away and skip `searchFn`.
+          if (intentResolver) {
+            const intent = intentResolver(q);
+            if (intent.kind === "navigate") {
+              dispatch({
+                type: "RESOLVE_NAVIGATE",
+                intent: intent.intent,
+              });
+              return;
+            }
+            // station-match — fall through to searchFn with the
+            // possibly-rewritten query.
+          }
+
           // Capture our generation BEFORE awaiting. If a second
           // silence event fires while this search is in flight, it
           // will bump `searchGen` and our `.then` / `.catch` below

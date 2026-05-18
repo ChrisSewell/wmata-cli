@@ -83,6 +83,22 @@ export interface Settings {
    * `src/schedule/rules.ts`.
    */
   schedule: ScheduleRule[];
+  /**
+   * Labelled station codes for voice-intent commands. Empty strings
+   * mean "not configured" — the corresponding voice keyword falls
+   * through to the fuzzy station match instead of a direct nav.
+   *
+   * "home" and "work" are the canonical labels; more can be added
+   * later without a schema change (the parser drops unknown keys).
+   */
+  voiceTargets: VoiceTargets;
+}
+
+/** Labelled station codes for voice navigation keywords. */
+export interface VoiceTargets {
+  /** Station code, e.g. "C01". Empty means unset. */
+  home: string;
+  work: string;
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -97,6 +113,7 @@ const KEY_FAVORITES = "wmata.g2.favorites";
 const KEY_STT_API_KEY = "wmata.g2.sttApiKey";
 const KEY_TUTORIAL_SEEN = "wmata.g2.tutorialSeen";
 const KEY_SCHEDULE = "wmata.g2.schedule";
+const KEY_VOICE_TARGETS = "wmata.g2.voiceTargets";
 
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
@@ -341,6 +358,25 @@ function writeSchedule(rules: ScheduleRule[]): void {
   safeSet(KEY_SCHEDULE, JSON.stringify(envelope));
 }
 
+function readVoiceTargets(): VoiceTargets {
+  const value = parseEnvelope(safeGet(KEY_VOICE_TARGETS));
+  if (!isRecord(value)) return { home: "", work: "" };
+  const home = value["home"];
+  const work = value["work"];
+  return {
+    home: typeof home === "string" ? home : "",
+    work: typeof work === "string" ? work : "",
+  };
+}
+
+function writeVoiceTargets(targets: VoiceTargets): void {
+  const envelope: Envelope<VoiceTargets> = {
+    schemaVersion: SCHEMA_VERSION,
+    value: targets,
+  };
+  safeSet(KEY_VOICE_TARGETS, JSON.stringify(envelope));
+}
+
 /**
  * Read the tutorial-seen flag.
  *
@@ -388,12 +424,25 @@ export function loadSettings(): Settings {
     sttApiKey: readSttApiKey(),
     tutorialSeen: readTutorialSeen(),
     schedule: readSchedule(),
+    voiceTargets: readVoiceTargets(),
   };
 }
 
 /** Persist the user's schedule rules. Pass `[]` to clear. */
 export function saveSchedule(rules: ScheduleRule[]): void {
   writeSchedule(rules);
+}
+
+/**
+ * Persist the user's labelled voice-target stations. Pass either
+ * field as `""` to clear that label (the corresponding voice keyword
+ * will fall through to the fuzzy station match).
+ */
+export function saveVoiceTargets(targets: VoiceTargets): void {
+  writeVoiceTargets({
+    home: targets.home.trim(),
+    work: targets.work.trim(),
+  });
 }
 
 /**
@@ -495,4 +544,5 @@ export function clearSettings(): void {
   safeRemove(KEY_STT_API_KEY);
   safeRemove(KEY_TUTORIAL_SEEN);
   safeRemove(KEY_SCHEDULE);
+  safeRemove(KEY_VOICE_TARGETS);
 }

@@ -36,7 +36,11 @@ import {
 import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
-import { createSttEngine, makeVoiceScreen } from "./screens/voice";
+import {
+  createSttEngine,
+  makeVoiceScreen,
+  resolveVoiceIntent,
+} from "./screens/voice";
 import { evaluateSchedule } from "./schedule/rules";
 import { Session } from "./session";
 import { parseLinesAffected } from "./wmata/incidents-cache";
@@ -376,6 +380,12 @@ async function bootGlasses(): Promise<void> {
           const screen = makeVoiceScreen(
             stt,
             (q: string) => session.searchStations(q),
+            undefined,
+            // Read voiceTargets at intent-resolution time (not at
+            // screen-construction time) so a settings change is
+            // picked up on the next utterance without remounting.
+            (transcript: string) =>
+              resolveVoiceIntent(transcript, loadSettings().voiceTargets),
           );
           router.current = "voice";
           unmount = await mountGlassesScreen(screen, bridge, router);

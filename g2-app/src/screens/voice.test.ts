@@ -34,6 +34,8 @@ import {
   makeVoiceScreen,
   renderHeader,
   renderMatchRow,
+  resolveVoiceIntent,
+  type VoiceIntent,
   type VoiceSnapshot,
 } from "./voice";
 
@@ -1179,5 +1181,198 @@ describe("voice onMount: in-flight search generation counter", () => {
       expect(r.matches.length).toBe(1);
       expect(r.matches[0]!.Code).toBe("B01");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice intent resolver
+// ---------------------------------------------------------------------------
+
+describe("resolveVoiceIntent", () => {
+  const targets = { home: "C01", work: "A01" };
+  const emptyTargets = { home: "", work: "" };
+
+  it("maps 'home' to predictions(home) when configured", () => {
+    expect(resolveVoiceIntent("home", targets)).toEqual({
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: "C01" },
+    } satisfies VoiceIntent);
+  });
+
+  it("maps 'work' to predictions(work) when configured", () => {
+    expect(resolveVoiceIntent("work", targets)).toEqual({
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: "A01" },
+    } satisfies VoiceIntent);
+  });
+
+  it("treats 'office' as a synonym for 'work'", () => {
+    expect(resolveVoiceIntent("office", targets)).toEqual({
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: "A01" },
+    } satisfies VoiceIntent);
+  });
+
+  it("strips a verbal prefix before matching ('take me home' -> home)", () => {
+    expect(resolveVoiceIntent("take me home", targets)).toEqual({
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: "C01" },
+    } satisfies VoiceIntent);
+  });
+
+  it("maps 'alerts' to incidents", () => {
+    expect(resolveVoiceIntent("alerts", emptyTargets)).toEqual({
+      kind: "navigate",
+      intent: { to: "incidents" },
+    } satisfies VoiceIntent);
+  });
+
+  it("maps 'incidents' to incidents", () => {
+    expect(resolveVoiceIntent("incidents", emptyTargets)).toEqual({
+      kind: "navigate",
+      intent: { to: "incidents" },
+    } satisfies VoiceIntent);
+  });
+
+  it("maps 'elevators' / 'outages' / 'access' to elevator", () => {
+    for (const word of ["elevators", "outages", "access"]) {
+      expect(resolveVoiceIntent(word, emptyTargets)).toEqual({
+        kind: "navigate",
+        intent: { to: "elevator" },
+      } satisfies VoiceIntent);
+    }
+  });
+
+  it("maps 'last train' to predictions(home) when home is set", () => {
+    expect(resolveVoiceIntent("last train", targets)).toEqual({
+      kind: "navigate",
+      intent: { to: "predictions", stationCode: "C01" },
+    } satisfies VoiceIntent);
+  });
+
+  it("falls through to station-match when 'last train' has no home configured", () => {
+    expect(resolveVoiceIntent("last train", emptyTargets)).toEqual({
+      kind: "station-match",
+      query: "last train",
+    } satisfies VoiceIntent);
+  });
+
+  it("falls through when 'home' has no station configured", () => {
+    expect(resolveVoiceIntent("home", emptyTargets)).toEqual({
+      kind: "station-match",
+      query: "home",
+    } satisfies VoiceIntent);
+  });
+
+  it("falls through to station-match for arbitrary station names", () => {
+    expect(resolveVoiceIntent("metro center", targets)).toEqual({
+      kind: "station-match",
+      query: "metro center",
+    } satisfies VoiceIntent);
+  });
+
+  it("falls through for empty / non-string input", () => {
+    expect(resolveVoiceIntent("", targets)).toEqual({
+      kind: "station-match",
+      query: "",
+    } satisfies VoiceIntent);
+  });
+
+  it("preserves the original (non-normalised) query in station-match", () => {
+    // Mixed-case + leading/trailing whitespace.
+    const out = resolveVoiceIntent("  Metro Center  ", targets);
+    expect(out).toEqual({
+      kind: "station-match",
+      query: "  Metro Center  ",
+    } satisfies VoiceIntent);
+  });
+});
+
+describe("voice screen: intent resolver shortcut", () => {
+  it("dispatches RESOLVE_NAVIGATE for a keyword and skips the searchFn", async () => {
+    let searchCalls = 0;
+    const search = (_q: string): Promise<Station[]> => {
+      searchCalls += 1;
+      return Promise.resolve([]);
+    };
+    const stt = new MockSttEngine();
+    const screen = makeVoiceScreen(
+      stt,
+      search,
+      undefined,
+      (transcript: string) => resolveVoiceIntent(transcript, { home: "C01", work: "" }),
+    );
+
+    const dispatched: ScreenEvent[] = [];
+    await screen.onMount!(
+      // The bridge isn't touched until the audio path is wired —
+      // we hand it a stub that satisfies the typed callbacks the
+      // Voice screen's `onMount` actually invokes.
+      {
+        audioControl: () => Promise.resolve(true),
+        onEvenHubEvent: () => () => undefined,
+      } as never,
+      (event) => {
+        dispatched.push(event);
+      },
+    );
+
+    // Drive a transcript + silence — the resolver should fire BEFORE
+    // searchFn and dispatch RESOLVE_NAVIGATE.
+    stt.simulatePartial("home");
+    stt.simulateSilence();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(searchCalls).toBe(0);
+    const nav = dispatched.find((e) => e.type === "RESOLVE_NAVIGATE");
+    expect(nav).toBeDefined();
+    if (nav?.type === "RESOLVE_NAVIGATE") {
+      expect(nav.intent).toEqual({ to: "predictions", stationCode: "C01" });
+    }
+
+    await screen.onUnmount!({
+      audioControl: () => Promise.resolve(true),
+    } as never);
+  });
+
+  it("falls through to searchFn for non-keyword transcripts", async () => {
+    let searchCalls = 0;
+    const search = (q: string): Promise<Station[]> => {
+      searchCalls += 1;
+      expect(q).toBe("metro center");
+      return Promise.resolve([station({ Code: "A01", Name: "Metro Center" })]);
+    };
+    const stt = new MockSttEngine();
+    const screen = makeVoiceScreen(
+      stt,
+      search,
+      undefined,
+      (transcript: string) =>
+        resolveVoiceIntent(transcript, { home: "C01", work: "" }),
+    );
+
+    const dispatched: ScreenEvent[] = [];
+    await screen.onMount!(
+      {
+        audioControl: () => Promise.resolve(true),
+        onEvenHubEvent: () => () => undefined,
+      } as never,
+      (event) => {
+        dispatched.push(event);
+      },
+    );
+
+    stt.simulatePartial("metro center");
+    stt.simulateSilence();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(searchCalls).toBe(1);
+    expect(dispatched.some((e) => e.type === "RESOLVE_NAVIGATE")).toBe(false);
+
+    await screen.onUnmount!({
+      audioControl: () => Promise.resolve(true),
+    } as never);
   });
 });
