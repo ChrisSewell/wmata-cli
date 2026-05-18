@@ -34,6 +34,8 @@ import {
   type RailIncident,
   type Station,
   type StationsResponse,
+  type StationTimes,
+  type StationTimesResponse,
 } from "./wmata";
 
 // ---------------------------------------------------------------------------
@@ -97,9 +99,16 @@ function stubClient(opts: {
   stations?: StationsResponse;
   incidents?: IncidentsResponse;
   elevatorIncidents?: ElevatorIncidentsResponse;
+  stationTimes?: StationTimesResponse;
   rejectIncidents?: unknown;
   rejectElevatorIncidents?: unknown;
-  counters: { stations: number; incidents: number; elevator: number };
+  rejectStationTimes?: unknown;
+  counters: {
+    stations: number;
+    incidents: number;
+    elevator: number;
+    stationTimes?: number;
+  };
 }): WmataClient {
   const get = <T>(url: string): Promise<T> => {
     if (url.includes("ElevatorIncidents")) {
@@ -108,6 +117,14 @@ function stubClient(opts: {
         return Promise.reject(opts.rejectElevatorIncidents);
       }
       const body = opts.elevatorIncidents ?? { ElevatorIncidents: [] };
+      return Promise.resolve(body as unknown as T);
+    }
+    if (url.includes("jStationTimes")) {
+      opts.counters.stationTimes = (opts.counters.stationTimes ?? 0) + 1;
+      if (opts.rejectStationTimes !== undefined) {
+        return Promise.reject(opts.rejectStationTimes);
+      }
+      const body = opts.stationTimes ?? { StationTimes: [] };
       return Promise.resolve(body as unknown as T);
     }
     if (url.includes("Incidents")) {
@@ -474,6 +491,113 @@ describe("Session: elevator-incidents cache", () => {
     // The cache's stored list is unaffected.
     const snapB = session.readCachedElevatorIncidents();
     expect(snapB.incidents.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Station-times cache (per-station, lazy)
+// ---------------------------------------------------------------------------
+
+function stationTimes(over: Partial<StationTimes> = {}): StationTimes {
+  const emptyDay = { OpeningTime: "05:00", FirstTrains: [], LastTrains: [] };
+  return {
+    Code: "A01",
+    StationName: "Metro Center",
+    Monday: emptyDay,
+    Tuesday: emptyDay,
+    Wednesday: emptyDay,
+    Thursday: emptyDay,
+    Friday: emptyDay,
+    Saturday: emptyDay,
+    Sunday: emptyDay,
+    ...over,
+  };
+}
+
+describe("Session: station-times cache", () => {
+  it("getStationTimes: first call hits the network, second returns the cache", async () => {
+    const counters = {
+      stations: 0,
+      incidents: 0,
+      elevator: 0,
+      stationTimes: 0,
+    };
+    const session = new Session(
+      stubClient({
+        counters,
+        stationTimes: { StationTimes: [stationTimes({ Code: "A01" })] },
+      }),
+    );
+
+    const a = await session.getStationTimes("A01");
+    expect(counters.stationTimes).toBe(1);
+    const b = await session.getStationTimes("A01");
+    expect(counters.stationTimes).toBe(1);
+    expect(a).toBe(b);
+  });
+
+  it("normalizes the code to uppercase before caching", async () => {
+    const counters = {
+      stations: 0,
+      incidents: 0,
+      elevator: 0,
+      stationTimes: 0,
+    };
+    const session = new Session(
+      stubClient({
+        counters,
+        stationTimes: { StationTimes: [stationTimes({ Code: "A01" })] },
+      }),
+    );
+
+    await session.getStationTimes("a01");
+    expect(counters.stationTimes).toBe(1);
+    await session.getStationTimes("A01");
+    expect(counters.stationTimes).toBe(1);
+  });
+
+  it("returns null when the response has no station data", async () => {
+    const counters = {
+      stations: 0,
+      incidents: 0,
+      elevator: 0,
+      stationTimes: 0,
+    };
+    const session = new Session(
+      stubClient({ counters, stationTimes: { StationTimes: [] } }),
+    );
+
+    const out = await session.getStationTimes("UNKNOWN");
+    expect(out).toBeNull();
+  });
+
+  it("returns null on network error AND does NOT cache the failure", async () => {
+    // This test bypasses `stubClient` — it needs a per-call rejection
+    // pattern that the standard stub doesn't model.
+    let attempts = 0;
+    const fakeGet = <T>(url: string): Promise<T> => {
+      if (url.includes("jStationTimes")) {
+        attempts += 1;
+        if (attempts === 1) return Promise.reject(new Error("net"));
+        return Promise.resolve({
+          StationTimes: [stationTimes({ Code: "A01" })],
+        } as unknown as T);
+      }
+      return Promise.resolve({} as unknown as T);
+    };
+    const flakyClient = { get: fakeGet } as unknown as WmataClient;
+    const session = new Session(flakyClient);
+
+    // First call: network rejects → null, no cache write.
+    const a = await session.getStationTimes("A01");
+    expect(a).toBeNull();
+    expect(attempts).toBe(1);
+
+    // Second call: retries the network (cache wasn't poisoned) → success.
+    const b = await session.getStationTimes("A01");
+    expect(attempts).toBe(2);
+    expect(b).not.toBeNull();
+    expect(b!.Code).toBe("A01");
   });
 });
 

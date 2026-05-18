@@ -91,6 +91,56 @@ export const STALE_THRESHOLD_MS = 60_000;
 /** Auto-refresh cadence handed back to the host via `tickIntervalMs`. */
 export const TICK_INTERVAL_MS = 20_000;
 
+/**
+ * Local-clock hour at and past which the "Last train" row is
+ * surfaced. WMATA service ends at midnight on most weeknights and
+ * 01:00–03:00 on weekend nights, so 21:00 gives a 3-hour heads-up
+ * window without cluttering the screen during normal commute hours.
+ *
+ * Exported so the test suite can pin the threshold rather than
+ * reaching into a constant from a `Date.now()` mock.
+ */
+export const LAST_TRAIN_HOUR = 21;
+
+/**
+ * True when the wall clock (in the runtime's local timezone) is at
+ * or past `LAST_TRAIN_HOUR` — at which point the last-train row is
+ * worth surfacing. Hidden during the morning rush and afternoon.
+ */
+export function shouldShowLastTrain(nowMs: number): boolean {
+  if (!Number.isFinite(nowMs) || nowMs <= 0) return false;
+  return new Date(nowMs).getHours() >= LAST_TRAIN_HOUR;
+}
+
+/**
+ * Pick the latest "HH:mm" string from a list of `StationTrainTime`s.
+ * Returns `null` for an empty list.
+ *
+ * Comparison is lexicographic-on-"HH:mm" because the format is
+ * zero-padded — `"08:32" < "23:47"` reads correctly as a string
+ * comparison. WMATA's `LastTrains` array may include AM times that
+ * actually mean "next day" (per docs), and those will sort EARLIEST
+ * by this comparison; we accept that for the v1.2 ship and just
+ * surface the latest PM time, which is the user-facing "last train".
+ */
+export function pickLastTrainTime(
+  times: ReadonlyArray<{ Time: string }>,
+): string | null {
+  let best: string | null = null;
+  for (const t of times) {
+    if (typeof t.Time !== "string" || t.Time.length === 0) continue;
+    // Skip AM times — they're "next day" per the WMATA docs, not
+    // "later today". A late-evening user wants the latest PM
+    // departure, not tomorrow morning's first AM run that happens
+    // to spill into the LastTrains array.
+    const hh = parseInt(t.Time.slice(0, 2), 10);
+    if (!Number.isFinite(hh)) continue;
+    if (hh < 12) continue;
+    if (best === null || t.Time > best) best = t.Time;
+  }
+  return best;
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot
 // ---------------------------------------------------------------------------
@@ -99,6 +149,14 @@ export const TICK_INTERVAL_MS = 20_000;
 export interface PredictionsFetchResult {
   trains: Train[];
   incidentHeadline: string | null;
+  /**
+   * "HH:mm" of today's last scheduled departure from this station,
+   * across all destinations served. `null` when the schedule fetch
+   * failed or the station isn't in the schedule data. Driven by the
+   * Session's lazy-cached `getStationTimes` so the wire fetch happens
+   * at most once per glasses session.
+   */
+  lastTrainToday: string | null;
 }
 
 /** Data the Predictions screen renders against. */
@@ -128,6 +186,14 @@ export interface PredictionsSnapshot {
    * `null` when there are no matching incidents — the footer hides.
    */
   incidentHeadline: string | null;
+  /**
+   * Last scheduled departure from this station today, `"HH:mm"`. Only
+   * rendered after the late-evening cutoff (see
+   * `shouldShowLastTrain`); rendered as a `"Last train: 23:47"` row
+   * appended to the body. `null` when the schedule lookup hasn't
+   * landed or the station isn't in the data.
+   */
+  lastTrainToday: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +338,23 @@ export function renderFooter(snapshot: PredictionsSnapshot): string | null {
 }
 
 /**
+ * Render the optional late-night last-train row. Returns `null` when
+ * the wall clock is before `LAST_TRAIN_HOUR` OR the schedule data
+ * isn't available — in either case the row is hidden.
+ *
+ *   "Last train: 23:47"  (always ≤ 24 cols)
+ */
+export function renderLastTrainRow(
+  snapshot: PredictionsSnapshot,
+  nowMs: number,
+): string | null {
+  if (!shouldShowLastTrain(nowMs)) return null;
+  const time = snapshot.lastTrainToday;
+  if (!time || time.length === 0) return null;
+  return truncate(`Last train: ${time}`, LINE_WIDTH);
+}
+
+/**
  * Sort + cap the train list for display. We sort by ETA ascending, with
  * BRD ahead of ARR ahead of any numeric, and unknown sentinels (`""`,
  * `"---"`) at the tail.
@@ -340,6 +423,14 @@ export function makePredictionsScreen(
 
       const footer = renderFooter(snapshot);
       if (footer !== null) lines.push(footer);
+
+      // Late-night last-train row. Independent of the footer — both
+      // can be present simultaneously (e.g. midnight on a single-
+      // tracking day). Hidden outside the late-night window OR when
+      // the schedule fetch hasn't completed; in either case the
+      // existing line count stays unchanged.
+      const lastTrain = renderLastTrainRow(snapshot, ctx.nowMs);
+      if (lastTrain !== null) lines.push(lastTrain);
       return lines;
     },
     reduce(_snapshot, nav, event: ScreenEvent): ReduceResult<PredictionsSnapshot> {
@@ -383,6 +474,11 @@ export function makePredictionsScreen(
           ...snapshot,
           trains: result.trains,
           incidentHeadline: result.incidentHeadline,
+          // Carry the last-train field forward when the fetcher
+          // provides one; preserve the prior value when null so the
+          // user doesn't see the row blink off if the fetcher only
+          // populates it on the first call.
+          lastTrainToday: result.lastTrainToday ?? snapshot.lastTrainToday,
           fetchedAt: now,
           fetchError: null,
           consecutiveFetchFailures: 0,

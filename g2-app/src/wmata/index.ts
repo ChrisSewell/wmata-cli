@@ -21,6 +21,7 @@ export {
   RAIL_STATIONS,
   RAIL_STATION_INFO,
   buildRailPredictionsUrl,
+  buildStationTimesUrl,
 } from "./endpoints";
 
 export type {
@@ -30,8 +31,12 @@ export type {
   ElevatorIncident,
   Station,
   StationAddress,
+  StationTrainTime,
+  DayStationTimes,
+  StationTimes,
   PredictionsResponse,
   IncidentsResponse,
   ElevatorIncidentsResponse,
   StationsResponse,
+  StationTimesResponse,
 } from "./types";

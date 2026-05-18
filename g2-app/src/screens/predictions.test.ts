@@ -30,15 +30,19 @@ import {
   type TextContainerUpgrade,
 } from "@evenrealities/even_hub_sdk";
 import {
+  LAST_TRAIN_HOUR,
   MAX_VISIBLE_TRAINS,
   STALE_THRESHOLD_MS,
   TICK_INTERVAL_MS,
   formatClock,
   isStale,
   makePredictionsScreen,
+  pickLastTrainTime,
   renderFooter,
   renderHeader,
+  renderLastTrainRow,
   renderTrainRow,
+  shouldShowLastTrain,
   sortTrainsForDisplay,
   type PredictionsFetchResult,
   type PredictionsSnapshot,
@@ -90,13 +94,14 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     fetchError: null,
     consecutiveFetchFailures: 0,
     incidentHeadline: null,
+    lastTrainToday: null,
     ...over,
   };
 }
 
 /** A noop fetcher — handy for screens that we never tick in a test. */
 const noopFetcher = (): Promise<PredictionsFetchResult> =>
-  Promise.resolve({ trains: [], incidentHeadline: null });
+  Promise.resolve({ trains: [], incidentHeadline: null, lastTrainToday: null });
 
 // ---------------------------------------------------------------------------
 // formatClock
@@ -708,6 +713,7 @@ describe("predictions tick", () => {
       Promise.resolve<PredictionsFetchResult>({
         trains: fixture,
         incidentHeadline: "Single-tracking RD",
+        lastTrainToday: null,
       });
     const screen = makePredictionsScreen(
       fetcher,
@@ -747,7 +753,11 @@ describe("predictions tick", () => {
     const fetcher = (): Promise<PredictionsFetchResult> =>
       shouldFail
         ? Promise.reject(new Error("boom"))
-        : Promise.resolve({ trains: [], incidentHeadline: null });
+        : Promise.resolve({
+            trains: [],
+            incidentHeadline: null,
+            lastTrainToday: null,
+          });
     const screen = makePredictionsScreen(
       fetcher,
       snap({ consecutiveFetchFailures: 2 }),
@@ -766,6 +776,181 @@ describe("predictions tick", () => {
     const screen = makePredictionsScreen(noopFetcher, snap({}));
     expect(screen.tickIntervalMs).toBe(TICK_INTERVAL_MS);
     expect(screen.tickIntervalMs).toBe(20_000);
+  });
+
+  it("folds lastTrainToday into the snapshot from the fetcher result", async () => {
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      Promise.resolve({
+        trains: [],
+        incidentHeadline: null,
+        lastTrainToday: "23:47",
+      });
+    const screen = makePredictionsScreen(fetcher, snap({}));
+    const next = await screen.tick(screen.init());
+    expect(next.lastTrainToday).toBe("23:47");
+  });
+
+  it("preserves prior lastTrainToday when the fetcher reports null", async () => {
+    // Use case: the schedule cache is warm from a prior tick; the
+    // current tick's fetcher couldn't update it (e.g. transient
+    // jStationTimes blip) and returns null. We should keep the
+    // last-known time rather than blinking the row off.
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      Promise.resolve({
+        trains: [],
+        incidentHeadline: null,
+        lastTrainToday: null,
+      });
+    const screen = makePredictionsScreen(
+      fetcher,
+      snap({ lastTrainToday: "23:47" }),
+    );
+    const next = await screen.tick(screen.init());
+    expect(next.lastTrainToday).toBe("23:47");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Last-train glance (A3)
+// ---------------------------------------------------------------------------
+
+describe("shouldShowLastTrain", () => {
+  it("returns false during the morning rush (08:00)", () => {
+    const t = new Date(2026, 4, 18, 8, 0, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(false);
+  });
+
+  it("returns false at 20:59 (just before the threshold)", () => {
+    const t = new Date(2026, 4, 18, 20, 59, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(false);
+  });
+
+  it("returns true exactly at LAST_TRAIN_HOUR (21:00)", () => {
+    const t = new Date(2026, 4, 18, LAST_TRAIN_HOUR, 0, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(true);
+  });
+
+  it("returns true at 23:30", () => {
+    const t = new Date(2026, 4, 18, 23, 30, 0).getTime();
+    expect(shouldShowLastTrain(t)).toBe(true);
+  });
+
+  it("returns false for epoch-0 / NaN", () => {
+    expect(shouldShowLastTrain(0)).toBe(false);
+    expect(shouldShowLastTrain(Number.NaN)).toBe(false);
+  });
+});
+
+describe("pickLastTrainTime", () => {
+  it("returns null for an empty list", () => {
+    expect(pickLastTrainTime([])).toBeNull();
+  });
+
+  it("returns the latest PM time across the list", () => {
+    expect(
+      pickLastTrainTime([
+        { Time: "21:30" },
+        { Time: "23:47" },
+        { Time: "22:15" },
+      ]),
+    ).toBe("23:47");
+  });
+
+  it("ignores AM times (they signify the next day per WMATA docs)", () => {
+    // 01:30 is an AM entry — WMATA puts these in LastTrains[] when
+    // service crosses midnight. We want the latest PM entry, not
+    // tomorrow morning.
+    expect(
+      pickLastTrainTime([
+        { Time: "23:47" },
+        { Time: "01:30" },
+      ]),
+    ).toBe("23:47");
+  });
+
+  it("returns null when every entry is AM", () => {
+    expect(
+      pickLastTrainTime([{ Time: "01:30" }, { Time: "02:15" }]),
+    ).toBeNull();
+  });
+
+  it("ignores malformed entries", () => {
+    expect(
+      pickLastTrainTime([
+        { Time: "" },
+        { Time: "not-a-time" },
+        { Time: "22:15" },
+      ]),
+    ).toBe("22:15");
+  });
+});
+
+describe("renderLastTrainRow", () => {
+  const EVENING = new Date(2026, 4, 18, 22, 30, 0).getTime();
+  const MORNING = new Date(2026, 4, 18, 8, 30, 0).getTime();
+
+  it("returns null before the late-night window", () => {
+    expect(
+      renderLastTrainRow(snap({ lastTrainToday: "23:47" }), MORNING),
+    ).toBeNull();
+  });
+
+  it("returns null when lastTrainToday is missing", () => {
+    expect(renderLastTrainRow(snap({ lastTrainToday: null }), EVENING)).toBeNull();
+    expect(renderLastTrainRow(snap({ lastTrainToday: "" }), EVENING)).toBeNull();
+  });
+
+  it("renders `Last train: HH:MM` when both conditions are met", () => {
+    const out = renderLastTrainRow(
+      snap({ lastTrainToday: "23:47" }),
+      EVENING,
+    );
+    expect(out).toBe("Last train: 23:47");
+    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+  });
+});
+
+describe("predictions view: late-night last-train row", () => {
+  const EVENING = new Date(2026, 4, 18, 22, 30, 0).getTime();
+  const EVENING_CTX: ViewContext = { nowMs: EVENING };
+
+  it("appends the row at the end of the body when after LAST_TRAIN_HOUR", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: [train({ Line: "RD", Min: "5" })],
+        lastTrainToday: "23:47",
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
+    expectFits(lines);
+    expect(lines[lines.length - 1]).toBe("Last train: 23:47");
+  });
+
+  it("does NOT append the row before LAST_TRAIN_HOUR", () => {
+    // CTX (above) is the canonical 14:32 fixture.
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: [train({ Line: "RD", Min: "5" })],
+        lastTrainToday: "23:47",
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), CTX);
+    expectFits(lines);
+    expect(lines.some((l) => l.includes("Last train"))).toBe(false);
+  });
+
+  it("does NOT append the row when lastTrainToday is null (data not loaded yet)", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: [train({ Line: "RD", Min: "5" })],
+        lastTrainToday: null,
+      }),
+    );
+    const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
+    expect(lines.some((l) => l.includes("Last train"))).toBe(false);
   });
 });
 
@@ -796,6 +981,7 @@ describe("predictions: stale check uses ctx.nowMs (not the snapshot)", () => {
       Promise.resolve<PredictionsFetchResult>({
         trains: [],
         incidentHeadline: null,
+        lastTrainToday: null,
       });
     const screen = makePredictionsScreen(fetcher, s1);
     // Pin Date.now() so the tick stamps fetchedAt deterministically.

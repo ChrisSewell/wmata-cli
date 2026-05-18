@@ -23,3 +23,15 @@ export const RAIL_STATION_INFO = `${BASE}/Rail.svc/json/jStationInfo`;
 export function buildRailPredictionsUrl(stationCodes: string): string {
   return `${BASE}/StationPrediction.svc/json/GetPrediction/${stationCodes}`;
 }
+
+/**
+ * Build the `jStationTimes` URL for a specific station. The
+ * `StationCode` query parameter is technically optional per the
+ * WMATA docs (omitting it returns every station), but the only
+ * caller of this URL is the per-station last-train cache, so we
+ * always pass the code.
+ */
+export function buildStationTimesUrl(stationCode: string): string {
+  const params = new URLSearchParams({ StationCode: stationCode });
+  return `${BASE}/Rail.svc/json/jStationTimes?${params.toString()}`;
+}

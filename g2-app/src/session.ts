@@ -32,6 +32,7 @@ import {
   WmataError,
   INCIDENTS_ELEVATOR,
   INCIDENTS_RAIL,
+  buildStationTimesUrl,
   getStations as fetchStations,
   type ElevatorIncident,
   type ElevatorIncidentsResponse,
@@ -39,6 +40,8 @@ import {
   type LineCode,
   type RailIncident,
   type Station,
+  type StationTimes,
+  type StationTimesResponse,
 } from "./wmata";
 import { parseLinesAffected } from "./wmata/incidents-cache";
 
@@ -279,6 +282,50 @@ class ElevatorIncidentsCache {
 }
 
 // ---------------------------------------------------------------------------
+// StationTimesCache (internal)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazy per-station schedule cache, scoped to one `WmataClient`.
+ *
+ * WMATA's station schedule (`jStationTimes`) changes only on pick
+ * days (rare; usually every ~6 months). For the lifetime of one
+ * glasses session it's effectively immutable — fetch once, never
+ * again. This cache lazy-loads on the first `get(code)` call and
+ * returns the same value for all subsequent calls.
+ *
+ * Failure path: a fetch error is NOT cached. Returns `null` and the
+ * next call retries. That way a transient network blip on the first
+ * load doesn't lock the user out of the last-train glance for the
+ * remainder of the session.
+ */
+class StationTimesCache {
+  private readonly byCode = new Map<string, StationTimes>();
+
+  constructor(private readonly client: WmataClient) {}
+
+  async get(code: string): Promise<StationTimes | null> {
+    const trimmed = code.toUpperCase().trim();
+    const cached = this.byCode.get(trimmed);
+    if (cached) return cached;
+    try {
+      const data = await this.client.get<StationTimesResponse>(
+        buildStationTimesUrl(trimmed),
+      );
+      const times = data.StationTimes?.[0] ?? null;
+      if (times) {
+        this.byCode.set(trimmed, times);
+        return times;
+      }
+      return null;
+    } catch {
+      // Do NOT cache a failed lookup — the next call retries.
+      return null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -294,6 +341,7 @@ export class Session {
   private readonly stationsCache: StationsCache;
   private readonly incidentsCache: IncidentsCache;
   private readonly elevatorIncidentsCache: ElevatorIncidentsCache;
+  private readonly stationTimesCache: StationTimesCache;
 
   /**
    * Build a Session from an API key (production path) or from a
@@ -311,6 +359,7 @@ export class Session {
     this.stationsCache = new StationsCache(this.client);
     this.incidentsCache = new IncidentsCache(this.client);
     this.elevatorIncidentsCache = new ElevatorIncidentsCache(this.client);
+    this.stationTimesCache = new StationTimesCache(this.client);
   }
 
   // -- Stations -------------------------------------------------------------
@@ -359,5 +408,16 @@ export class Session {
     userStationCodes: readonly string[],
   ): Promise<CachedElevatorIncidents> {
     return this.elevatorIncidentsCache.refresh(userStationCodes);
+  }
+
+  // -- Station schedule (jStationTimes) -------------------------------------
+
+  /**
+   * Lazy-load a single station's schedule. Returns `null` on fetch
+   * failure or if the station isn't found. The result is cached for
+   * the rest of the session — call again is free.
+   */
+  getStationTimes(code: string): Promise<StationTimes | null> {
+    return this.stationTimesCache.get(code);
   }
 }

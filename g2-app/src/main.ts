@@ -33,7 +33,7 @@ import {
   makeElevatorScreen,
   makeInitialElevatorSnapshot,
 } from "./screens/elevator";
-import { makePredictionsScreen } from "./screens/predictions";
+import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
 import { createSttEngine, makeVoiceScreen } from "./screens/voice";
@@ -97,6 +97,39 @@ function computeAffectedLines(
     }
   }
   return Array.from(out);
+}
+
+/** Day-of-week key for indexing into a `StationTimes` schedule. */
+const WEEKDAY_KEYS = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+] as const;
+
+/**
+ * Read the latest scheduled departure time from `code`'s
+ * `LastTrains[]` for today's day-of-week. Returns `null` on any
+ * failure (cache miss, unknown station, network blip). The session
+ * cache makes calls after the first one essentially free.
+ */
+async function readLastTrainToday(
+  session: Session,
+  code: string,
+): Promise<string | null> {
+  try {
+    const times = await session.getStationTimes(code);
+    if (!times) return null;
+    const today = WEEKDAY_KEYS[new Date().getDay()];
+    const day = times[today];
+    if (!day) return null;
+    return pickLastTrainTime(day.LastTrains ?? []);
+  } catch {
+    return null;
+  }
 }
 
 async function bootGlasses(): Promise<void> {
@@ -211,9 +244,19 @@ async function bootGlasses(): Promise<void> {
             // Predictions — useful side effect.
             const data = await session.client.get<PredictionsResponse>(url);
             await session.refreshIncidents(stationServedLines);
+            // Last-train lookup is a separate HTTP call, but the
+            // session cache makes calls beyond the first one free —
+            // so a 20s refresh tick only pays the network cost on
+            // the very first tick of a glasses session for any given
+            // station.
+            const lastTrainToday = await readLastTrainToday(
+              session,
+              intent.stationCode,
+            );
             return {
               trains: data.Trains ?? [],
               incidentHeadline: readFirstIncidentHeadline(session),
+              lastTrainToday,
             };
           };
 
@@ -232,6 +275,9 @@ async function bootGlasses(): Promise<void> {
             // one-tick blink between mount and the first fetcher
             // resolution.
             incidentHeadline: readFirstIncidentHeadline(session),
+            // null = not yet loaded; the first tick fills it in. The
+            // late-night row hides until then.
+            lastTrainToday: null,
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);

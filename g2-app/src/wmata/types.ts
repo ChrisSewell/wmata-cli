@@ -113,6 +113,47 @@ export interface Station {
   Address: StationAddress;
 }
 
+/**
+ * One scheduled-departure entry inside a `DayStationTimes.FirstTrains`
+ * or `DayStationTimes.LastTrains` array. Both arrays have the same
+ * shape. `Time` is `"HH:mm"`; `DestinationStation` is a station code.
+ *
+ * Per WMATA docs: AM times that appear in `LastTrains` signify the
+ * *next* calendar day — the trains run past midnight.
+ */
+export interface StationTrainTime {
+  Time: string;
+  DestinationStation: string;
+}
+
+/** Per-day-of-week schedule sub-object. */
+export interface DayStationTimes {
+  /** Station opening time, `"HH:mm"`. */
+  OpeningTime: string;
+  FirstTrains: StationTrainTime[];
+  LastTrains: StationTrainTime[];
+}
+
+/**
+ * Schedule for one station from `/Rail.svc/json/jStationTimes`.
+ *
+ * The seven weekday keys mirror the wire shape verbatim. Reading a
+ * specific day requires `times[weekdayName]` — see
+ * `weekdayKey(epochMs)` in the screen-side helper for the canonical
+ * mapping.
+ */
+export interface StationTimes {
+  Code: string;
+  StationName: string;
+  Monday: DayStationTimes;
+  Tuesday: DayStationTimes;
+  Wednesday: DayStationTimes;
+  Thursday: DayStationTimes;
+  Friday: DayStationTimes;
+  Saturday: DayStationTimes;
+  Sunday: DayStationTimes;
+}
+
 // Response wrappers --------------------------------------------------------
 
 export interface PredictionsResponse {
@@ -125,6 +166,10 @@ export interface IncidentsResponse {
 
 export interface ElevatorIncidentsResponse {
   ElevatorIncidents: ElevatorIncident[];
+}
+
+export interface StationTimesResponse {
+  StationTimes: StationTimes[];
 }
 
 export interface StationsResponse {
