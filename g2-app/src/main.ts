@@ -28,10 +28,12 @@ import {
 } from "./screens/incidents";
 import { makePredictionsScreen } from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
+import { createSttEngine, makeVoiceScreen } from "./screens/voice";
 import {
   WmataClient,
   buildRailPredictionsUrl,
   resolveStationCode,
+  searchStations,
   type PredictionsResponse,
 } from "./wmata";
 import {
@@ -161,7 +163,32 @@ async function bootGlasses(): Promise<void> {
           return;
         }
         case "voice": {
-          console.log(`[router] voice screen not yet implemented in WP6`);
+          if (unmount) {
+            await unmount();
+            unmount = null;
+          }
+          // The STT engine is the only WMATA-unrelated dependency this
+          // screen needs. `createSttEngine` intentionally throws today
+          // — see `src/screens/voice.ts` for the wiring TODO. We catch
+          // here so the user gets a clear error phase on the HUD
+          // rather than an uncaught exception in the router.
+          let stt;
+          try {
+            stt = createSttEngine(loadSettings().apiKey);
+          } catch (err) {
+            console.warn(`[router] createSttEngine failed:`, err);
+            // Bounce back to Home rather than mounting a half-broken
+            // page. The Home screen's footer is the natural recovery
+            // surface (and the user can re-attempt or change settings).
+            await router.navigate({ to: "home" });
+            return;
+          }
+          const screen = makeVoiceScreen(
+            stt,
+            (q: string) => searchStations(client, q),
+          );
+          router.current = "voice";
+          unmount = await mountGlassesScreen(screen, bridge, router);
           return;
         }
       }

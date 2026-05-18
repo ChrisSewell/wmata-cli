@@ -466,7 +466,7 @@ export function makeIncidentsScreen(
       for (const r of decorated) lines.push(truncate(r, LINE_WIDTH));
       return lines;
     },
-    reduce(snapshot, nav, event: ScreenEvent): ReduceResult {
+    reduce(snapshot, nav, event: ScreenEvent): ReduceResult<IncidentsSnapshot> {
       const body = flattenBlocks(snapshot.preformatted);
       const maxOffset = Math.max(0, body.length - 1);
       const offset = clamp(nav.highlightedIndex, maxOffset);
@@ -483,6 +483,11 @@ export function makeIncidentsScreen(
             nav: { highlightedIndex: offset },
             navigate: { to: "home" },
           };
+        default:
+          // Voice-flow events (TRANSCRIPT, RESOLVE_RESULT, etc.) are
+          // never dispatched against the Incidents screen; absorb them
+          // as a no-op so the reducer stays total over `ScreenEvent`.
+          return { nav: { highlightedIndex: offset } };
       }
     },
     /**

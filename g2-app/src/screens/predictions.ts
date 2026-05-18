@@ -297,10 +297,15 @@ export function makePredictionsScreen(
       if (footer !== null) lines.push(footer);
       return lines;
     },
-    reduce(_snapshot, nav, event: ScreenEvent): ReduceResult {
+    reduce(_snapshot, nav, event: ScreenEvent): ReduceResult<PredictionsSnapshot> {
       // Predictions is a glanceable screen: SCROLL_UP/DOWN and TAP have
       // no meaning here. DOUBLE_TAP navigates BACK to Home (not "exit")
       // — that's the new behaviour for non-root screens.
+      //
+      // The voice-flow event variants (TRANSCRIPT, RESOLVE_RESULT, etc.)
+      // are dispatched only by the Voice screen's `onMount` glue; they
+      // arrive at this reducer only via a programming error. The default
+      // branch absorbs them as a no-op so the contract stays total.
       switch (event.type) {
         case "SCROLL_UP":
         case "SCROLL_DOWN":
@@ -308,6 +313,8 @@ export function makePredictionsScreen(
           return { nav };
         case "DOUBLE_TAP":
           return { nav, navigate: { to: "home" } };
+        default:
+          return { nav };
       }
     },
     /**

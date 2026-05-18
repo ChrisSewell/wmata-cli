@@ -298,6 +298,43 @@ export async function mountGlassesScreen<S>(
     console.warn(`[glasses-host] createStartUpPageContainer threw:`, err);
   }
 
+  /**
+   * Async-event dispatch for screens that need to push `ScreenEvent`s
+   * from a callback (e.g. the Voice screen's STT subscriber). Mirrors
+   * the touchpad event path: reduce the snapshot, apply any returned
+   * snapshot replacement, fire any navigation intent, then re-render.
+   * Ignored after unmount.
+   */
+  const dispatch = (event: ScreenEvent): void => {
+    if (!active) return;
+    const result = screen.reduce(snapshot, nav, event);
+    nav = result.nav;
+    // A reducer may return a fresh snapshot (e.g. Voice folds a new
+    // transcript into `snapshot.transcript`). When present, apply it
+    // before the re-render so `view` sees the updated state.
+    if (result.snapshot !== undefined) {
+      snapshot = result.snapshot;
+    }
+    const intent = result.navigate;
+    if (intent) {
+      void render().then(() => router.navigate(intent));
+      return;
+    }
+    void render();
+  };
+
+  // Optional: side-effect setup tied to the screen's lifetime. The
+  // Voice screen uses this to flip the microphone on and start its STT
+  // stream. Errors are swallowed (logged) so a misbehaving screen
+  // cannot strand the user on an unmountable page.
+  if (screen.onMount) {
+    try {
+      await screen.onMount(bridge, dispatch);
+    } catch (err) {
+      console.warn(`[glasses-host] onMount threw:`, err);
+    }
+  }
+
   // Run one tick (fetch + re-render).
   //
   // Defensive try/catch: a screen's `tick` is contracted not to throw,
@@ -369,18 +406,10 @@ export async function mountGlassesScreen<S>(
     const screenEvent = eventToScreenEvent(event);
     if (!screenEvent) return;
 
-    const result = screen.reduce(snapshot, nav, screenEvent);
-    nav = result.nav;
-
-    const intent = result.navigate;
-    if (intent) {
-      // We re-render BEFORE the router decides what to do, so the user
-      // sees an immediate "Loading…"-style transition if the router is
-      // slow. The router itself is in charge of replacing/keeping us.
-      void render().then(() => router.navigate(intent));
-      return;
-    }
-    void render();
+    // Route touchpad gestures through the same `dispatch` path as
+    // screen-driven async events (e.g. the Voice screen's STT
+    // callbacks). This keeps re-render / navigation logic in one place.
+    dispatch(screenEvent);
   });
 
   const unmount = async (): Promise<void> => {
@@ -408,6 +437,17 @@ export async function mountGlassesScreen<S>(
       unsubscribe();
     } catch (err) {
       console.warn(`[glasses-host] unsubscribe threw:`, err);
+    }
+    // Optional: side-effect teardown tied to the screen's lifetime.
+    // Runs BEFORE `shutDownPageContainer` so the screen can flush any
+    // in-flight resources (e.g. closing the STT socket) while the page
+    // is still around.
+    if (screen.onUnmount) {
+      try {
+        await screen.onUnmount(bridge);
+      } catch (err) {
+        console.warn(`[glasses-host] onUnmount threw:`, err);
+      }
     }
     try {
       await bridge.shutDownPageContainer(0);

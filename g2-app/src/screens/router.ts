@@ -28,12 +28,25 @@
  * Touchpad / lifecycle event, after the host has normalised away the
  * SDK's three event envelopes (sysEvent / textEvent / listEvent) and the
  * Protobuf zero-value caveat (`undefined === CLICK_EVENT`).
+ *
+ * In addition to the four touchpad gestures, the host can forward
+ * voice-flow events emitted by a screen's `onMount` glue (e.g. the
+ * Voice screen subscribes to its injected `SttEngine` and dispatches
+ * `TRANSCRIPT` / `TRANSCRIPT_SILENCE` / `RESOLVE_RESULT` /
+ * `RESOLVE_ERROR` through `dispatch`). Screens that don't care about
+ * the voice-flow variants simply ignore them in their reducer's
+ * `default` branch — the `Screen<S>` contract requires every reducer to
+ * be total over `ScreenEvent`, including future additions.
  */
 export type ScreenEvent =
   | { type: "SCROLL_UP" }
   | { type: "SCROLL_DOWN" }
   | { type: "TAP" }
-  | { type: "DOUBLE_TAP" };
+  | { type: "DOUBLE_TAP" }
+  | { type: "TRANSCRIPT"; text: string; isFinal: boolean }
+  | { type: "TRANSCRIPT_SILENCE" }
+  | { type: "RESOLVE_RESULT"; matches: import("../wmata").Station[] }
+  | { type: "RESOLVE_ERROR"; message: string };
 
 /**
  * Per-screen UI cursor state. Lives outside the snapshot so we can
@@ -55,10 +68,28 @@ export type NavIntent =
   | { to: "voice" }
   | { to: "exit" };
 
-/** Result of a reducer step. */
-export interface ReduceResult {
+/**
+ * Result of a reducer step.
+ *
+ * The optional `snapshot` field lets a reducer return a NEW snapshot
+ * value (e.g. the Voice screen folds a fresh transcript into
+ * `snapshot.transcript` on every `TRANSCRIPT` event). Most reducers
+ * leave it unset — touchpad gestures that only move the highlight
+ * cursor don't need to allocate a new snapshot.
+ *
+ * The host treats `snapshot === undefined` as "keep the previous
+ * snapshot reference"; an explicit `snapshot` replaces the host's
+ * stored value before the next render.
+ *
+ * `Snapshot` defaults to `unknown` so reducers that never produce a
+ * snapshot field can use the bare `ReduceResult` type at their call
+ * site. Concrete screens parameterise with their own snapshot type
+ * to get full type-safety on the field.
+ */
+export interface ReduceResult<Snapshot = unknown> {
   nav: NavState;
   navigate?: NavIntent;
+  snapshot?: Snapshot;
 }
 
 /**
@@ -107,6 +138,37 @@ export interface Screen<Snapshot> {
   /** Build the initial snapshot. Pure: no SDK, no I/O. */
   init(): Snapshot;
   /**
+   * Optional: called once by the host after the page container is
+   * created, BEFORE any tick or clock-render. Use for SDK side effects
+   * that are tied to the screen's lifetime — e.g. the Voice screen
+   * enables the microphone here (`bridge.audioControl(true)`) and
+   * starts its STT stream, wiring callbacks to `dispatch` so transcript
+   * updates flow through the reducer like any other event.
+   *
+   * The `dispatch` parameter forwards a `ScreenEvent` through the host's
+   * normal event path: `screen.reduce(snapshot, nav, event)` is invoked,
+   * the resulting snapshot is applied, and a re-render is queued — so
+   * the reducer stays pure even though the event source is asynchronous.
+   *
+   * Best-effort: errors are caught by the host and logged but do not
+   * block the page from mounting (the user can always double-tap out).
+   */
+  onMount?: (
+    bridge: import("@evenrealities/even_hub_sdk").EvenAppBridge,
+    dispatch: (event: ScreenEvent) => void,
+  ) => Promise<void>;
+  /**
+   * Optional: called once by the host during `unmount`, before
+   * `shutDownPageContainer`. Use for cleanup tied to the screen's
+   * lifetime — e.g. the Voice screen disables the microphone
+   * (`bridge.audioControl(false)`) and stops its STT stream.
+   *
+   * Best-effort: errors are caught by the host and logged.
+   */
+  onUnmount?: (
+    bridge: import("@evenrealities/even_hub_sdk").EvenAppBridge,
+  ) => Promise<void>;
+  /**
    * Render the screen into ≤ TOTAL_ROWS lines, each ≤ LINE_WIDTH cols.
    *
    * `ctx.nowMs` is freshly stamped by the host on EVERY render —
@@ -115,8 +177,19 @@ export interface Screen<Snapshot> {
    * Screens with no time-sensitive UI can ignore `ctx`.
    */
   view(snapshot: Snapshot, nav: NavState, ctx: ViewContext): string[];
-  /** Pure reducer over (snapshot, nav, event). */
-  reduce(snapshot: Snapshot, nav: NavState, event: ScreenEvent): ReduceResult;
+  /**
+   * Pure reducer over (snapshot, nav, event).
+   *
+   * Returning `snapshot` in the result replaces the host's stored
+   * snapshot before the next render — used by the Voice screen to
+   * fold STT-driven `TRANSCRIPT` events into the snapshot without
+   * giving the reducer a side-channel.
+   */
+  reduce(
+    snapshot: Snapshot,
+    nav: NavState,
+    event: ScreenEvent,
+  ): ReduceResult<Snapshot>;
   /**
    * Optional: called by the host on mount and then on the
    * `tickIntervalMs` cadence. Must NOT throw — fetch errors should be

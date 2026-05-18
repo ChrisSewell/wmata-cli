@@ -334,7 +334,7 @@ export function makeHomeScreen(
       lines.push(renderVoiceRow(isVoiceIndex(clamped, idx)));
       return lines;
     },
-    reduce(snapshot, nav, event): ReduceResult {
+    reduce(snapshot, nav, event): ReduceResult<HomeSnapshot> {
       const clamped = clampedSnapshot(snapshot);
       const total = rowCount(clamped);
       const idx = clampIndex(nav.highlightedIndex, total);
@@ -370,6 +370,12 @@ export function makeHomeScreen(
             nav: { highlightedIndex: idx },
             navigate: { to: "exit" },
           };
+        }
+        default: {
+          // Voice-flow events (TRANSCRIPT, RESOLVE_RESULT, etc.) are
+          // never dispatched against the Home screen; absorb them as a
+          // no-op so the reducer stays total over `ScreenEvent`.
+          return { nav: { highlightedIndex: idx } };
         }
       }
     },
