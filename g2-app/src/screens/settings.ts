@@ -83,6 +83,17 @@ interface ScreenState {
    */
   favoritesNotice: string | null;
   favoritesNoticeTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Tracks `state.favorites.length` from the *previous* render of the
+   * favorites card. Used to detect the 0 -> 1 transition so we can give
+   * the "Done — launch on glasses" button a brief attention-grabbing
+   * class on the render right after the user adds their first favorite.
+   *
+   * Initialised to the loaded favorites count so the highlight does NOT
+   * fire on the very first render (the user didn't just add a favorite —
+   * they reloaded the page).
+   */
+  favoritesCountAtLastRender: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +192,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     searchQuery: '',
     favoritesNotice: null,
     favoritesNoticeTimer: null,
+    favoritesCountAtLastRender: initial.favorites.length,
   };
 
   // Container & layout shell ------------------------------------------------
@@ -242,6 +254,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     state.searchError = null;
     state.searchQuery = '';
     state.favoritesNotice = null;
+    state.favoritesCountAtLastRender = 0;
     renderApiKeyCard();
     renderFavoritesCard();
   };
@@ -641,6 +654,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     }
 
     // Favorites list -----------------------------------------------------
+    const previousCount = state.favoritesCountAtLastRender;
     favoritesMount.appendChild(
       el('h3', { class: 'wmata-settings__card-title' }, [
         `Your favorites (${String(state.favorites.length)}/${String(MAX_FAVORITES)})`,
@@ -737,6 +751,52 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
       });
       favoritesMount.appendChild(favList);
     }
+
+    // Done — launch on glasses --------------------------------------------
+    //
+    // Surface a prominent action at the bottom of the favorites card so
+    // the user has an obvious way to "finish here and move to the
+    // glasses HUD" without manually reloading the page. The handoff is
+    // intentionally a `window.location.reload()` — simple and reliable;
+    // the boot logic in `main.ts` re-evaluates the settings on every
+    // start and routes to the glasses Home screen when a key is saved
+    // and favorites are present.
+    //
+    // The button is hidden when either prerequisite is missing (no key
+    // accepted OR zero favorites), because the glasses route would be a
+    // dead-end in that state.
+    //
+    // The 0 -> 1 favorites transition triggers a brief class toggle
+    // (`wmata-settings__button--attention`) so the button visually
+    // announces itself on the same render where it first appears.
+    // The class is cleared on the next render to avoid the highlight
+    // becoming permanent.
+    if (state.keyAccepted && state.favorites.length > 0) {
+      const justGotFirstFavorite =
+        previousCount === 0 && state.favorites.length >= 1;
+      const doneBtn = el(
+        'button',
+        {
+          type: 'button',
+          class: justGotFirstFavorite
+            ? 'wmata-settings__button wmata-settings__button--primary wmata-settings__button--done wmata-settings__button--attention'
+            : 'wmata-settings__button wmata-settings__button--primary wmata-settings__button--done',
+          'data-testid': 'wmata-settings-done',
+          'aria-label': 'Done. Launch on glasses.',
+        },
+        ['Done — launch on glasses'],
+      );
+      doneBtn.addEventListener('click', () => {
+        window.location.reload();
+      });
+      favoritesMount.appendChild(
+        el('div', { class: 'wmata-settings__done-row' }, [doneBtn]),
+      );
+    }
+
+    // Update the previous-count tracker AFTER this render so the next
+    // render compares against this one.
+    state.favoritesCountAtLastRender = state.favorites.length;
   }
 
   // Initial render --------------------------------------------------------

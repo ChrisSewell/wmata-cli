@@ -128,3 +128,32 @@ describe("abbreviateStation", () => {
     expect(STATION_ABBREVIATIONS["NoMa-Gallaudet U"]).toBe("NoMa");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Width budget invariant: every abbreviation must fit NAME_WIDTH (10 cols).
+// Anything longer is invisibly truncated with `…` at render time, which
+// defeats the purpose of having a hand-tuned abbreviation. This guard
+// fails CI if a future edit drifts an entry past the budget.
+// ---------------------------------------------------------------------------
+
+describe("STATION_ABBREVIATIONS width budget", () => {
+  // NAME_WIDTH is defined in screens/home.ts as the abbreviated-name
+  // column width on the Home screen (10). It is the *narrowest* place an
+  // abbreviation is rendered, so it is the binding constraint here.
+  // We hard-code the value (with this comment) rather than reaching
+  // across to home.ts to keep ui/format.ts free of screen-layer
+  // dependencies. If the column ever widens, bump this value first.
+  const ABBREV_BUDGET = 10;
+
+  it("keeps every value at or below the NAME_WIDTH (10) budget", () => {
+    const offenders: Array<{ key: string; value: string; len: number }> = [];
+    for (const [key, value] of Object.entries(STATION_ABBREVIATIONS)) {
+      if (value.length > ABBREV_BUDGET) {
+        offenders.push({ key, value, len: value.length });
+      }
+    }
+    // Surface ALL offenders in the failure message at once so a single
+    // failing assertion shows the maintainer the full list to fix.
+    expect(offenders).toEqual([]);
+  });
+});

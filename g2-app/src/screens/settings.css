@@ -321,6 +321,37 @@
 }
 
 /* --------------------------------------------------------------------- */
+/* Done — launch on glasses                                              */
+/* --------------------------------------------------------------------- */
+
+.wmata-settings__done-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.wmata-settings__button--done {
+  width: 100%;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 14px 18px;
+  min-height: 52px;
+}
+
+/* Brief attention-grabbing highlight applied on the 0 -> 1 transition.
+ * The animation auto-disables after one cycle; the class is also cleared
+ * on the next render so the button settles into its normal appearance. */
+@keyframes wmata-settings-done-pulse {
+  0%   { box-shadow: 0 0 0 0   rgba(122, 168, 255, 0.45); }
+  50%  { box-shadow: 0 0 0 10px rgba(122, 168, 255, 0.0); }
+  100% { box-shadow: 0 0 0 0   rgba(122, 168, 255, 0.0); }
+}
+
+.wmata-settings__button--attention {
+  animation: wmata-settings-done-pulse 1.4s ease-out 2;
+}
+
+/* --------------------------------------------------------------------- */
 /* Footer                                                                */
 /* --------------------------------------------------------------------- */
 

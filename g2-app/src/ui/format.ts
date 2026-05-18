@@ -5,6 +5,23 @@
 // `format_min` and similar helpers used by rail_predictions.py. The
 // glasses surface has even tighter width constraints than the CLI, so
 // `abbreviateStation` is also defined here.
+//
+// Abbreviation length budget (per WP6 Reviewer):
+//
+//   Every value in `STATION_ABBREVIATIONS` must be ≤ NAME_WIDTH (10)
+//   columns. Anything longer is invisibly truncated with `…` at render
+//   time, which defeats the purpose of having a hand-tuned abbreviation.
+//   The fix-up pass shortened these entries:
+//
+//     "Federal Triangle"  "Fed Triangle" (12) -> "Fed Tri"    (7)
+//     "Morgan Boulevard"  "Morgan Blvd"  (11) -> "Morgan Bv"  (9)
+//     "Virginia Sq-GMU"   "Virginia Sq"  (11) -> "Virgnia Sq" (10)
+//     "Eastern Market"    "Eastern Mkt"  (11) -> "Eastern Mk" (10)
+//     "Smithsonian"       "Smithsonian"  (11) -> "Smithson"   (8)
+//
+//   The "Federal Center SW" entry was left as "Fed Center" (10) because
+//   it already fits within budget. A guard test in `format.test.ts`
+//   asserts the ≤ 10-char invariant so future entries can't drift.
 
 import type { LineCode } from "../wmata";
 import { ELLIPSIS, truncate } from "./render";
@@ -69,12 +86,12 @@ export const STATION_ABBREVIATIONS: Record<string, string> = {
   "U Street/African-Amer Civil War Memorial/Cardozo": "U Street",
   "Dupont Circle": "Dupont",
   "Foggy Bottom-GWU": "Foggy Btm",
-  "Federal Triangle": "Fed Triangle",
+  "Federal Triangle": "Fed Tri",
   "Federal Center SW": "Fed Center",
   "Capitol South": "Capitol S",
-  "Eastern Market": "Eastern Mkt",
+  "Eastern Market": "Eastern Mk",
   "Stadium-Armory": "Stadium",
-  Smithsonian: "Smithsonian",
+  Smithsonian: "Smithson",
   "McPherson Sq": "McPherson",
   "Metro Center": "Metro Ctr",
   "Judiciary Sq": "Judiciary",
@@ -106,7 +123,7 @@ export const STATION_ABBREVIATIONS: Record<string, string> = {
   McLean: "McLean",
   "Court House": "Court Hse",
   Clarendon: "Clarendon",
-  "Virginia Sq-GMU": "Virginia Sq",
+  "Virginia Sq-GMU": "Virgnia Sq",
   "Ballston-MU": "Ballston",
   Rosslyn: "Rosslyn",
   "Arlington Cemetery": "Arlington",
@@ -134,7 +151,7 @@ export const STATION_ABBREVIATIONS: Record<string, string> = {
   "Benning Rd": "Benning",
   "Capitol Heights": "Capitol H",
   "Addison Rd-Seat Pleasant": "Addison Rd",
-  "Morgan Boulevard": "Morgan Blvd",
+  "Morgan Boulevard": "Morgan Bv",
   Greenbelt: "Greenbelt",
   "College Park-U of Md": "College Pk",
   "Prince George's Plaza": "Prince Geo",

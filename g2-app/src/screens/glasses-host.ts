@@ -194,6 +194,32 @@ export async function mountGlassesScreen<S>(
   let active = true;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Single-flight tick guard.
+  //
+  // STRATEGY: SKIP (drop overlapping ticks).
+  //
+  // Background: the interval fires regardless of whether the previous
+  // tick has settled. On a slow network this would mean overlapping
+  // in-flight fetches racing each other to write to `snapshot`, with
+  // the later fetch arbitrarily winning (or losing). The WP7 Builder
+  // flagged this as a known gap.
+  //
+  // We pick SKIP over QUEUE-ONE because:
+  //   - Predictions are a "freshest wins" stream; if a fetch is in
+  //     flight when the next interval fires, the in-flight result is
+  //     already the freshest available — queuing a redundant fetch
+  //     would just compound the back-pressure that triggered the skip.
+  //   - SKIP keeps the rate-limit budget honest (WMATA's 10 req/s soft
+  //     cap): one fetch per `tickIntervalMs`, never more.
+  //   - QUEUE-ONE would still leave us racing if the user navigated
+  //     away mid-flight (we'd need to drop the queued tick anyway).
+  //
+  // We also use a *generation counter* (rather than a plain boolean) so
+  // that a tick whose fetch settles AFTER `unmount` was called can
+  // detect that it is stale and refuse to write to `snapshot`.
+  let inFlightTick = false;
+  let tickGeneration = 0;
+
   // Render-loop guard: ignore events that arrive after unmount.
   const render = async (): Promise<void> => {
     if (!active) return;
@@ -225,18 +251,39 @@ export async function mountGlassesScreen<S>(
     console.warn(`[glasses-host] createStartUpPageContainer threw:`, err);
   }
 
-  // Run one tick (fetch + re-render). Defensive try/catch: a screen's
-  // `tick` is contracted not to throw, but we treat the contract as
-  // best-effort so a buggy screen can't take down the page.
+  // Run one tick (fetch + re-render).
+  //
+  // Defensive try/catch: a screen's `tick` is contracted not to throw,
+  // but we treat the contract as best-effort so a buggy screen can't
+  // take down the page.
+  //
+  // Single-flight: if `inFlightTick` is set, drop this invocation on
+  // the floor (see strategy note above). If `unmount` is called while
+  // a tick is in flight, the post-await `generation !== tickGeneration`
+  // check ensures the late result is discarded — we never write to a
+  // snapshot that the unmount has already taken down.
   const runTick = async (): Promise<void> => {
     if (!active || !screen.tick) return;
+    if (inFlightTick) {
+      // A previous tick hasn't settled yet — drop this one rather than
+      // racing. The next interval firing will get a fresh shot.
+      return;
+    }
+    inFlightTick = true;
+    const myGeneration = tickGeneration;
     try {
       const next = await screen.tick(snapshot);
-      if (!active) return;
+      // Re-check after the await: if the host was unmounted (and thus
+      // `tickGeneration` was bumped) while we were waiting, do NOT
+      // apply this result to the snapshot — the snapshot is about to
+      // be discarded.
+      if (!active || myGeneration !== tickGeneration) return;
       snapshot = next;
       await render();
     } catch (err) {
       console.warn(`[glasses-host] tick threw:`, err);
+    } finally {
+      inFlightTick = false;
     }
   };
 
@@ -281,6 +328,10 @@ export async function mountGlassesScreen<S>(
   const unmount = async (): Promise<void> => {
     if (!active) return;
     active = false;
+    // Bump the generation so an in-flight tick can detect, when its
+    // fetch finally settles, that the host was unmounted in the
+    // meantime and refuse to write its result back into `snapshot`.
+    tickGeneration += 1;
     if (tickTimer !== null) {
       clearInterval(tickTimer);
       tickTimer = null;

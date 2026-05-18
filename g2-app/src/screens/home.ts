@@ -10,8 +10,15 @@
 //          Union Stn  RD
 //          VOICE LOOKUP
 //
-// Empty state (no favorites): a help message above a single
-// VOICE LOOKUP row.
+// Empty state (no favorites): exactly 4 rendered lines —
+//   1. header                ("WMATA — Favorites (0/5)")
+//   2. "No favorites yet."
+//   3. "Open phone to add."
+//   4. VOICE LOOKUP row (with the highlight prefix)
+//
+// The empty-state line count is locked at 4 by an assertion in the
+// home.test.ts suite (per the WP6 Reviewer's "lock per-screen line
+// counts to exact integers" pattern). Drift will fail CI.
 //
 // Width budget after the 2-char highlight prefix (`> ` or `  `):
 //   - 10 cols for the abbreviated station name
@@ -31,6 +38,7 @@
 // touches the bridge. That keeps `view` and `reduce` Vitest-friendly.
 
 import type { FavoriteStation } from "../storage/settings";
+import { MAX_FAVORITES } from "../storage/settings";
 import { LINE_WIDTH, highlightPrefix, padRight, truncate } from "../ui/render";
 import { abbreviateStation } from "../ui/format";
 import type { ReduceResult, Screen } from "./router";
@@ -41,8 +49,12 @@ import type { ReduceResult, Screen } from "./router";
 
 /** Width of the highlight prefix ("> " or "  ") in characters. */
 const PREFIX_WIDTH = 2;
-/** Width of the abbreviated-station-name cell. */
-const NAME_WIDTH = 10;
+/**
+ * Width of the abbreviated-station-name cell. Exported so that other
+ * modules (e.g. tests that audit the station-abbreviation map) can refer
+ * to the canonical budget rather than hard-coding `10`.
+ */
+export const NAME_WIDTH = 10;
 /** Width of the lines-suffix cell. */
 const LINES_WIDTH = LINE_WIDTH - PREFIX_WIDTH - NAME_WIDTH - 1; // = 11
 /** Maximum number of raw line codes shown verbatim before we collapse to `+N`. */
@@ -161,6 +173,20 @@ function clampIndex(idx: number, count: number): number {
 }
 
 /**
+ * Return a snapshot whose `favorites` list is clipped to at most
+ * `MAX_FAVORITES` entries. If the input is already within the cap, the
+ * original snapshot is returned by reference (zero allocation in the
+ * common case). This is a defensive guard for data-corruption paths
+ * (e.g. a future schema-migration bug that writes 6+ favorites): the
+ * screen should silently render only the first five, never throw or
+ * produce an oversized list.
+ */
+function clampedSnapshot(snapshot: HomeSnapshot): HomeSnapshot {
+  if (snapshot.favorites.length <= MAX_FAVORITES) return snapshot;
+  return { ...snapshot, favorites: snapshot.favorites.slice(0, MAX_FAVORITES) };
+}
+
+/**
  * The Home screen value. The host imports this and passes it into
  * `mountGlassesScreen(homeScreen, bridge, router)`.
  */
@@ -171,32 +197,37 @@ export function makeHomeScreen(
     name: "home",
     init: loader,
     view(snapshot, nav) {
+      // Defensive clamp: if a future migration / data-corruption bug
+      // hands us more than MAX_FAVORITES, render only the first slice
+      // rather than throwing or producing an oversized list. The same
+      // clamp is applied in `reduce()` via `rowCount`/`isVoiceIndex`,
+      // both of which call through `clampedSnapshot()`.
+      const clamped = clampedSnapshot(snapshot);
       const lines: string[] = [];
-      lines.push(renderHeader(snapshot.favorites.length));
+      lines.push(renderHeader(clamped.favorites.length));
 
-      if (snapshot.favorites.length === 0) {
-        // Empty state. The voice-lookup row is at index 0.
-        lines.push("");
+      if (clamped.favorites.length === 0) {
+        // Empty state — exactly 4 rendered lines:
+        //   header + "No favorites yet." + "Open phone to add." + voice
+        // The voice-lookup row is at index 0 in this state.
         lines.push(truncate("No favorites yet.", LINE_WIDTH));
-        lines.push("");
-        lines.push(truncate("Open the phone app to", LINE_WIDTH));
-        lines.push(truncate("add a station.", LINE_WIDTH));
-        lines.push("");
+        lines.push(truncate("Open phone to add.", LINE_WIDTH));
         lines.push(renderVoiceRow(nav.highlightedIndex === 0));
         return lines;
       }
 
-      const total = rowCount(snapshot);
+      const total = rowCount(clamped);
       const idx = clampIndex(nav.highlightedIndex, total);
-      for (let i = 0; i < snapshot.favorites.length; i++) {
-        const fav = snapshot.favorites[i]!;
+      for (let i = 0; i < clamped.favorites.length; i++) {
+        const fav = clamped.favorites[i]!;
         lines.push(renderFavoriteRow(fav, idx === i));
       }
-      lines.push(renderVoiceRow(idx === snapshot.favorites.length));
+      lines.push(renderVoiceRow(idx === clamped.favorites.length));
       return lines;
     },
     reduce(snapshot, nav, event): ReduceResult {
-      const total = rowCount(snapshot);
+      const clamped = clampedSnapshot(snapshot);
+      const total = rowCount(clamped);
       const idx = clampIndex(nav.highlightedIndex, total);
       switch (event.type) {
         case "SCROLL_UP": {
@@ -206,10 +237,10 @@ export function makeHomeScreen(
           return { nav: { highlightedIndex: clampIndex(idx + 1, total) } };
         }
         case "TAP": {
-          if (isVoiceIndex(snapshot, idx)) {
+          if (isVoiceIndex(clamped, idx)) {
             return { nav: { highlightedIndex: idx }, navigate: { to: "voice" } };
           }
-          const fav = snapshot.favorites[idx];
+          const fav = clamped.favorites[idx];
           if (!fav) {
             // Defensive — should be impossible given clamping above.
             return { nav: { highlightedIndex: idx } };

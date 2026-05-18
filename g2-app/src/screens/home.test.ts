@@ -123,12 +123,33 @@ describe("home view: empty favorites", () => {
     const snap = screen.init();
     const lines = screen.view(snap, initialNav());
     expectFits(lines);
-    // header + 5 help/spacing rows + voice = 7 lines (and ≤ TOTAL_ROWS).
-    expect(lines.length).toBeGreaterThanOrEqual(4);
-    expect(lines.length).toBeLessThanOrEqual(8);
+    // Exact line count is locked at 4 (per the WP6 Reviewer's "lock
+    // per-screen line counts to exact integers" pattern). Drift fails CI.
+    expect(lines.length).toBe(4);
     expect(lines[0]).toBe(renderHeader(0));
+    expect(lines[1]).toBe("No favorites yet.");
+    expect(lines[2]).toBe("Open phone to add.");
     const voiceLine = lines[lines.length - 1]!;
     expect(voiceLine).toContain(VOICE_LABEL);
+  });
+
+  it("renders the highlighted VOICE LOOKUP row with '> ' prefix when selected", () => {
+    const screen = makeHomeScreen(loaderFor([]));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 });
+    expect(lines.length).toBe(4);
+    // index 0 in the empty state is the voice row itself.
+    expect(lines[3]!.startsWith("> ")).toBe(true);
+  });
+
+  it("renders the unselected VOICE LOOKUP row with '  ' prefix when not selected", () => {
+    const screen = makeHomeScreen(loaderFor([]));
+    const snap = screen.init();
+    // Force a non-zero highlight (which the reducer would normally clamp,
+    // but `view` should still render the voice row as unselected).
+    const lines = screen.view(snap, { highlightedIndex: 99 });
+    expect(lines.length).toBe(4);
+    expect(lines[3]!.startsWith("  ")).toBe(true);
   });
 });
 
@@ -280,6 +301,91 @@ describe("home reduce: DOUBLE_TAP", () => {
       );
       expect(r.navigate).toEqual({ to: "exit" });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Edge cases the WP6 Reviewer surfaced (empty lines, empty name, duplicate
+// codes, favorites-over-cap clamp)
+// ---------------------------------------------------------------------------
+
+describe("home view: edge cases", () => {
+  it("renders an empty `lines: []` favorite as 11 spaces in the lines column (no crash)", () => {
+    const fav: FavoriteStation = {
+      code: "X01",
+      name: "Empty",
+      lines: [],
+    };
+    const screen = makeHomeScreen(loaderFor([fav]));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 });
+    expectFits(lines);
+    // The favorite row is exactly LINE_WIDTH cols wide, with the lines
+    // cell filled with 11 spaces (LINES_WIDTH = 11).
+    expect(lines.length).toBe(3); // header + 1 fav + voice
+    expect(lines[1]!.length).toBe(LINE_WIDTH);
+    expect(lines[1]!.endsWith("           ")).toBe(true); // 11 trailing spaces
+  });
+
+  it("renders a `name: ''` favorite as an empty name column with padding, no crash", () => {
+    const fav: FavoriteStation = {
+      code: "X02",
+      name: "",
+      lines: ["RD"],
+    };
+    const screen = makeHomeScreen(loaderFor([fav]));
+    const snap = screen.init();
+    const lines = screen.view(snap, { highlightedIndex: 0 });
+    expectFits(lines);
+    expect(lines.length).toBe(3);
+    // After the 2-char highlight prefix, the next 10 chars are the
+    // name cell, which should be entirely spaces when name === "".
+    expect(lines[1]!.slice(2, 12)).toBe("          "); // 10 spaces
+    expect(lines[1]!.length).toBe(LINE_WIDTH);
+  });
+
+  it("collapses duplicate line codes via the +N rule (['RD','RD','RD','RD','RD'] -> 'RD RD RD +2')", () => {
+    // Duplicate codes are still 5 entries, so the +N rule fires at the
+    // tail. This guards against the renderer assuming the input is
+    // de-duplicated.
+    expect(renderLinesSuffix(["RD", "RD", "RD", "RD", "RD"])).toBe(
+      "RD RD RD +2",
+    );
+  });
+
+  it("clamps favorites.length > MAX_FAVORITES silently to the first 5, no oversized list", () => {
+    // Simulate data-corruption / future migration bug: 7 favorites stored.
+    const fav = (code: string, name: string): FavoriteStation => ({
+      code,
+      name,
+      lines: ["RD"],
+    });
+    const corrupt: FavoriteStation[] = [
+      fav("A01", "One"),
+      fav("A02", "Two"),
+      fav("A03", "Three"),
+      fav("A04", "Four"),
+      fav("A05", "Five"),
+      fav("A06", "Six"),
+      fav("A07", "Seven"),
+    ];
+    const screen = makeHomeScreen(loaderFor(corrupt));
+    const snap = screen.init();
+    const lines = screen.view(snap, initialNav());
+    expectFits(lines);
+    // header + 5 fav rows + voice = 7 lines (clamped). No throw.
+    expect(lines.length).toBe(7);
+    // The header still reports the clamped count.
+    expect(lines[0]).toContain("(5/5)");
+    // The 6th & 7th favorites must NOT appear in the rendered output.
+    for (const l of lines) {
+      expect(l).not.toContain("Six");
+      expect(l).not.toContain("Seven");
+    }
+    // And the reducer doesn't choke either — TAP on the highlighted
+    // (clamped) row resolves a valid favorite.
+    const r = screen.reduce(snap, { highlightedIndex: 0 }, { type: "TAP" });
+    expect(r.navigate).toEqual({ to: "predictions", stationCode: "A01" });
   });
 });
 
