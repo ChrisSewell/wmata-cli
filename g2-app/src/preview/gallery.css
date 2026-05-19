@@ -1,0 +1,97 @@
+/* Screens-gallery styling. Dark surface to mimic the G2's greyscale
+ * panel; monospace rendering for the actual view output so column
+ * alignment is faithful to the device. */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #0e1014;
+  color: #e6e9f1;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, system-ui,
+    "Segoe UI", sans-serif;
+}
+
+.wmata-preview__header {
+  padding: 24px 32px 8px;
+  border-bottom: 1px solid #1b1f2a;
+}
+
+.wmata-preview__h1 {
+  margin: 0 0 8px;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.wmata-preview__sub {
+  margin: 0;
+  color: #8a92a3;
+  font-size: 13px;
+  max-width: 800px;
+}
+
+.wmata-preview__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 16px;
+  padding: 24px 32px 48px;
+}
+
+.wmata-preview__card {
+  background: #161a23;
+  border: 1px solid #1f2430;
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wmata-preview__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #e6e9f1;
+}
+
+.wmata-preview__caption {
+  margin: 0;
+  font-size: 12px;
+  color: #8a92a3;
+  line-height: 1.4;
+}
+
+/* The "panel" simulates the G2's display surface — slightly inset,
+ * dark-grey background, subtle border, fixed-width container so
+ * the rendered <pre> can't reflow. */
+.wmata-preview__panel {
+  background: #05080d;
+  border: 1px solid #2a3142;
+  border-radius: 4px;
+  padding: 10px 12px;
+  /* The device is greyscale; we tint slightly cool to evoke the
+   * panel's near-monochrome read. */
+  color: #d5dbe6;
+  /* Approx aspect ratio of the panel: 576x288 = 2:1. Letting the
+   * <pre> width drive the height keeps the box compact. */
+  width: fit-content;
+}
+
+.wmata-preview__pre {
+  margin: 0;
+  /* The on-device font is monospace; this is the closest browser
+   * approximation. The size is tuned so 24 columns sit at ~280-300
+   * px wide — readable on a desktop while staying compact. */
+  font: 13px/1.35 "Menlo", "Consolas", "Courier New", monospace;
+  white-space: pre;
+  letter-spacing: 0.5px;
+  /* Preserve the trailing-space contract — each row is padded to
+   * LINE_WIDTH in `renderCard`. */
+  tab-size: 4;
+}
+
+.wmata-preview__meta {
+  margin: 0;
+  font-size: 11px;
+  color: #5d6478;
+  font-family: "Menlo", "Consolas", "Courier New", monospace;
+}

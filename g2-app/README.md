@@ -23,6 +23,17 @@ npm run dev        # Vite dev server on :5173 (LAN-bound for QR access)
 npm run simulate   # render in the desktop simulator
 ```
 
+Both `npm run dev` and `npm run simulate` serve two pages:
+
+- `/index.html` — the production entry. Renders the companion
+  settings UI on the phone, then hands off to the glasses HUD when
+  the SDK bridge is available.
+- `/preview.html` — a browser-only **screens gallery** that renders
+  every glasses screen state through its real `view()` function.
+  No SDK bridge required; works in any desktop browser. Useful for
+  reviewing layout drift, capturing screenshots, and demoing the
+  app without hardware.
+
 The desktop simulator (`evenhub-simulator`) works out-of-the-box on macOS
 and Windows. On Linux it requires `webkit2gtk` (`apt install
 libwebkit2gtk-4.1-0` or your distro's equivalent).
