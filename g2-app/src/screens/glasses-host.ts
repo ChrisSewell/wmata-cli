@@ -23,12 +23,15 @@
 //      `sysEvent`. We never assume only one envelope is populated.
 //   3. ListContainer dependency for scrolls. Per the SDK docs only
 //      LIST containers emit SCROLL_TOP/SCROLL_BOTTOM events. We mount
-//      a lightweight, off-screen ListContainerProperty (0-pixel) just
-//      to act as a scroll-event source, alongside the visible
-//      TextContainer. The list never renders; the OS still pipes
-//      touchpad swipes to it because it has `isEventCapture: 1`.
-//      If the simulator does not behave this way, swipes will arrive
-//      as `textEvent` clicks anyway, and the user can still tap.
+//      a lightweight, off-screen ListContainerProperty (0-pixel)
+//      alongside the visible TextContainer purely as a scroll-event
+//      source. The list never renders; the OS still pipes touchpad
+//      swipes to it because it has `isEventCapture: 1`. The text
+//      container is the visible-only surface, so it carries
+//      `isEventCapture: 0`. Taps then arrive via `listEvent` (the
+//      list is the page's sole event capturer) or via `sysEvent`
+//      as a global touchpad event — both paths are handled by
+//      `eventToScreenEvent` below.
 //   4. `createStartUpPageContainer` returns a `StartUpPageCreateResult`
 //      enum. Any value other than `success (0)` is logged but does
 //      NOT throw — we still wire up event handlers so a USER can
@@ -145,6 +148,14 @@ export function isSystemExit(event: EvenHubEvent): boolean {
  * over the (invisible) list, so the user sees only the text.
  */
 function buildPage(initialContent: string): CreateStartUpPageContainer {
+  // SDK rule (README "Important Notes"): when a page has multiple
+  // containers, EXACTLY ONE may carry `isEventCapture: 1` — all others
+  // must be `0`. The on-device deserialiser and the simulator both
+  // reject the whole page when this is violated, surfacing a stale
+  // "missing field `itemContainer`" parse error rather than a useful
+  // validation message. We park the capture flag on the list (it is
+  // the documented source for SCROLL_TOP/SCROLL_BOTTOM, and taps
+  // fall through via `listEvent.CLICK` or `sysEvent`).
   const text = new TextContainerProperty({
     xPosition: 0,
     yPosition: 0,
@@ -155,7 +166,7 @@ function buildPage(initialContent: string): CreateStartUpPageContainer {
     paddingLength: 4,
     containerID: TEXT_CONTAINER_ID,
     containerName: "wmata.main",
-    isEventCapture: 1,
+    isEventCapture: 0,
     content: initialContent,
   });
   // `itemContainer` is non-optional in the host-side (Rust simulator /
