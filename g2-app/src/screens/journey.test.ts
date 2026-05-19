@@ -62,8 +62,8 @@ describe("estimateTravelMinutes", () => {
 });
 
 describe("formatClock + renderHeader", () => {
-  it("formatClock returns canonical HH:MM", () => {
-    expect(formatClock(NOW)).toBe("14:32");
+  it("formatClock returns canonical 12-hour clock", () => {
+    expect(formatClock(NOW)).toBe(" 2:32p");
   });
 
   it("renderHeader for an unconfigured plan collapses to 'Journey' + clock", () => {
@@ -73,14 +73,14 @@ describe("formatClock + renderHeader", () => {
     );
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("Journey");
-    expect(out).toContain("14:32");
+    expect(out).toContain("2:32p");
   });
 
   it("renderHeader includes the orig→dest pair when configured", () => {
     const out = renderHeader(snap({}), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("→");
-    expect(out).toContain("14:32");
+    expect(out).toContain("2:32p");
   });
 });
 

@@ -248,13 +248,16 @@ export function flattenBlocks(blocks: readonly string[][]): string[] {
   return out;
 }
 
-/** Format epoch-ms timestamp as 24h "HH:MM". Duplicated from sibling screens. */
+/** Format epoch-ms timestamp as 12-hour clock (` 9:05a` / `12:32p`). Duplicated from sibling screens. */
 export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return "--:--";
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
   const d = new Date(epochMs);
-  const hh = String(d.getHours()).padStart(2, "0");
+  const h24 = d.getHours();
+  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+  const hh = String(h12).padStart(2, " ");
   const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  const ap = h24 < 12 ? "a" : "p";
+  return `${hh}:${mm}${ap}`;
 }
 
 /** Time-based staleness predicate (mirrors `Incidents` semantics). */
@@ -284,8 +287,8 @@ export function stalenessMarker(
 /**
  * Render the header row.
  *
- *   "ACCESS (n)              HH:MM"   (n > 0)
- *   "ACCESS                  HH:MM"   (empty)
+ *   "ACCESS (n)             2:32p"   (n > 0)
+ *   "ACCESS                 2:32p"   (empty)
  *
  * Marker character (`*` / `**` / `?`) sits to the right of the
  * clock, consuming from the gap between the left label and the

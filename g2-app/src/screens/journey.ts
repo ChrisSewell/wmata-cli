@@ -89,18 +89,21 @@ export interface JourneySnapshot {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/** "HH:mm" formatter — duplicated for module independence. */
+/** 12-hour clock formatter (` 9:05a` / `12:32p`) — duplicated for module independence. */
 export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return "--:--";
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
   const d = new Date(epochMs);
-  const hh = String(d.getHours()).padStart(2, "0");
+  const h24 = d.getHours();
+  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+  const hh = String(h12).padStart(2, " ");
   const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  const ap = h24 < 12 ? "a" : "p";
+  return `${hh}:${mm}${ap}`;
 }
 
 /**
- * Render the header: `<origin>→<dest>   HH:MM`. Names are
- * abbreviated to fit the 18-col budget shared with the clock cell.
+ * Render the header: `<origin>→<dest>  2:32p`. Names are
+ * abbreviated to fit the 17-col budget shared with the clock cell.
  * If the plan is unconfigured, the header collapses to `"Journey"`.
  */
 export function renderHeader(
@@ -115,12 +118,12 @@ export function renderHeader(
     const left = padRight("Journey", LINE_WIDTH - clock.length - 1);
     return truncate(left + " " + clock, LINE_WIDTH);
   }
-  // Squeeze "<orig>→<dest>" into 18 cols. Allocate 8 to each side and
+  // Squeeze "<orig>→<dest>" into 17 cols. Allocate ~8 to each side and
   // 2 to the "→" + spacing.
   const orig = abbreviateStation(snapshot.originName, 8);
   const dest = abbreviateStation(snapshot.destinationName, 8);
   const composed = orig + "→" + dest;
-  // composed could be ≤ 17 chars; clock is 5; spacing is 1 → 23 max.
+  // composed could be ≤ 17 chars; clock is 6; spacing is 1 → 24 max.
   // Pad to LINE_WIDTH.
   const left = padRight(composed, LINE_WIDTH - clock.length - 1);
   return truncate(left + " " + clock, LINE_WIDTH);

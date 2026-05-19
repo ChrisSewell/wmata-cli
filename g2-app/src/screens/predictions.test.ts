@@ -111,19 +111,24 @@ const noopFetcher = (): Promise<PredictionsFetchResult> =>
 // ---------------------------------------------------------------------------
 
 describe("formatClock", () => {
-  it("formats a real timestamp as 24h HH:MM", () => {
+  it("formats a real timestamp in 12-hour form with a single-letter suffix", () => {
     const t = new Date(2026, 4, 18, 9, 5, 0).getTime();
-    expect(formatClock(t)).toBe("09:05");
+    expect(formatClock(t)).toBe(" 9:05a");
   });
 
-  it("pads single-digit hours and minutes to two digits", () => {
-    const t = new Date(2026, 0, 1, 0, 0, 0).getTime();
-    expect(formatClock(t)).toBe("00:00");
+  it("renders midnight as 12:00a and noon as 12:00p", () => {
+    expect(formatClock(new Date(2026, 0, 1, 0, 0, 0).getTime())).toBe("12:00a");
+    expect(formatClock(new Date(2026, 0, 1, 12, 0, 0).getTime())).toBe("12:00p");
+  });
+
+  it("renders PM hours past noon with 1-12 numbering", () => {
+    expect(formatClock(new Date(2026, 4, 18, 14, 32, 0).getTime())).toBe(" 2:32p");
+    expect(formatClock(new Date(2026, 4, 18, 23, 47, 0).getTime())).toBe("11:47p");
   });
 
   it("returns a stable placeholder for epoch-0 / invalid input", () => {
-    expect(formatClock(0)).toBe("--:--");
-    expect(formatClock(Number.NaN)).toBe("--:--");
+    expect(formatClock(0)).toBe(" --:--");
+    expect(formatClock(Number.NaN)).toBe(" --:--");
   });
 });
 
@@ -162,17 +167,17 @@ describe("renderHeader", () => {
     const out = renderHeader(snap({ stationName: "Metro Center" }), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("Metro Center");
-    expect(out).toContain("14:32");
+    expect(out).toContain("2:32p");
   });
 
-  it("abbreviates a long station name to fit the 18-col name budget", () => {
+  it("abbreviates a long station name to fit the 17-col name budget", () => {
     const out = renderHeader(
       snap({ stationName: "U Street/African-Amer Civil War Memorial/Cardozo" }),
       NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("U Street");
-    expect(out).toContain("14:32");
+    expect(out).toContain("2:32p");
   });
 
   it("appends '*' when the snapshot is stale (old fetchedAt, no error)", () => {
@@ -181,7 +186,7 @@ describe("renderHeader", () => {
       NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("14:32*")).toBe(true);
+    expect(out.endsWith("2:32p*")).toBe(true);
   });
 
   // ----- 3-state stale-marker escalation -----
@@ -197,7 +202,7 @@ describe("renderHeader", () => {
       NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("14:32*")).toBe(true);
+    expect(out.endsWith("2:32p*")).toBe(true);
   });
 
   it("appends '**' after two consecutive fetch failures", () => {
@@ -206,7 +211,7 @@ describe("renderHeader", () => {
       NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("14:32**")).toBe(true);
+    expect(out.endsWith("2:32p**")).toBe(true);
   });
 
   it("appends '?' after three or more consecutive fetch failures", () => {
@@ -215,7 +220,7 @@ describe("renderHeader", () => {
       NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("14:32?")).toBe(true);
+    expect(out.endsWith("2:32p?")).toBe(true);
   });
 
   it("appends '?' when no successful fetch ever AND there's an error", () => {
@@ -226,11 +231,11 @@ describe("renderHeader", () => {
       NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("14:32?")).toBe(true);
+    expect(out.endsWith("2:32p?")).toBe(true);
   });
 
   it("steals 2 cols from the name budget when the marker is '**'", () => {
-    // "Metro Center" (12 chars) → with **, the name budget is 18-2=16,
+    // "Metro Center" (12 chars) → with **, the name budget is 17-2=15,
     // so the name still fits verbatim. The total line length stays at
     // exactly LINE_WIDTH.
     const out = renderHeader(
@@ -431,11 +436,11 @@ describe("predictions view: empty state", () => {
     });
     const screen = makePredictionsScreen(noopFetcher, initial);
     const lines = screen.view(screen.init(), initialNav(), CTX);
-    // Header: "Metro Center" + spaces + "14:32" + "*" (stale because
+    // Header: "Metro Center" + spaces + " 2:32p" + "*" (stale because
     // never fetched). With the marker present the name cell shrinks
-    // from 18 to 17 cols, so total = 17 + 1 + 6 = 24.
+    // from 17 to 16 cols, so total = 16 + 1 + 7 = 24.
     expect(lines).toEqual([
-      "Metro Center      14:32*",
+      "Metro Center      2:32p*",
       "Loading…",
       "",
       "(double-tap to exit)",
@@ -903,12 +908,12 @@ describe("renderLastTrainRow", () => {
     expect(renderLastTrainRow(snap({ lastTrainToday: "" }), EVENING)).toBeNull();
   });
 
-  it("renders `Last train: HH:MM` when both conditions are met", () => {
+  it("renders `Last train: <12-hour>` when both conditions are met", () => {
     const out = renderLastTrainRow(
       snap({ lastTrainToday: "23:47" }),
       EVENING,
     );
-    expect(out).toBe("Last train: 23:47");
+    expect(out).toBe("Last train: 11:47p");
     expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
   });
 });
@@ -927,7 +932,7 @@ describe("predictions view: late-night last-train row", () => {
     );
     const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
     expectFits(lines);
-    expect(lines[lines.length - 1]).toBe("Last train: 23:47");
+    expect(lines[lines.length - 1]).toBe("Last train: 11:47p");
   });
 
   it("does NOT append the row before LAST_TRAIN_HOUR", () => {
@@ -1052,7 +1057,7 @@ describe("predictions: clock decoupled from fetch (hung-fetch regression)", () =
   it("the 1Hz clock tick re-renders the screen with progressing nowMs even when tick() never resolves", async () => {
     vi.useFakeTimers();
     try {
-      // Anchor wall-clock so the formatted "HH:MM" string is deterministic
+      // Anchor wall-clock so the formatted 12-hour string is deterministic
       // (the timer-driven render reads Date.now() inside the host).
       vi.setSystemTime(new Date(2026, 4, 18, 14, 32, 0));
 
@@ -1085,8 +1090,8 @@ describe("predictions: clock decoupled from fetch (hung-fetch regression)", () =
       grab();
 
       for (let s = 1; s <= 5; s++) {
-        // Bump system clock so HH:MM changes; advance fake timers so
-        // the 1Hz interval callback fires.
+        // Bump system clock so the rendered minute changes; advance
+        // fake timers so the 1Hz interval callback fires.
         vi.setSystemTime(new Date(2026, 4, 18, 14, 32 + s, 0));
         await vi.advanceTimersByTimeAsync(1000);
         grab();
@@ -1094,15 +1099,15 @@ describe("predictions: clock decoupled from fetch (hung-fetch regression)", () =
 
       // We should have at LEAST 4 re-renders (one per clock tick) on
       // top of the initial render. In practice the dedupe filter passes
-      // every one because HH:MM changes each step.
+      // every one because the rendered minute changes each step.
       expect(upgrades.length).toBeGreaterThanOrEqual(5);
 
       // Each rendered first line is the header; pull the clock substring
       // out and check they're strictly increasing in minutes. Header
-      // shape: "<name padded> HH:MM*"  (the snapshot is stale because
+      // shape: "<name padded> h:mma*"  (the snapshot is stale because
       // `fetchedAt === 0`, so the `*` marker is present.)
       const minutes = renderedClocks
-        .map((line) => line.match(/(\d{2}):(\d{2})/))
+        .map((line) => line.match(/(\d{1,2}):(\d{2})/))
         .filter((m): m is RegExpMatchArray => m !== null)
         .map((m) => Number(m[1]) * 60 + Number(m[2]));
       // At least 5 distinct clock values across the renders.
@@ -1135,13 +1140,13 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
 
     expectFits(lines);
     // Exact-pin against the canonical render. Cells (24 cols total):
-    //   header:    name(18) + " " + clock(5)
+    //   header:    name(17) + " " + clock(6)
     //   body row:  glyph(2) + " " + dest(11) + " " + cars(2) + " " + eta(6)
     //
     // The first train carries the `>` cursor in place of its second
     // glyph char (v1.2 pin-a-train default cursor — TAP affordance).
     expect(lines).toEqual([
-      "Metro Center       14:32",
+      "Metro Center       2:32p",
       "R> Shady Grove 6c    ARR",
       "RD Glenmont    8c  3 min",
       "OR Vienna      6c  5 min",
@@ -1179,7 +1184,7 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines).toEqual([
-      "Metro Center       14:32",
+      "Metro Center       2:32p",
       "R> Shady Grove 6c    ARR",
       "RD Glenmont    8c  3 min",
       "OR Vienna      6c  5 min",

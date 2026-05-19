@@ -317,27 +317,31 @@ export const MIN_QUERY_LENGTH = 2;
 // ---------------------------------------------------------------------------
 
 /**
- * Format an epoch-ms timestamp as a 24-hour "HH:MM" string.
- * Identical helper to the Predictions / Incidents screens. Duplicated
- * here so the Voice module has no cross-screen import.
+ * Format an epoch-ms timestamp as a 12-hour clock string (` 9:05a` /
+ * `12:32p`). Identical helper to the Predictions / Incidents /
+ * Elevator / Journey screens. Duplicated here so the Voice module
+ * has no cross-screen import.
  */
 export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return "--:--";
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
   const d = new Date(epochMs);
-  const hh = String(d.getHours()).padStart(2, "0");
+  const h24 = d.getHours();
+  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+  const hh = String(h12).padStart(2, " ");
   const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  const ap = h24 < 12 ? "a" : "p";
+  return `${hh}:${mm}${ap}`;
 }
 
 /**
- * Render the header row: `VOICE` + a right-aligned `HH:MM` clock.
+ * Render the header row: `VOICE` + a right-aligned 12-hour clock.
  *
  * Always returns exactly `LINE_WIDTH` columns.
  */
 export function renderHeader(nowMs: number): string {
   const left = "VOICE";
   const clock = formatClock(nowMs);
-  // left(5) + spaces + clock(5) = LINE_WIDTH(24)  -> 14 spaces.
+  // left(5) + spaces + clock(6) = LINE_WIDTH(24)  -> 13 spaces.
   const spaces = Math.max(1, LINE_WIDTH - left.length - clock.length);
   return truncate(left + " ".repeat(spaces) + clock, LINE_WIDTH);
 }

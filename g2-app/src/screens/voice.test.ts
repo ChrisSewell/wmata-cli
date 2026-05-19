@@ -91,13 +91,13 @@ function makeRig(
 // ---------------------------------------------------------------------------
 
 describe("voice formatClock", () => {
-  it("formats a real timestamp as 24h HH:MM", () => {
-    expect(formatClock(NOW)).toBe("14:32");
+  it("formats a real timestamp in 12-hour form", () => {
+    expect(formatClock(NOW)).toBe(" 2:32p");
   });
 
   it("returns a stable placeholder for epoch-0 / invalid input", () => {
-    expect(formatClock(0)).toBe("--:--");
-    expect(formatClock(Number.NaN)).toBe("--:--");
+    expect(formatClock(0)).toBe(" --:--");
+    expect(formatClock(Number.NaN)).toBe(" --:--");
   });
 });
 
@@ -106,7 +106,7 @@ describe("voice renderHeader", () => {
     const out = renderHeader(NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.startsWith("VOICE")).toBe(true);
-    expect(out.endsWith("14:32")).toBe(true);
+    expect(out.endsWith("2:32p")).toBe(true);
   });
 });
 
@@ -567,10 +567,10 @@ describe("voice view snapshot: 3 matches at highlight idx 0", () => {
     });
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
-    // Header: "VOICE" + 14 spaces + "14:32" = 24 cols.
+    // Header: "VOICE" + 13 spaces + " 2:32p" = 24 cols.
     // Match rows: "> " or "  " + name(10) + " " + lines(11).
     expect(lines).toEqual([
-      "VOICE              14:32",
+      "VOICE              2:32p",
       "Did you mean:",
       "",
       renderMatchRow(THREE[0]!, true),

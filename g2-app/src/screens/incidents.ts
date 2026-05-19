@@ -271,15 +271,19 @@ export function flattenBlocks(blocks: readonly string[][]): string[] {
 }
 
 /**
- * Format an epoch-ms timestamp as a 24-hour "HH:MM" string.
- * Identical helper to the Predictions screen's `formatClock`.
+ * Format an epoch-ms timestamp as a 12-hour clock string
+ * (` 9:05a` / `12:32p`). Identical helper to the Predictions screen's
+ * `formatClock`.
  */
 export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return "--:--";
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
   const d = new Date(epochMs);
-  const hh = String(d.getHours()).padStart(2, "0");
+  const h24 = d.getHours();
+  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+  const hh = String(h12).padStart(2, " ");
   const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  const ap = h24 < 12 ? "a" : "p";
+  return `${hh}:${mm}${ap}`;
 }
 
 /**
@@ -322,8 +326,8 @@ export function stalenessMarker(
 /**
  * Render the header row.
  *
- *   "ALERTS (n)              HH:MM"   (n > 0)
- *   "ALERTS                  HH:MM"   (n === 0, empty state)
+ *   "ALERTS (n)             2:32p"   (n > 0)
+ *   "ALERTS                 2:32p"   (n === 0, empty state)
  *
  * Adds a 1- or 2-char marker after the clock per `stalenessMarker`.
  * The text on the left collapses to a single "ALERTS" when there are
