@@ -42,15 +42,18 @@ import type {
 interface FakeBridgeRecord {
   upgrades: string[];
   shutdownCalls: number;
+  pageCreates: CreateStartUpPageContainer[];
 }
 
 function makeFakeBridge(): { bridge: EvenAppBridge; record: FakeBridgeRecord } {
-  const record: FakeBridgeRecord = { upgrades: [], shutdownCalls: 0 };
+  const record: FakeBridgeRecord = { upgrades: [], shutdownCalls: 0, pageCreates: [] };
   const fake = {
     createStartUpPageContainer: (
-      _container: CreateStartUpPageContainer,
-    ): Promise<StartUpPageCreateResult> =>
-      Promise.resolve(StartUpPageCreateResult.success),
+      container: CreateStartUpPageContainer,
+    ): Promise<StartUpPageCreateResult> => {
+      record.pageCreates.push(container);
+      return Promise.resolve(StartUpPageCreateResult.success);
+    },
     textContainerUpgrade: (container: TextContainerUpgrade): Promise<boolean> => {
       // `content` lives on the protobuf-shaped container. The SDK's
       // generated type makes it `string | undefined`; the host always
@@ -338,6 +341,40 @@ describe("glasses-host clock tick (decoupled from fetch)", () => {
       expect(record.upgrades.length).toBe(upgradesAtUnmount);
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Page-container shape (host-side deserialiser expectations)
+// ---------------------------------------------------------------------------
+//
+// The Rust simulator and the on-device Dart bridge use a strict
+// deserialiser that rejects a `ListContainerProperty` without an
+// `itemContainer`, even though the SDK's TypeScript model marks the
+// field optional. When this regression last shipped, the simulator
+// logged `Failed to parse data for CreateStartUpPageContainer: missing
+// field 'itemContainer'` and then every `textContainerUpgrade` to the
+// (never-created) container 1 failed. We pin the shape here so the
+// mistake can't sneak back in.
+
+describe("glasses-host page-container shape", () => {
+  it("includes an itemContainer on the scroll ListContainerProperty", async () => {
+    const { bridge, record } = makeFakeBridge();
+    const router = makeStubRouter();
+    const ticker = makeTicker({ generation: 0 }, 10_000);
+
+    const unmount = await mountGlassesScreen(ticker.screen, bridge, router);
+    try {
+      expect(record.pageCreates).toHaveLength(1);
+      const page = record.pageCreates[0]!;
+      const lists = (page.listObject ?? []);
+      expect(lists.length).toBeGreaterThan(0);
+      for (const list of lists) {
+        expect(list.itemContainer).toBeDefined();
+      }
+    } finally {
+      await unmount();
     }
   });
 });
