@@ -38,6 +38,7 @@
 import {
   CreateStartUpPageContainer,
   ListContainerProperty,
+  ListItemContainerProperty,
   OsEventTypeList,
   StartUpPageCreateResult,
   TextContainerProperty,
@@ -157,6 +158,14 @@ function buildPage(initialContent: string): CreateStartUpPageContainer {
     isEventCapture: 1,
     content: initialContent,
   });
+  // `itemContainer` is non-optional in the host-side (Rust simulator /
+  // Dart glasses) deserialiser, even though the SDK's TypeScript model
+  // marks it `?`. Omitting it makes the simulator reject the whole
+  // `CreateStartUpPageContainer` with "missing field `itemContainer`",
+  // after which container 1 doesn't exist and every subsequent
+  // `textContainerUpgrade` fails with "container 1 not found". The
+  // scroll list never actually renders any items, so we hand it a
+  // zero-item descriptor purely to satisfy the schema.
   const list = new ListContainerProperty({
     xPosition: 0,
     yPosition: 0,
@@ -168,6 +177,12 @@ function buildPage(initialContent: string): CreateStartUpPageContainer {
     containerID: LIST_CONTAINER_ID,
     containerName: "wmata.scroll",
     isEventCapture: 1,
+    itemContainer: new ListItemContainerProperty({
+      itemCount: 0,
+      itemWidth: 0,
+      isItemSelectBorderEn: 0,
+      itemName: [],
+    }),
   });
   return new CreateStartUpPageContainer({
     containerTotalNum: 2,
