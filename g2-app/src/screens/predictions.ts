@@ -40,9 +40,9 @@
 // `STATION_ABBREVIATIONS` (longest map value is "Tenleytown" at 10 chars).
 //
 // Header row (24 cols):
-//   - 18 cols  abbreviated station name
+//   - 17 cols  abbreviated station name
 //   - 1 col    space
-//   - 5 cols   "HH:MM" wall clock (+ optional `*` stale marker that
+//   - 6 cols   12-hour wall clock (+ optional `*` stale marker that
 //              consumes one column from the name budget when present).
 //
 // PURITY: This module has no SDK imports and does no I/O of its own. The
@@ -76,11 +76,11 @@ const CARS_WIDTH = 2;
 /** Width of the ETA cell — sized to fit "12 min". */
 const ETA_WIDTH = 6;
 /** Width of the station-name cell in the header. */
-const HEADER_NAME_WIDTH = 18;
-// Clock cell is fixed at 5 cols ("HH:MM") plus an optional 1-col stale
-// marker; no constant needed because we never reference the width
-// outside `renderHeader` where the cell composition is open-coded for
-// readability.
+const HEADER_NAME_WIDTH = 17;
+// Clock cell is fixed at 6 cols (12-hour " h:mma" / "hh:mma") plus an
+// optional 1- or 2-col stale marker; no constant needed because we
+// never reference the width outside `renderHeader` where the cell
+// composition is open-coded for readability.
 
 /** Maximum number of predictions rendered as body rows. */
 export const MAX_VISIBLE_TRAINS = 5;
@@ -219,17 +219,22 @@ export interface PredictionsSnapshot {
 // ---------------------------------------------------------------------------
 
 /**
- * Format an epoch-ms timestamp as a 24-hour "HH:MM" string in the runtime's
- * local timezone. We deliberately render via `Date` slot getters rather than
- * `toLocaleTimeString` so the output is identical across browsers / Node /
- * the on-glasses runtime regardless of locale settings.
+ * Format an epoch-ms timestamp as a 12-hour clock string. Output is
+ * fixed-width 6 chars: hour (space-padded 1-12), ":", minutes
+ * (zero-padded), and a single-letter "a"/"p" suffix — e.g. ` 9:05a`,
+ * `12:32p`. We render via `Date` slot getters rather than
+ * `toLocaleTimeString` so the output is identical across browsers /
+ * Node / the on-glasses runtime regardless of locale settings.
  */
 export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return "--:--";
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
   const d = new Date(epochMs);
-  const hh = String(d.getHours()).padStart(2, "0");
+  const h24 = d.getHours();
+  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+  const hh = String(h12).padStart(2, " ");
   const mm = String(d.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
+  const ap = h24 < 12 ? "a" : "p";
+  return `${hh}:${mm}${ap}`;
 }
 
 /**
@@ -309,7 +314,7 @@ export function renderHeader(
     abbreviateStation(snapshot.stationName, nameBudget),
     nameBudget,
   );
-  // name(nameBudget) + " "(1) + clockCell(5..7) = 24 by construction.
+  // name(nameBudget) + " "(1) + clockCell(6..8) = 24 by construction.
   return name + " " + clockCell;
 }
 
@@ -424,11 +429,30 @@ export function renderFooter(snapshot: PredictionsSnapshot): string | null {
 }
 
 /**
+ * Convert a WMATA "HH:mm" 24-hour string to a compact 12-hour display
+ * string for the late-night last-train row. The snapshot keeps the raw
+ * 24-hour wire format (matches the schedule API); only the rendered
+ * row swaps to 12-hour for user-facing consistency with the header
+ * clock. Returns the input untouched if it doesn't parse — defensive
+ * for unexpected upstream shapes.
+ */
+export function formatLastTrainTime(hhmm: string): string {
+  const parts = hhmm.split(":");
+  if (parts.length !== 2) return hhmm;
+  const h24 = parseInt(parts[0]!, 10);
+  const mm = parts[1]!;
+  if (!Number.isFinite(h24) || mm.length !== 2) return hhmm;
+  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+  const ap = h24 < 12 ? "a" : "p";
+  return `${h12}:${mm}${ap}`;
+}
+
+/**
  * Render the optional late-night last-train row. Returns `null` when
  * the wall clock is before `LAST_TRAIN_HOUR` OR the schedule data
  * isn't available — in either case the row is hidden.
  *
- *   "Last train: 23:47"  (always ≤ 24 cols)
+ *   "Last train: 11:47p"  (always ≤ 24 cols)
  */
 export function renderLastTrainRow(
   snapshot: PredictionsSnapshot,
@@ -437,7 +461,7 @@ export function renderLastTrainRow(
   if (!shouldShowLastTrain(nowMs)) return null;
   const time = snapshot.lastTrainToday;
   if (!time || time.length === 0) return null;
-  return truncate(`Last train: ${time}`, LINE_WIDTH);
+  return truncate(`Last train: ${formatLastTrainTime(time)}`, LINE_WIDTH);
 }
 
 /**

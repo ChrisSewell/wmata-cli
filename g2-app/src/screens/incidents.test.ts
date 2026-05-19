@@ -268,7 +268,7 @@ describe("renderHeader", () => {
     const out = renderHeader(makeSnap([incident()]), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.startsWith("ALERTS (1)")).toBe(true);
-    expect(out.endsWith("14:32")).toBe(true);
+    expect(out.endsWith("2:32p")).toBe(true);
   });
 
   it("renders `ALERTS` (no count) when there are 0 incidents", () => {
@@ -284,29 +284,29 @@ describe("renderHeader", () => {
       NOW,
     );
     expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("14:32*")).toBe(true);
+    expect(out.endsWith("2:32p*")).toBe(true);
   });
 
   it("fits at n=99 (two-digit count) in 24 cols with a clock", () => {
-    // ALERTS (99) is 11 cols; 14:32 is 5; spacing fills the rest.
+    // ALERTS (99) is 11 cols; clock " 2:32p" is 6; spacing fills the rest.
     const incs = Array.from({ length: 99 }, (_, i) =>
       incident({ IncidentID: `${i}` }),
     );
     const out = renderHeader(makeSnap(incs), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.startsWith("ALERTS (99)")).toBe(true);
-    expect(out.endsWith("14:32")).toBe(true);
+    expect(out.endsWith("2:32p")).toBe(true);
   });
 
   it("fits at n=999 (three-digit count) in 24 cols with a clock", () => {
-    // ALERTS (999) is 12 cols; 14:32 is 5; spacing fills the rest.
+    // ALERTS (999) is 12 cols; clock " 2:32p" is 6; spacing fills the rest.
     const incs = Array.from({ length: 999 }, (_, i) =>
       incident({ IncidentID: `${i}` }),
     );
     const out = renderHeader(makeSnap(incs), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out.startsWith("ALERTS (999)")).toBe(true);
-    expect(out.endsWith("14:32")).toBe(true);
+    expect(out.endsWith("2:32p")).toBe(true);
   });
 });
 
@@ -320,7 +320,7 @@ describe("incidents view: empty state", () => {
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines).toEqual([
-      "ALERTS             14:32",
+      "ALERTS             2:32p",
       "No active alerts on",
       "your lines.",
       "",
@@ -498,7 +498,7 @@ describe("incidents view: stale marker uses ctx.nowMs", () => {
     const screen = makeIncidentsScreen(noopFetcher, snap);
     const lines = screen.view(screen.init(), initialNav(), { nowMs: T });
     expectFits(lines);
-    expect(lines[0]!.endsWith("14:32*")).toBe(true);
+    expect(lines[0]!.endsWith("2:32p*")).toBe(true);
   });
 });
 
@@ -532,7 +532,7 @@ describe("incidents view: first-load fetch error", () => {
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines).toEqual([
-      "ALERTS            14:32?",
+      "ALERTS            2:32p?",
       "Couldn't reach WMATA.",
       "Will retry shortly.",
       "",
@@ -559,7 +559,7 @@ describe("incidents view: stale-marker escalation", () => {
     });
     const screen = makeIncidentsScreen(noopFetcher, snap);
     const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines[0]!.endsWith("14:32*")).toBe(true);
+    expect(lines[0]!.endsWith("2:32p*")).toBe(true);
   });
 
   it("shows '**' after two consecutive failures", () => {
@@ -569,7 +569,7 @@ describe("incidents view: stale-marker escalation", () => {
     });
     const screen = makeIncidentsScreen(noopFetcher, snap);
     const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines[0]!.endsWith("14:32**")).toBe(true);
+    expect(lines[0]!.endsWith("2:32p**")).toBe(true);
   });
 
   it("shows '?' after three or more consecutive failures", () => {
@@ -579,7 +579,7 @@ describe("incidents view: stale-marker escalation", () => {
     });
     const screen = makeIncidentsScreen(noopFetcher, snap);
     const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines[0]!.endsWith("14:32?")).toBe(true);
+    expect(lines[0]!.endsWith("2:32p?")).toBe(true);
   });
 });
 
@@ -631,7 +631,7 @@ describe("incidents view snapshot: 1 incident with a multi-line desc", () => {
     // exact rendered lines explicitly so a future change to the wrap
     // rules surfaces as a test failure.
     expect(lines).toEqual([
-      "ALERTS (1)         14:32",
+      "ALERTS (1)         2:32p",
       "  ! BL OR SV",
       "  Single-tracking",
       "  between Foggy Bottom",

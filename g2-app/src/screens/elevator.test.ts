@@ -165,12 +165,17 @@ describe("renderUnitHeader", () => {
 // ---------------------------------------------------------------------------
 
 describe("formatClock", () => {
-  it("formats a real timestamp as 24h HH:MM", () => {
+  it("formats a real timestamp in 12-hour form", () => {
     const t = new Date(2026, 4, 18, 9, 5, 0).getTime();
-    expect(formatClock(t)).toBe("09:05");
+    expect(formatClock(t)).toBe(" 9:05a");
+  });
+  it("renders PM hours with a 'p' suffix and 1-12 hour numbering", () => {
+    expect(formatClock(new Date(2026, 4, 18, 14, 32, 0).getTime())).toBe(" 2:32p");
+    expect(formatClock(new Date(2026, 4, 18, 12, 0, 0).getTime())).toBe("12:00p");
+    expect(formatClock(new Date(2026, 4, 18, 0, 0, 0).getTime())).toBe("12:00a");
   });
   it("returns a stable placeholder for epoch-0 / invalid input", () => {
-    expect(formatClock(0)).toBe("--:--");
+    expect(formatClock(0)).toBe(" --:--");
   });
 });
 
@@ -244,7 +249,7 @@ describe("renderHeader", () => {
     const out = renderHeader(makeSnap([incident(), incident()]), NOW);
     expect(out.length).toBe(LINE_WIDTH);
     expect(out).toContain("ACCESS (2)");
-    expect(out).toContain("14:32");
+    expect(out).toContain("2:32p");
   });
 
   it("renders `ACCESS` (no count) when the list is empty", () => {
@@ -262,7 +267,7 @@ describe("renderHeader", () => {
       }),
       NOW,
     );
-    expect(out.endsWith("14:32**")).toBe(true);
+    expect(out.endsWith("2:32p**")).toBe(true);
   });
 });
 
@@ -272,9 +277,9 @@ describe("view: empty state", () => {
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
     expect(lines.length).toBe(5);
-    // Header layout: "ACCESS" (6) + 13 spaces + "14:32" (5) = 24.
+    // Header layout: "ACCESS" (6) + 12 spaces + " 2:32p" (6) = 24.
     expect(lines).toEqual([
-      "ACCESS             14:32",
+      "ACCESS             2:32p",
       "No active outages at",
       "your stations.",
       "",
@@ -291,9 +296,9 @@ describe("view: empty state", () => {
     const screen = makeElevatorScreen(noopFetcher, snap);
     const lines = screen.view(screen.init(), initialNav(), CTX);
     expectFits(lines);
-    // Header: "ACCESS" (6) + 12 spaces + "14:32?" (6) = 24.
+    // Header: "ACCESS" (6) + 11 spaces + " 2:32p?" (7) = 24.
     expect(lines).toEqual([
-      "ACCESS            14:32?",
+      "ACCESS            2:32p?",
       "Couldn't reach WMATA.",
       "Will retry shortly.",
       "",
