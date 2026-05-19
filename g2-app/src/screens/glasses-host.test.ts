@@ -377,4 +377,34 @@ describe("glasses-host page-container shape", () => {
       await unmount();
     }
   });
+
+  // SDK README "Important Notes": when multiple containers are mounted
+  // in a single page, EXACTLY ONE may have `isEventCapture: 1`.
+  // Violating this makes the host-side deserialiser reject the page
+  // outright — and the error it surfaces is the stale "missing field
+  // `itemContainer`" parse failure, not anything mentioning event
+  // capture, so the symptom looks identical to the regression the
+  // previous test pins. Pin both shapes so neither can sneak back.
+  it("has exactly one container with isEventCapture=1 (SDK constraint)", async () => {
+    const { bridge, record } = makeFakeBridge();
+    const router = makeStubRouter();
+    const ticker = makeTicker({ generation: 0 }, 10_000);
+
+    const unmount = await mountGlassesScreen(ticker.screen, bridge, router);
+    try {
+      expect(record.pageCreates).toHaveLength(1);
+      const page = record.pageCreates[0]!;
+      const captures: number[] = [];
+      for (const t of page.textObject ?? []) {
+        captures.push(t.isEventCapture ?? 0);
+      }
+      for (const l of page.listObject ?? []) {
+        captures.push(l.isEventCapture ?? 0);
+      }
+      const ones = captures.filter((c) => c === 1).length;
+      expect(ones).toBe(1);
+    } finally {
+      await unmount();
+    }
+  });
 });
