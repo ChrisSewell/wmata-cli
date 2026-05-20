@@ -5,29 +5,29 @@
 // (same-line only); the screen falls back to a clear "not a same-
 // line route" message when the user's pair spans a transfer.
 //
-// Layout (24 cols × up to 8 rendered rows):
+// Layout (wide grid × up to 8 rendered rows). Full line + station
+// names everywhere, matching Home / Predictions / Incidents:
 //
-//   col:   0         1         2
-//   col:   0123456789012345678901234
-//          MetroCtr→Vienna   14:32
-//          RD · 8 stops
+//          Metro Center → Vienna/Fairfax-GMU        2:32p
+//          RED · 8 stops
 //          Est. travel: ~16 min
+//          Next: RED Glenmont 5 min
 //          (double-tap to return)
 //
 // Empty state (journey not yet configured):
 //
-//          Journey            14:32
-//          No journey saved.
-//          Open phone to add.
+//          Journey                                  2:32p
+//          No journey saved. Open the phone app
+//          to set an origin + destination.
 //          (double-tap to return)
 //
-// Cross-line state (origin & destination on different lines — jPath
-// returns []):
+// Cross-line state (a routable two-leg journey via a transfer):
 //
-//          MetroCtr→Glnmt    14:32
-//          Not a same-line
-//          route. Transfer
-//          required.
+//          Metro Center → Pentagon City             2:32p
+//          ORANGE→YELLOW · 4 stops
+//          via L'Enfant Plaza
+//          Est. travel: ~10 min
+//          Next: ORANGE New Carrollton 3 min
 //          (double-tap to return)
 //
 // PURITY: pure view + reducer. The host injects a `fetcher` that
@@ -35,12 +35,18 @@
 
 import type { JourneyPlan } from "../storage/settings";
 import type { PathStep } from "../wmata";
-import { LINE_WIDTH, padRight, truncate } from "../ui/render";
-import { abbreviateStation } from "../ui/format";
+import { SAFE_TEXT_WIDTH, truncate } from "../ui/render";
+import { lineName } from "../ui/format";
+// `formatClock` now lives in the shared field-formatter module and is
+// rendered by the host into its own top-right clock container. Re-export
+// it here so existing imports (`import { formatClock } from "./journey"`)
+// keep resolving after the screen stopped embedding the clock.
+export { formatClock } from "../ui/format";
 import type {
   ReduceResult,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
 
@@ -118,44 +124,25 @@ export interface JourneySnapshot {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/** 12-hour clock formatter (` 9:05a` / `12:32p`) — duplicated for module independence. */
-export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
-  const d = new Date(epochMs);
-  const h24 = d.getHours();
-  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
-  const hh = String(h12).padStart(2, " ");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ap = h24 < 12 ? "a" : "p";
-  return `${hh}:${mm}${ap}`;
-}
-
 /**
- * Render the header: `<origin>→<dest>  2:32p`. Names are
- * abbreviated to fit the 17-col budget shared with the clock cell.
- * If the plan is unconfigured, the header collapses to `"Journey"`.
+ * Render the header — the journey title only, left-aligned:
+ * `<origin> → <dest>` (or `"Journey"` when the plan is unconfigured).
+ *
+ * Both origin and destination are rendered with their FULL Title-Case
+ * names (no abbreviation), matching the rest of the app. The wall clock
+ * is NO LONGER part of the header string: the host renders it into a
+ * dedicated top-right clock container on every screen. The title is
+ * truncated to 50 columns so it can never collide with that clock cell
+ * (which starts at x≈486px ≈ column 50).
  */
-export function renderHeader(
-  snapshot: JourneySnapshot,
-  nowMs: number,
-): string {
-  const clock = formatClock(nowMs);
+export function renderHeader(snapshot: JourneySnapshot): string {
   if (
     snapshot.plan.origin.length === 0 ||
     snapshot.plan.destination.length === 0
   ) {
-    const left = padRight("Journey", LINE_WIDTH - clock.length - 1);
-    return truncate(left + " " + clock, LINE_WIDTH);
+    return "Journey";
   }
-  // Squeeze "<orig>→<dest>" into 17 cols. Allocate ~8 to each side and
-  // 2 to the "→" + spacing.
-  const orig = abbreviateStation(snapshot.originName, 8);
-  const dest = abbreviateStation(snapshot.destinationName, 8);
-  const composed = orig + "→" + dest;
-  // composed could be ≤ 17 chars; clock is 6; spacing is 1 → 24 max.
-  // Pad to LINE_WIDTH.
-  const left = padRight(composed, LINE_WIDTH - clock.length - 1);
-  return truncate(left + " " + clock, LINE_WIDTH);
+  return truncate(`${snapshot.originName} → ${snapshot.destinationName}`, 50);
 }
 
 /**
@@ -201,9 +188,13 @@ export function stopsAcrossLegs(
 }
 
 /**
- * Compact "RD" / "OR→YL" line indicator string. One leg → just
- * the line code; two legs → "AA→BB" using the lead-circuit's
- * `LineCode`.
+ * Full-name "RED" / "ORANGE→YELLOW" line indicator string. One leg →
+ * just the line name; two legs → "AAA→BBB" using the lead-circuit's
+ * `LineCode`, spelled out via `lineName` for consistency with the
+ * rest of the app (Home / Predictions / Incidents). Dedups
+ * consecutive identical codes (a same-line transfer collapses to one
+ * name). The wider grid + per-line SAFE_TEXT_WIDTH truncation in the
+ * caller keep even "ORANGE→YELLOW · N stops" inside the panel.
  */
 export function formatLineSummary(
   legs: readonly (readonly PathStep[])[],
@@ -213,7 +204,7 @@ export function formatLineSummary(
     const lc = leg[0]?.LineCode ?? "?";
     if (codes[codes.length - 1] !== lc) codes.push(lc);
   }
-  return codes.join("→");
+  return codes.map((c) => lineName(c)).join("→");
 }
 
 // ---------------------------------------------------------------------------
@@ -229,75 +220,79 @@ export function makeJourneyScreen(
   return {
     name: "journey",
     init: () => initialSnapshot,
-    view(snapshot, _nav, ctx: ViewContext): string[] {
-      const lines: string[] = [];
-      lines.push(renderHeader(snapshot, ctx.nowMs));
+    view(snapshot, _nav, _ctx: ViewContext): ScreenSections {
+      const header: string[] = [renderHeader(snapshot)];
+      const body: string[] = [];
 
       // Unset plan — surface the friendly empty state.
       if (
         snapshot.plan.origin.length === 0 ||
         snapshot.plan.destination.length === 0
       ) {
-        lines.push(truncate("No journey saved.", LINE_WIDTH));
-        lines.push(truncate("Open phone to add.", LINE_WIDTH));
-        lines.push("");
-        lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-        return lines;
+        body.push(truncate("No journey saved. Open the phone app", SAFE_TEXT_WIDTH));
+        body.push(truncate("to set an origin + destination.", SAFE_TEXT_WIDTH));
+        body.push("");
+        body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+        return { header, body };
       }
 
       // Unresolved (first tick still pending or fetcher failed).
       if (snapshot.legs === null) {
         if (snapshot.fetchError !== null && snapshot.fetchedAt === 0) {
-          lines.push(truncate("Couldn't reach WMATA.", LINE_WIDTH));
-          lines.push(truncate("Will retry shortly.", LINE_WIDTH));
+          body.push(truncate("Couldn't reach WMATA. Will retry shortly.", SAFE_TEXT_WIDTH));
         } else {
-          lines.push(truncate("Loading path…", LINE_WIDTH));
+          body.push(truncate("Loading path…", SAFE_TEXT_WIDTH));
         }
-        lines.push("");
-        lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-        return lines;
+        body.push("");
+        body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+        return { header, body };
       }
 
       // No routable journey: either a cross-line pair without a
       // transfer configured (legs === []), or one of the two legs
       // returned empty (a malformed transfer code).
       if (snapshot.legs.length === 0) {
-        lines.push(truncate("Not a routable", LINE_WIDTH));
-        lines.push(truncate("journey. Add a", LINE_WIDTH));
-        lines.push(truncate("transfer station.", LINE_WIDTH));
-        lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-        return lines;
+        body.push(truncate("Not a routable journey. Add a transfer", SAFE_TEXT_WIDTH));
+        body.push(truncate("station from the phone app.", SAFE_TEXT_WIDTH));
+        body.push("");
+        body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+        return { header, body };
       }
 
       // Happy path. Summary line shows the line(s) involved + stop
-      // count. For two-leg journeys: "OR→YL · 11 stops".
+      // count, using full line names: "ORANGE→YELLOW · 11 stops".
       const lineSummary = formatLineSummary(snapshot.legs);
       const stops = stopsAcrossLegs(snapshot.legs);
-      lines.push(truncate(`${lineSummary} · ${stops} stops`, LINE_WIDTH));
+      body.push(truncate(`${lineSummary} · ${stops} stops`, SAFE_TEXT_WIDTH));
 
-      // Optional "via" row for transfer journeys.
+      // Optional "via" row for transfer journeys (full transfer name).
       if (snapshot.legs.length > 1 && snapshot.transferName.length > 0) {
-        lines.push(truncate(`via ${snapshot.transferName}`, LINE_WIDTH));
+        body.push(truncate(`via ${snapshot.transferName}`, SAFE_TEXT_WIDTH));
       }
 
       const minutes = estimateTravelMinutesForLegs(snapshot.legs);
-      lines.push(truncate(`Est. travel: ~${minutes} min`, LINE_WIDTH));
+      body.push(truncate(`Est. travel: ~${minutes} min`, SAFE_TEXT_WIDTH));
 
-      // Live next-train at origin.
+      // Live next-train at origin. The line code is spelled out
+      // (lineName) and the destination is rendered in full — it comes
+      // from live data, so only the SAFE_TEXT_WIDTH cap clips it.
       if (snapshot.nextTrain !== null) {
         const { line, min, destination } = snapshot.nextTrain;
         const minLabel =
           min === "ARR" || min === "BRD" || min === "" || min === "---"
             ? min || "—"
             : `${min} min`;
-        lines.push(
-          truncate(`Next: ${line} ${destination} ${minLabel}`, LINE_WIDTH),
+        body.push(
+          truncate(
+            `Next: ${lineName(line)} ${destination} ${minLabel}`,
+            SAFE_TEXT_WIDTH,
+          ),
         );
       }
 
-      lines.push("");
-      lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-      return lines;
+      body.push("");
+      body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+      return { header, body };
     },
     reduce(_snapshot, nav, event: ScreenEvent): ReduceResult<JourneySnapshot> {
       switch (event.type) {

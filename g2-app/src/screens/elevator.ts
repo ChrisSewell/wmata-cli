@@ -41,6 +41,7 @@
 import {
   ELLIPSIS,
   LINE_WIDTH,
+  SAFE_TEXT_WIDTH,
   USABLE_ROWS,
   scrollWindowWithMarkers,
   truncate,
@@ -51,8 +52,15 @@ import type {
   ReduceResult,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
+
+// The canonical HUD clock formatter now lives in `../ui/format` (the host
+// renders it in its own dedicated top-right container). Re-export it here
+// so existing `import { formatClock } from "./elevator"` call sites
+// (notably the test suite) keep resolving.
+export { formatClock } from "../ui/format";
 
 // ---------------------------------------------------------------------------
 // Column / row budgets
@@ -60,11 +68,34 @@ import type {
 
 /** Two-column gutter that precedes every body row. */
 const INDENT = "  ";
-/** Usable text width inside a body row, after the 2-col gutter. */
-const BODY_TEXT_WIDTH = LINE_WIDTH - INDENT.length; // 22
+
+/**
+ * Real-text width budget for the station-header row. The header carries
+ * only the 2-col section gutter (added by `flattenBlocks`), so it must
+ * fit `SAFE_TEXT_WIDTH - INDENT.length` real chars before the LVGL
+ * container hard-wraps at the 576px border.
+ */
+const STATION_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length; // 56
+
+/**
+ * Inner inset (extra indent) applied to per-unit detail rows so they
+ * read as detail nested under the station-name header.
+ */
+const DETAIL_INSET = "  ";
+
+/**
+ * Real-text width budget for a wrapped detail line ("Type · location").
+ * A detail line carries BOTH the 2-col section gutter (added by
+ * `flattenBlocks`) AND the 2-col inner inset (added in
+ * `formatStationGroup`), so its total indent is 4 cols. Wrapping the
+ * detail content at `SAFE_TEXT_WIDTH - 4` keeps every rendered line at
+ * or below `SAFE_TEXT_WIDTH` real chars — past which the container
+ * re-wraps and dumps orphan words at column 0.
+ */
+const DETAIL_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length - DETAIL_INSET.length; // 54
 
 /** Width budget for the abbreviated station name on the unit-header row. */
-const STATION_NAME_BUDGET = BODY_TEXT_WIDTH - 2; // 20  ("X " glyph cell)
+const STATION_NAME_BUDGET = STATION_TEXT_WIDTH - 2; // 54  ("X " glyph cell)
 
 /**
  * Per-incident location-description lines cap. Matches the
@@ -156,17 +187,44 @@ export function wrap(text: string, width: number): string[] {
   return lines;
 }
 
-/** Cap wrapped description lines at MAX_DESC_LINES with an ellipsis. */
+/**
+ * Strip trailing sentence separators (`, ; .`) plus any whitespace from
+ * a fragment so a wrapped/truncated tail doesn't read as mid-sentence
+ * (e.g. "Street to mezzanine," → "Street to mezzanine"). Only the FINAL
+ * emitted line of a fragment should be passed through this — interior
+ * lines keep their punctuation.
+ */
+export function trimTrailingSeparators(text: string): string {
+  return text.replace(/[\s,;.]+$/, "");
+}
+
+/**
+ * Cap wrapped description lines at MAX_DESC_LINES with an ellipsis.
+ *
+ * When the text fits within the cap, the final line gets its dangling
+ * sentence separator trimmed so the location doesn't read as a clipped
+ * mid-sentence fragment. When the text is truncated we append `…`
+ * instead (the ellipsis already signals "more was cut").
+ */
 export function capDescription(lines: readonly string[]): string[] {
-  if (lines.length <= MAX_DESC_LINES) return lines.slice();
+  if (lines.length === 0) return [];
+  if (lines.length <= MAX_DESC_LINES) {
+    const out = lines.slice();
+    const lastIdx = out.length - 1;
+    const last = out[lastIdx]!;
+    if (!last.endsWith(ELLIPSIS)) {
+      out[lastIdx] = trimTrailingSeparators(last);
+    }
+    return out;
+  }
   const out = lines.slice(0, MAX_DESC_LINES);
   const last = out[MAX_DESC_LINES - 1] ?? "";
   if (!last.endsWith(ELLIPSIS)) {
-    if (last.length < BODY_TEXT_WIDTH - 2) {
-      out[MAX_DESC_LINES - 1] = last + ELLIPSIS;
+    const trimmed = trimTrailingSeparators(last);
+    if (trimmed.length < DETAIL_TEXT_WIDTH) {
+      out[MAX_DESC_LINES - 1] = trimmed + ELLIPSIS;
     } else {
-      out[MAX_DESC_LINES - 1] =
-        last.slice(0, BODY_TEXT_WIDTH - 3) + ELLIPSIS;
+      out[MAX_DESC_LINES - 1] = trimmed.slice(0, DETAIL_TEXT_WIDTH - 1) + ELLIPSIS;
     }
   }
   return out;
@@ -200,7 +258,7 @@ export function stationNameOnly(fullName: string): string {
 /**
  * Render the unit-header row (glyph + station name).
  *
- * Width contract: ≤ BODY_TEXT_WIDTH (22) chars. The caller prepends
+ * Width contract: ≤ STATION_TEXT_WIDTH (56) chars. The caller prepends
  * the 2-col indent at flatten time so the result is directly usable.
  *
  *   "E Foggy Bottom-GWU"
@@ -212,27 +270,100 @@ export function renderUnitHeader(incident: ElevatorIncident): string {
     stationNameOnly(incident.StationName),
     STATION_NAME_BUDGET,
   );
-  // glyph(1) + " "(1) + station(≤20) = ≤22
-  return truncate(`${glyph} ${station}`, BODY_TEXT_WIDTH);
+  // glyph(1) + " "(1) + station(≤STATION_NAME_BUDGET) = ≤STATION_TEXT_WIDTH
+  return truncate(`${glyph} ${station}`, STATION_TEXT_WIDTH);
 }
 
 /**
  * Pre-format one outage into the block of body rows it will occupy:
  *
- *   ["E Foggy Bottom", "  Mezz to street", "  west side"]
+ *   ["Foggy Bottom-GWU",
+ *    "  Elevator · Mezzanine to street, west side"]
  *
- * The description is wrapped to (BODY_TEXT_WIDTH - 2) cols so it sits
- * with a one-space indent under the unit-header — that visually
- * groups the description with its parent row.
+ * Format: station header (Title Case, no glyph) on its own line;
+ * per-unit detail rows indented 2 chars further, prefixed
+ * `<Type> · <Location>` so the unit type and where it is read as
+ * one phrase. The bordered ACCESS section above already signals
+ * "these are access outages."
+ *
+ * To group multiple outages at the same station under a single
+ * header, use `formatStationGroup` (or rebuild the preformatted
+ * list by grouping the source incidents first).
+ *
+ * The location description is wrapped to DETAIL_TEXT_WIDTH cols so the
+ * indented detail lines don't push past SAFE_TEXT_WIDTH once
+ * `flattenBlocks` adds its own 2-col gutter and the detail inset is
+ * applied.
  */
 export function formatIncidentBlock(incident: ElevatorIncident): string[] {
-  const header = renderUnitHeader(incident);
-  const desc = (incident.LocationDescription ?? "").trim();
-  if (desc.length === 0) return [header];
-  // One-space inner indent so the description hangs under the
-  // station name. Net usable width is BODY_TEXT_WIDTH - 1 = 21.
-  const wrapped = capDescription(wrap(desc, BODY_TEXT_WIDTH - 1));
-  return [header, ...wrapped.map((l) => " " + l)];
+  return formatStationGroup(stationNameOnly(incident.StationName), [incident]);
+}
+
+/**
+ * Pre-format a group of outages at the SAME station into a single
+ * block of body rows:
+ *
+ *   ["Glenmont",
+ *    "  Elevator · Street to mezzanine, west side",
+ *    "  Escalator · Street to mezzanine, east"]
+ *
+ * Multiple-unit outages at the same station collapse under one
+ * station header — drier than the per-unit form that repeats the
+ * station name once per row.
+ */
+export function formatStationGroup(
+  stationName: string,
+  incidents: readonly ElevatorIncident[],
+): string[] {
+  const out: string[] = [
+    truncate(stationName, STATION_TEXT_WIDTH),
+  ];
+  for (const inc of incidents) {
+    const type = inc.UnitType === "ELEVATOR" ? "Elevator" : "Escalator";
+    const desc = (inc.LocationDescription ?? "").trim();
+    if (desc.length === 0) {
+      out.push(DETAIL_INSET + type);
+      continue;
+    }
+    // Wrap the bare "Type · location" content (no leading inset) at
+    // DETAIL_TEXT_WIDTH, then prepend a uniform 2-col inset to every
+    // wrapped line. With `flattenBlocks`' own 2-col gutter that's a
+    // 4-col total indent, so no rendered line exceeds SAFE_TEXT_WIDTH
+    // real chars (which would make the container re-wrap and orphan
+    // words at column 0). `capDescription` trims any dangling trailing
+    // separator off the final fragment line.
+    const wrapped = capDescription(
+      wrap(`${type} · ${desc}`, DETAIL_TEXT_WIDTH),
+    );
+    for (const line of wrapped) {
+      out.push(DETAIL_INSET + line);
+    }
+  }
+  return out;
+}
+
+/**
+ * Group incidents by station and emit one block per station group,
+ * preserving the original ordering of stations as they appeared in
+ * the source array (the WMATA API typically returns outages
+ * grouped already, but we don't rely on it).
+ */
+export function groupIncidentsByStation(
+  incidents: readonly ElevatorIncident[],
+): string[][] {
+  const groups = new Map<string, ElevatorIncident[]>();
+  for (const inc of incidents) {
+    const station = stationNameOnly(inc.StationName);
+    const existing = groups.get(station);
+    if (existing) {
+      existing.push(inc);
+    } else {
+      groups.set(station, [inc]);
+    }
+  }
+  return Array.from(groups.entries()).map(([station, incs]) =>
+    formatStationGroup(station, incs),
+  );
 }
 
 /** Flatten incident blocks into renderable body rows with separators. */
@@ -246,18 +377,6 @@ export function flattenBlocks(blocks: readonly string[][]): string[] {
     if (i < blocks.length - 1) out.push("");
   }
   return out;
-}
-
-/** Format epoch-ms timestamp as 12-hour clock (` 9:05a` / `12:32p`). Duplicated from sibling screens. */
-export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
-  const d = new Date(epochMs);
-  const h24 = d.getHours();
-  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
-  const hh = String(h12).padStart(2, " ");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ap = h24 < 12 ? "a" : "p";
-  return `${hh}:${mm}${ap}`;
 }
 
 /** Time-based staleness predicate (mirrors `Incidents` semantics). */
@@ -285,26 +404,21 @@ export function stalenessMarker(
 }
 
 /**
- * Render the header row.
+ * Render the header row: the section TITLE ONLY, left-aligned.
  *
- *   "ACCESS (n)             2:32p"   (n > 0)
- *   "ACCESS                 2:32p"   (empty)
+ *   "ACCESS (n)"   (n > 0)
+ *   "ACCESS"       (empty)
  *
- * Marker character (`*` / `**` / `?`) sits to the right of the
- * clock, consuming from the gap between the left label and the
- * clock cell. Always exactly LINE_WIDTH cols.
+ * The host now renders the wall clock + staleness marker in its own
+ * dedicated top-right container (identically on every screen), so the
+ * header no longer embeds the clock or marker. The marker is surfaced
+ * via `view()`'s `clockMarker` field. The title is truncated so it can't
+ * collide with the clock container (which starts at column ≈ 50).
  */
-export function renderHeader(
-  snapshot: ElevatorSnapshot,
-  nowMs: number,
-): string {
+export function renderHeader(snapshot: ElevatorSnapshot): string {
   const count = snapshot.incidents.length;
   const left = count > 0 ? `ACCESS (${count})` : "ACCESS";
-  const marker = stalenessMarker(snapshot, nowMs);
-  const clockStr = formatClock(nowMs);
-  const clockCell = clockStr + marker;
-  const spaces = Math.max(1, LINE_WIDTH - left.length - clockCell.length);
-  return truncate(left + " ".repeat(spaces) + clockCell, LINE_WIDTH);
+  return truncate(left, 50);
 }
 
 /**
@@ -321,7 +435,7 @@ export function makeInitialElevatorSnapshot(cache: {
     fetchedAt: cache.fetchedAt,
     fetchError: cache.fetchError,
     consecutiveFetchFailures: 0,
-    preformatted: cache.incidents.map(formatIncidentBlock),
+    preformatted: groupIncidentsByStation(cache.incidents),
   };
 }
 
@@ -347,9 +461,13 @@ export function makeElevatorScreen(
   return {
     name: "elevator",
     init: () => initialSnapshot,
-    view(snapshot, nav, ctx: ViewContext): string[] {
-      const lines: string[] = [];
-      lines.push(renderHeader(snapshot, ctx.nowMs));
+    view(snapshot, nav, ctx: ViewContext): ScreenSections {
+      const header: string[] = [renderHeader(snapshot)];
+      const body: string[] = [];
+      // Staleness marker rides in the host's top-right clock container
+      // (via `clockMarker`), no longer the header string. `ctx.nowMs`
+      // drives the time-based stale check on every 1Hz clock re-render.
+      const clockMarker = stalenessMarker(snapshot, ctx.nowMs);
 
       // Empty-data branches mirror the Incidents screen:
       // first-load fetch error gets distinct copy; otherwise the
@@ -359,26 +477,24 @@ export function makeElevatorScreen(
         snapshot.fetchedAt === 0 &&
         snapshot.fetchError !== null
       ) {
-        lines.push(truncate("Couldn't reach WMATA.", LINE_WIDTH));
-        lines.push(truncate("Will retry shortly.", LINE_WIDTH));
-        lines.push("");
-        lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-        return lines;
+        body.push(truncate("Couldn't reach WMATA. Will retry shortly.", LINE_WIDTH));
+        body.push("");
+        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        return { header, body, clockMarker };
       }
 
       if (snapshot.incidents.length === 0) {
-        lines.push(truncate("No active outages at", LINE_WIDTH));
-        lines.push(truncate("your stations.", LINE_WIDTH));
-        lines.push("");
-        lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-        return lines;
+        body.push(truncate("All access points open at your stations.", LINE_WIDTH));
+        body.push("");
+        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        return { header, body, clockMarker };
       }
 
-      const body = flattenBlocks(snapshot.preformatted);
-      const offset = clamp(nav.highlightedIndex, Math.max(0, body.length - 1));
-      const decorated = scrollWindowWithMarkers(body, offset, USABLE_ROWS);
-      for (const r of decorated) lines.push(truncate(r, LINE_WIDTH));
-      return lines;
+      const flat = flattenBlocks(snapshot.preformatted);
+      const offset = clamp(nav.highlightedIndex, Math.max(0, flat.length - 1));
+      const decorated = scrollWindowWithMarkers(flat, offset, USABLE_ROWS);
+      for (const r of decorated) body.push(truncate(r, LINE_WIDTH));
+      return { header, body, clockMarker };
     },
     reduce(snapshot, nav, event: ScreenEvent): ReduceResult<ElevatorSnapshot> {
       const body = flattenBlocks(snapshot.preformatted);
@@ -418,7 +534,7 @@ export function makeElevatorScreen(
           consecutiveFetchFailures: failed
             ? snapshot.consecutiveFetchFailures + 1
             : 0,
-          preformatted: result.incidents.map(formatIncidentBlock),
+          preformatted: groupIncidentsByStation(result.incidents),
         };
       } catch (err) {
         const message =

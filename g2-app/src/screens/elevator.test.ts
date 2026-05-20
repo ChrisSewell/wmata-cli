@@ -11,9 +11,10 @@
 //     it, fetcher result with fetchError !== null also bumps it.
 
 import { describe, expect, it } from "vitest";
-import { LINE_WIDTH } from "../ui/render";
+import { LINE_WIDTH, SAFE_TEXT_WIDTH } from "../ui/render";
 import type { ElevatorIncident } from "../wmata";
-import { initialNav, type ViewContext } from "./router";
+import {
+  flattenSections, initialNav, type ViewContext } from "./router";
 import {
   MAX_DESC_LINES,
   STALE_THRESHOLD_MS,
@@ -22,6 +23,7 @@ import {
   flattenBlocks,
   formatClock,
   formatIncidentBlock,
+  formatStationGroup,
   isStale,
   makeElevatorScreen,
   makeInitialElevatorSnapshot,
@@ -29,6 +31,7 @@ import {
   renderUnitHeader,
   stalenessMarker,
   stationNameOnly,
+  trimTrailingSeparators,
   unitGlyph,
   wrap,
   type ElevatorFetchResult,
@@ -134,11 +137,17 @@ describe("capDescription", () => {
 });
 
 describe("renderUnitHeader", () => {
+  // The unit header must fit within the body-row text budget since the
+  // caller prepends an indent prefix before rendering. `LINE_WIDTH - 2`
+  // is a loose upper bound (the impl actually caps at the tighter
+  // SAFE_TEXT_WIDTH-derived STATION_TEXT_WIDTH = 56); asserting the
+  // looser bound keeps this test agnostic to the exact inner budget.
+  const BODY_TEXT_WIDTH = LINE_WIDTH - 2;
+
   it("renders an ELEVATOR row as `E <station>`", () => {
     const out = renderUnitHeader(incident({ StationName: "Foggy Bottom-GWU" }));
     expect(out.startsWith("E ")).toBe(true);
-    // Width contract: ≤ 22 (BODY_TEXT_WIDTH).
-    expect(out.length).toBeLessThanOrEqual(22);
+    expect(out.length).toBeLessThanOrEqual(BODY_TEXT_WIDTH);
   });
 
   it("renders an ESCALATOR row as `S <station>`", () => {
@@ -148,7 +157,7 @@ describe("renderUnitHeader", () => {
     expect(out.startsWith("S ")).toBe(true);
   });
 
-  it("uses the abbreviation map for long station names", () => {
+  it("renders the station name (full or abbreviated) within the budget", () => {
     const out = renderUnitHeader(
       incident({
         StationName:
@@ -156,7 +165,7 @@ describe("renderUnitHeader", () => {
       }),
     );
     expect(out).toContain("U Street");
-    expect(out.length).toBeLessThanOrEqual(22);
+    expect(out.length).toBeLessThanOrEqual(BODY_TEXT_WIDTH);
   });
 });
 
@@ -245,66 +254,94 @@ describe("stalenessMarker", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderHeader", () => {
-  it("renders `ACCESS (n)` + clock at exactly LINE_WIDTH cols", () => {
-    const out = renderHeader(makeSnap([incident(), incident()]), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("ACCESS (2)");
-    expect(out).toContain("2:32p");
+  // The header is now the section TITLE ONLY — the host renders the wall
+  // clock + staleness marker in its own dedicated top-right container, so
+  // neither appears in the header string. The marker is asserted via
+  // `view(...).clockMarker` in the dedicated block below.
+  it("renders `ACCESS (n)` as the title only (no clock)", () => {
+    const out = renderHeader(makeSnap([incident(), incident()]));
+    expect(out).toBe("ACCESS (2)");
+    expect(out).not.toContain(":");
   });
 
   it("renders `ACCESS` (no count) when the list is empty", () => {
-    const out = renderHeader(makeSnap([]), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("ACCESS");
+    const out = renderHeader(makeSnap([]));
+    expect(out).toBe("ACCESS");
     expect(out).not.toContain("(0)");
   });
 
-  it("appends the 3-state marker per `stalenessMarker`", () => {
+  it("does not embed a stale marker even when degrading", () => {
     const out = renderHeader(
       makeSnap([incident()], {
         consecutiveFetchFailures: 2,
         fetchError: "x",
       }),
-      NOW,
     );
-    expect(out.endsWith("2:32p**")).toBe(true);
+    expect(out).toBe("ACCESS (1)");
+    expect(out).not.toContain("*");
+  });
+});
+
+describe("view: clockMarker staleness escalation", () => {
+  const markerFor = (
+    over: Partial<ElevatorSnapshot>,
+    nowMs = NOW,
+  ): string | undefined => {
+    const screen = makeElevatorScreen(noopFetcher, makeSnap([incident()], over));
+    return screen.view(screen.init(), initialNav(), { nowMs }).clockMarker;
+  };
+
+  it("is empty for fresh data, escalates '*' → '**' → '?' on failures", () => {
+    expect(markerFor({ fetchedAt: NOW })).toBe("");
+    expect(markerFor({ consecutiveFetchFailures: 1, fetchError: "x" })).toBe("*");
+    expect(markerFor({ consecutiveFetchFailures: 2, fetchError: "x" })).toBe(
+      "**",
+    );
+    expect(markerFor({ consecutiveFetchFailures: 3, fetchError: "x" })).toBe("?");
+  });
+
+  it("is '*' when the snapshot is older than STALE_THRESHOLD_MS", () => {
+    expect(markerFor({ fetchedAt: NOW - (STALE_THRESHOLD_MS + 5_000) })).toBe(
+      "*",
+    );
   });
 });
 
 describe("view: empty state", () => {
-  it("pins EXACTLY 5 lines for the friendly empty-state copy", () => {
+  it("pins EXACTLY 4 lines for the friendly empty-state copy", () => {
     const screen = makeElevatorScreen(noopFetcher, makeSnap([]));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
     expectFits(lines);
-    expect(lines.length).toBe(5);
-    // Header layout: "ACCESS" (6) + 12 spaces + " 2:32p" (6) = 24.
+    expect(lines.length).toBe(4);
+    // Header is now the bare title — the host renders the clock in its
+    // own container, so the flattened view output has no clock.
     expect(lines).toEqual([
-      "ACCESS             2:32p",
-      "No active outages at",
-      "your stations.",
+      "ACCESS",
+      "All access points open at your stations.",
       "",
       "(double-tap to return)",
     ]);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
+    expect(sections.clockMarker).toBe("");
   });
 
-  it("pins the EXACT 5-line first-load error body", () => {
+  it("pins the EXACT 4-line first-load error body", () => {
     const snap = makeSnap([], {
       fetchedAt: 0,
       fetchError: "Could not connect.",
     });
     const screen = makeElevatorScreen(noopFetcher, snap);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
     expectFits(lines);
-    // Header: "ACCESS" (6) + 11 spaces + " 2:32p?" (7) = 24.
     expect(lines).toEqual([
-      "ACCESS            2:32p?",
-      "Couldn't reach WMATA.",
-      "Will retry shortly.",
+      "ACCESS",
+      "Couldn't reach WMATA. Will retry shortly.",
       "",
       "(double-tap to return)",
     ]);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
+    // fetchedAt=0 with an active error → strongest marker rides the clock.
+    expect(sections.clockMarker).toBe("?");
   });
 });
 
@@ -323,14 +360,22 @@ describe("view: with incidents", () => {
       }),
     ];
     const screen = makeElevatorScreen(noopFetcher, makeSnap(incs));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines[0]).toContain("ACCESS (2)");
-    // Block-header rows carry the unit glyph + the (entrance-stripped)
-    // station name. The names fit within the 20-col budget without
-    // abbreviation, so they appear verbatim.
-    expect(lines.some((l) => l.includes("E Foggy Bottom-GWU"))).toBe(true);
-    expect(lines.some((l) => l.includes("S Dupont Circle"))).toBe(true);
+    // Exact pin: each station group has a header row carrying the
+    // (entrance-stripped) station name; per-unit detail lines sit
+    // beneath at a 4-col total indent, prefixed `<Type> · <location>`.
+    // The trailing period of each location is stripped (so the fragment
+    // doesn't read as a clipped sentence) BUT the interior comma in
+    // "...plat, west side" is preserved.
+    expect(lines.slice(1)).toEqual([
+      "  Foggy Bottom-GWU",
+      "    Elevator · Street to mezzanine",
+      "",
+      "  Dupont Circle",
+      "    Escalator · Mezz to plat, west side",
+    ]);
   });
 
   it("inserts a blank-line separator between consecutive outages", () => {
@@ -461,5 +506,83 @@ describe("makeInitialElevatorSnapshot", () => {
     expect(snap.incidents.length).toBe(1);
     expect(snap.preformatted.length).toBe(1);
     expect(snap.consecutiveFetchFailures).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// trimTrailingSeparators
+// ---------------------------------------------------------------------------
+
+describe("trimTrailingSeparators", () => {
+  it("strips a dangling comma / semicolon / period", () => {
+    expect(trimTrailingSeparators("Street to mezzanine,")).toBe(
+      "Street to mezzanine",
+    );
+    expect(trimTrailingSeparators("Mezzanine to platform.")).toBe(
+      "Mezzanine to platform",
+    );
+  });
+  it("leaves interior separators untouched", () => {
+    expect(trimTrailingSeparators("plat, west side")).toBe("plat, west side");
+  });
+  it("returns the input unchanged when there's no trailing separator", () => {
+    expect(trimTrailingSeparators("west side")).toBe("west side");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatStationGroup: trailing-separator strip + long-desc wrap
+// ---------------------------------------------------------------------------
+
+describe("formatStationGroup", () => {
+  it("groups multiple units under one header and strips trailing separators", () => {
+    const block = formatStationGroup("Glenmont", [
+      incident({ UnitType: "ELEVATOR", LocationDescription: "Street to mezzanine, west side." }),
+      incident({ UnitType: "ESCALATOR", LocationDescription: "Mezzanine to platform," }),
+    ]);
+    expect(block).toEqual([
+      "Glenmont",
+      "  Elevator · Street to mezzanine, west side",
+      "  Escalator · Mezzanine to platform",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overflow invariant: no rendered body line exceeds SAFE_TEXT_WIDTH
+// ---------------------------------------------------------------------------
+
+describe("elevator view: SAFE_TEXT_WIDTH overflow invariant", () => {
+  it("keeps every rendered body line at or below SAFE_TEXT_WIDTH real chars", () => {
+    const incs = [
+      incident({
+        UnitType: "ELEVATOR",
+        StationName: "U Street/African-Amer Civil War Memorial/Cardozo",
+        LocationDescription:
+          "Street level to mezzanine elevator out of service, use the Vermont Avenue entrance instead.",
+      }),
+      incident({
+        UnitType: "ESCALATOR",
+        StationName: "Foggy Bottom-GWU",
+        LocationDescription: "Mezzanine to platform, west side near the faregates.",
+      }),
+      incident({
+        UnitType: "ESCALATOR",
+        StationName: "Dupont Circle",
+        LocationDescription: "South entrance.",
+      }),
+    ];
+    const screen = makeElevatorScreen(noopFetcher, makeSnap(incs));
+    // The header row (index 0) is space-padded to LINE_WIDTH for the
+    // right-aligned clock; trailing spaces never overflow, so we only
+    // assert the real-text body rows here.
+    let nav = initialNav();
+    for (let step = 0; step < 30; step++) {
+      const lines = flattenSections(screen.view(screen.init(), nav, CTX));
+      for (const line of lines.slice(1)) {
+        expect(line.length).toBeLessThanOrEqual(SAFE_TEXT_WIDTH);
+      }
+      nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
+    }
   });
 });

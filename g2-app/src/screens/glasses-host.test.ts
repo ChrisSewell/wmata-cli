@@ -27,6 +27,7 @@ import type {
   Router,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
 
@@ -137,10 +138,10 @@ function makeTicker(initial: TickerSnapshot, intervalMs: number): Ticker {
       snapshot: TickerSnapshot,
       _nav,
       _ctx: ViewContext,
-    ): string[] {
+    ): ScreenSections {
       const lines = [`gen=${String(snapshot.generation)}`];
       ticker.latestRenderedLines = lines;
-      return lines;
+      return { header: lines, body: [] };
     },
     reduce(_s: TickerSnapshot, nav, _e: ScreenEvent) {
       return { nav };
@@ -263,8 +264,8 @@ function makeHungClockScreen(): {
   } = {
     name: "predictions",
     init: () => ({ marker: "hung" }),
-    view(snapshot, _nav, ctx: ViewContext): string[] {
-      return [`now=${ctx.nowMs}`, snapshot.marker];
+    view(snapshot, _nav, ctx: ViewContext): ScreenSections {
+      return { header: [`now=${ctx.nowMs}`], body: [snapshot.marker] };
     },
     reduce(_s, nav, _e: ScreenEvent) {
       return { nav };
@@ -346,45 +347,28 @@ describe("glasses-host clock tick (decoupled from fetch)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Page-container shape (host-side deserialiser expectations)
+// Page-container shape (host-side deserialiser + event-routing expectations)
 // ---------------------------------------------------------------------------
 //
-// The Rust simulator and the on-device Dart bridge use a strict
-// deserialiser that rejects a `ListContainerProperty` without an
-// `itemContainer`, even though the SDK's TypeScript model marks the
-// field optional. When this regression last shipped, the simulator
-// logged `Failed to parse data for CreateStartUpPageContainer: missing
-// field 'itemContainer'` and then every `textContainerUpgrade` to the
-// (never-created) container 1 failed. We pin the shape here so the
-// mistake can't sneak back in.
+// The page is a single TextContainer that fills the 576x288 panel
+// and is the page's sole event capturer. Earlier iterations mounted
+// a hidden 1x1 ListContainer "to harvest scrolls", on the assumption
+// that only LIST containers emit SCROLL_TOP/SCROLL_BOTTOM. That was
+// a misreading: lists *consume* scroll events internally for native
+// scrolling and never surface them to the page. Empirical testing
+// (simulator with `RUST_LOG=debug`) confirmed text containers
+// receive every gesture (taps, double-taps, AND swipes) when they
+// hold `isEventCapture: 1`. Pin the shape so a future "let's add a
+// list back" attempt fails loudly here instead of silently breaking
+// every swipe.
 
 describe("glasses-host page-container shape", () => {
-  it("includes an itemContainer on the scroll ListContainerProperty", async () => {
-    const { bridge, record } = makeFakeBridge();
-    const router = makeStubRouter();
-    const ticker = makeTicker({ generation: 0 }, 10_000);
-
-    const unmount = await mountGlassesScreen(ticker.screen, bridge, router);
-    try {
-      expect(record.pageCreates).toHaveLength(1);
-      const page = record.pageCreates[0]!;
-      const lists = (page.listObject ?? []);
-      expect(lists.length).toBeGreaterThan(0);
-      for (const list of lists) {
-        expect(list.itemContainer).toBeDefined();
-      }
-    } finally {
-      await unmount();
-    }
-  });
-
   // SDK README "Important Notes": when multiple containers are mounted
-  // in a single page, EXACTLY ONE may have `isEventCapture: 1`.
-  // Violating this makes the host-side deserialiser reject the page
-  // outright — and the error it surfaces is the stale "missing field
-  // `itemContainer`" parse failure, not anything mentioning event
-  // capture, so the symptom looks identical to the regression the
-  // previous test pins. Pin both shapes so neither can sneak back.
+  // in a single page, EXACTLY ONE may have `isEventCapture: 1`. The
+  // simulator's validation error for the multi-capturer case is
+  // "multiple event listeners (N) not allowed", surfaced only via
+  // `RUST_LOG=debug`; without it the page creation simply returns
+  // `invalid (1)`. Pin the shape here.
   it("has exactly one container with isEventCapture=1 (SDK constraint)", async () => {
     const { bridge, record } = makeFakeBridge();
     const router = makeStubRouter();
@@ -403,6 +387,30 @@ describe("glasses-host page-container shape", () => {
       }
       const ones = captures.filter((c) => c === 1).length;
       expect(ones).toBe(1);
+    } finally {
+      await unmount();
+    }
+  });
+
+  // The page must use a TEXT container as the event capturer, NOT a
+  // list. Lists consume scroll events internally (native scrolling)
+  // and never deliver them to the page — using a list as the
+  // capturer silently drops every swipe.
+  it("uses a TextContainer as the event capturer (no list)", async () => {
+    const { bridge, record } = makeFakeBridge();
+    const router = makeStubRouter();
+    const ticker = makeTicker({ generation: 0 }, 10_000);
+
+    const unmount = await mountGlassesScreen(ticker.screen, bridge, router);
+    try {
+      expect(record.pageCreates).toHaveLength(1);
+      const page = record.pageCreates[0]!;
+      // No list container at all — lists swallow scrolls natively.
+      expect((page.listObject ?? []).length).toBe(0);
+      const capturer = (page.textObject ?? []).find(
+        (t) => (t.isEventCapture ?? 0) === 1,
+      );
+      expect(capturer).toBeDefined();
     } finally {
       await unmount();
     }

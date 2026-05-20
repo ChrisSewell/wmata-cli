@@ -24,7 +24,7 @@ import { recordOpen } from "./storage/history";
 import { loadSettings } from "./storage/settings";
 import { mountSettingsScreen } from "./screens/settings";
 import { mountGlassesScreen } from "./screens/glasses-host";
-import { makeHomeScreen } from "./screens/home";
+import { makeHomeScreen, soonestEta } from "./screens/home";
 import {
   computeUserLines,
   makeIncidentsScreen,
@@ -116,6 +116,62 @@ function computeAffectedLines(
     }
   }
   return Array.from(out);
+}
+
+/**
+ * Fetch the soonest next-train ETA for every favorite station in ONE
+ * batched WMATA predictions call and return a `stationCode → Min token`
+ * map. The token is the raw `Min` of the soonest upcoming train at that
+ * station across all of its lines (`"4"` / `"ARR"` / `"BRD"`), or
+ * `null` when the station has no upcoming train. Drives the Home
+ * screen's live departure board.
+ *
+ * Batching: WMATA's `GetPrediction` endpoint accepts a comma-joined
+ * list of station codes (`.../GetPrediction/A01,B01,B03`) and returns a
+ * single `Trains[]` array spanning them all — so N favorites cost ONE
+ * request, not N, keeping us comfortably under the 10 req/s ceiling.
+ * The returned trains carry `LocationCode`, which we group by to find
+ * each station's soonest departure.
+ *
+ * Best-effort: any failure (network, decode) throws, and the caller
+ * (`refreshFavoriteEtas`) lets the tick swallow it so the rows linger
+ * at their last values rather than blanking. An empty favorites list
+ * short-circuits to `{}` without a network call.
+ */
+async function buildFavoriteEtaMap(
+  session: Session,
+  codes: readonly string[],
+): Promise<Record<string, string | null>> {
+  if (codes.length === 0) return {};
+  // One request for all favorites. The comma-join is the documented
+  // multi-station form of GetPrediction.
+  const url = buildRailPredictionsUrl(codes.join(","));
+  const data = await session.client.get<PredictionsResponse>(url);
+  const trains = data.Trains ?? [];
+
+  // Bucket each train's `Min` token by the station it departs from
+  // (`LocationCode`). We only collect tokens for codes the user
+  // actually favorites — the multi-station response can include
+  // platform siblings (e.g. Gallery Place B01/F01) we didn't ask for.
+  const wanted = new Set<string>(codes);
+  const minsByCode = new Map<string, string[]>();
+  for (const t of trains) {
+    const code = t.LocationCode;
+    if (!code || !wanted.has(code)) continue;
+    const bucket = minsByCode.get(code);
+    if (bucket) bucket.push(t.Min);
+    else minsByCode.set(code, [t.Min]);
+  }
+
+  // Build the map for every requested code so a station with no trains
+  // in the response gets an explicit `null` (rendered as a blank,
+  // aligned cell — distinct from the absent-key "loading" state before
+  // the first successful fetch).
+  const out: Record<string, string | null> = {};
+  for (const code of wanted) {
+    out[code] = soonestEta(minsByCode.get(code) ?? []);
+  }
+  return out;
 }
 
 /**
@@ -252,6 +308,11 @@ async function bootGlasses(): Promise<void> {
         affectedLines: computeAffectedLines(cached, userLines),
         accessOutageCount: cachedAccess,
         quietHours: evaluation.quietHours,
+        // Seed empty = "loading": no per-favorite ETA is known until
+        // the first `refreshFavoriteEtas` tick lands. An empty map
+        // renders the rows without an ETA cell content (blank, aligned)
+        // so the first paint doesn't blink an ETA in then out.
+        favoriteEtas: {},
       };
     },
     {
@@ -271,6 +332,16 @@ async function bootGlasses(): Promise<void> {
           Date.now(),
         );
         return evaluation.quietHours;
+      },
+      refreshFavoriteEtas: async (): Promise<
+        Record<string, string | null>
+      > => {
+        // Re-read favorites each tick so a phone-side edit is picked up
+        // without remounting. One batched predictions call covers them
+        // all. Any throw here propagates to the tick's allSettled, which
+        // preserves the prior ETA map (rows linger, never blank).
+        const codes = loadSettings().favorites.map((f) => f.code);
+        return buildFavoriteEtaMap(session, codes);
       },
       tickIntervalMs: 60_000,
     },

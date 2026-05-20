@@ -16,23 +16,27 @@
 //   1. Protobuf zero-value omission. `CLICK_EVENT = 0` arrives on the
 //      wire as `undefined`, NOT as `0`. We coalesce every `eventType`
 //      with `?? 0` before comparing.
-//   2. Event routing. Single taps may arrive in either `textEvent`
-//      (when a TextContainer with `isEventCapture: 1` is hit) or
-//      `sysEvent` (as a global touchpad event). Scrolls arrive in
-//      `listEvent`. Lifecycle (FOREGROUND_*, SYSTEM_EXIT) arrives in
-//      `sysEvent`. We never assume only one envelope is populated.
-//   3. ListContainer dependency for scrolls. Per the SDK docs only
-//      LIST containers emit SCROLL_TOP/SCROLL_BOTTOM events. We mount
-//      a lightweight, off-screen ListContainerProperty (0-pixel)
-//      alongside the visible TextContainer purely as a scroll-event
-//      source. The list never renders; the OS still pipes touchpad
-//      swipes to it because it has `isEventCapture: 1`. The text
-//      container is the visible-only surface, so it carries
-//      `isEventCapture: 0`. Taps then arrive via `listEvent` (the
-//      list is the page's sole event capturer) or via `sysEvent`
-//      as a global touchpad event — both paths are handled by
-//      `eventToScreenEvent` below.
-//   4. `createStartUpPageContainer` returns a `StartUpPageCreateResult`
+//   2. Event routing. The TextContainer is the page's sole event
+//      capturer (`isEventCapture: 1`), so all touchpad inputs — taps,
+//      double-taps, AND swipes — arrive as `textEvent` with the
+//      appropriate `eventType`. The `sysEvent` envelope is the
+//      fallback for global touchpad events (and the source for
+//      lifecycle events FOREGROUND_*, SYSTEM_EXIT). We handle every
+//      `OsEventTypeList` value on both envelopes so a future routing
+//      change can't silently swallow a gesture.
+//
+//      Earlier iterations of this file mounted a hidden 1x1
+//      ListContainer alongside the text purely as a scroll-event
+//      source, on the assumption that "only LIST containers emit
+//      SCROLL_TOP/SCROLL_BOTTOM" (a misreading of the SDK docs).
+//      Lists actually *consume* scroll events internally for native
+//      scrolling and never surface them to the page — the design
+//      worked at the parse level but silently dropped every swipe.
+//      We removed the list entirely once empirical testing
+//      (simulator `RUST_LOG=debug`) confirmed text containers
+//      receive scroll events as `textEvent` with eventType
+//      SCROLL_TOP_EVENT/SCROLL_BOTTOM_EVENT.
+//   3. `createStartUpPageContainer` returns a `StartUpPageCreateResult`
 //      enum. Any value other than `success (0)` is logged but does
 //      NOT throw — we still wire up event handlers so a USER can
 //      double-tap to exit. (If we threw, the user would be stuck on
@@ -40,8 +44,6 @@
 
 import {
   CreateStartUpPageContainer,
-  ListContainerProperty,
-  ListItemContainerProperty,
   OsEventTypeList,
   StartUpPageCreateResult,
   TextContainerProperty,
@@ -50,10 +52,8 @@ import {
   type EvenHubEvent,
 } from "@evenrealities/even_hub_sdk";
 
-import {
-  SCREEN_HEIGHT_PX,
-  SCREEN_WIDTH_PX,
-} from "../ui/render";
+import { SCREEN_WIDTH_PX } from "../ui/render";
+import { formatClock } from "../ui/format";
 
 import type {
   NavState,
@@ -64,15 +64,120 @@ import type {
 } from "./router";
 import { initialNav } from "./router";
 
-/** Container ID for the visible text container. */
-const TEXT_CONTAINER_ID = 1;
+// Multi-section page layout. Each section is a bordered TextContainer
+// for visual hierarchy. All screens have a HEADER (title + clock) and
+// a BODY (main content + event capturer); screens that opt into a
+// three-section layout also get a FOOTER container (used by Predictions
+// to surface incident headlines in their own bordered block).
+//
+// Heights are empirically tuned in the simulator — see
+// `g2_simulator_debugging` memory for how to verify.
+
+/** Container ID for the header text container. */
+const HEADER_CONTAINER_ID = 1;
+/** Container ID for the body text container (event capturer). */
+const BODY_CONTAINER_ID = 2;
+/** Container ID for the optional footer text container. */
+const FOOTER_CONTAINER_ID = 3;
+/**
+ * Container ID for the host-managed clock. The ID is layout-dependent
+ * so it's always the last container (after the footer, when present):
+ * 3 for two-section pages, 4 for three-section. `clockContainerId()`
+ * resolves it.
+ */
+function clockContainerId(layout: "two-section" | "three-section"): number {
+  return layout === "three-section" ? 4 : 3;
+}
+
+// --- Clock container (host-owned, top-right of every screen) ---
+/**
+ * The clock lives in its own small borderless container pinned to the
+ * top-right, so its position is identical on every screen instead of
+ * drifting with the title length (as it did when each screen embedded
+ * the clock at the end of its header string). Geometry sits INSIDE the
+ * header band (y 0..40) with margin so it never collides with the
+ * header's border. Content = `formatClock(now)` + the screen's optional
+ * `clockMarker`.
+ */
+const CLOCK_X_PX = 486;
+const CLOCK_Y_PX = 8;
+const CLOCK_WIDTH_PX = 84;
+const CLOCK_HEIGHT_PX = 24;
+
+// --- Body value-column overlay (two-column bodies) ---
+/**
+ * Container ID for the optional right-hand VALUE column. When a screen
+ * returns `ScreenSections.bodyColumns`, the host keeps the normal
+ * full-width body container (id 2) holding the LEFT lines, and overlays
+ * this small BORDERLESS container on the body's right portion with the
+ * value lines — so the value column starts at a fixed pixel x and is
+ * truly aligned (a space-padded column in the body can't be, given the
+ * variable-width font). Like the clock, it's an additive overlay, so
+ * the header/body/footer/clock IDs and geometry are unchanged. The
+ * high, fixed ID avoids colliding with the layout-dependent footer/
+ * clock IDs.
+ */
+const BODY_RIGHT_CONTAINER_ID = 7;
+/** Left x of the value-column overlay (and width to the right border). */
+const BODY_RIGHT_X_PX = 466;
+const BODY_RIGHT_WIDTH_PX = SCREEN_WIDTH_PX - BODY_RIGHT_X_PX; // 110
+
+// --- Two-section layout (default) ---
+/** Header section height for two-section pages. */
+const TWO_HEADER_HEIGHT_PX = 40;
+/** Body section y-position for two-section pages. */
+const TWO_BODY_Y_PX = TWO_HEADER_HEIGHT_PX;
+/** Body section height for two-section pages. */
+const TWO_BODY_HEIGHT_PX = 248; // 288 - 40
+
+// --- Three-section layout (Predictions) ---
+/** Header section height for three-section pages — same as two-section. */
+const THREE_HEADER_HEIGHT_PX = 40;
+/** Body section y-position for three-section pages. */
+const THREE_BODY_Y_PX = THREE_HEADER_HEIGHT_PX;
+/**
+ * Body section height. Sized to hold the densest body state — a pinned
+ * train (compact summary + schematic) ON TOP of the live train list —
+ * without clipping. The previous 120px clipped the pinned state's last
+ * row while the footer sat empty below; 160px (~5 rows) fits it and
+ * still leaves a footer for the incident alert.
+ */
+const THREE_BODY_HEIGHT_PX = 160;
+/** Footer section y-position for three-section pages. */
+const THREE_FOOTER_Y_PX = THREE_HEADER_HEIGHT_PX + THREE_BODY_HEIGHT_PX; // 200
+/**
+ * Footer section height (~3 rows). Holds the active service-alert
+ * headline wrapped at SAFE_TEXT_WIDTH (typically 2-3 lines). Smaller
+ * than before so an EMPTY footer (no incident) doesn't read as a big
+ * broken box; the screen fills it with a quiet line when there's no
+ * alert.
+ */
+const THREE_FOOTER_HEIGHT_PX = 88; // = 288 - 200
 
 /**
- * Container ID for the hidden list container we use to harvest
- * SCROLL_TOP/SCROLL_BOTTOM swipe events. The OS-side list never
- * renders any items; it exists only as an event source.
+ * Container border colour index (16-shade greyscale, 0..15). Index 8
+ * is the midpoint — visible enough to read as a frame without
+ * competing with the brighter content (rendered at ~14-15).
  */
-const LIST_CONTAINER_ID = 2;
+const BORDER_COLOR = 8;
+
+/**
+ * Border-radius (0..10) for the container corners. A small non-zero
+ * value gives the bordered sections a "card" feel instead of sharp
+ * 90° corners. Empirically tuned in the simulator.
+ */
+const BORDER_RADIUS = 4;
+
+/** Padding inside every container, in pixels. A small inset keeps
+ *  content (especially the cursor marker and first text column) from
+ *  sitting flush against the bordered frame — it was previously 0 on
+ *  the theory that right-anchored content could then reach the right
+ *  border, but the variable-width font means space-padded right
+ *  content never reaches the border anyway, so the inset is pure
+ *  upside: every screen breathes and nothing collides with the frame. */
+const HEADER_PADDING = 6;
+const BODY_PADDING = 6;
+const FOOTER_PADDING = 6;
 
 /**
  * Cadence for the screen-independent clock-only re-render. Every
@@ -105,26 +210,29 @@ function normalizeEventType(raw: OsEventTypeList | undefined): OsEventTypeList {
  * navigation gestures.
  */
 export function eventToScreenEvent(event: EvenHubEvent): ScreenEvent | null {
-  const list = event.listEvent;
-  if (list) {
-    const t = normalizeEventType(list.eventType);
-    if (t === OsEventTypeList.SCROLL_TOP_EVENT) return { type: "SCROLL_UP" };
-    if (t === OsEventTypeList.SCROLL_BOTTOM_EVENT) return { type: "SCROLL_DOWN" };
-    if (t === OsEventTypeList.CLICK_EVENT) return { type: "TAP" };
-    if (t === OsEventTypeList.DOUBLE_CLICK_EVENT) return { type: "DOUBLE_TAP" };
-  }
+  // The text container captures every touchpad gesture (it is the
+  // page's sole event capturer); the sys envelope is the global
+  // fallback. Both can carry scroll AND tap event types — handle
+  // all four `OsEventTypeList` gesture values on both.
   const text = event.textEvent;
   if (text) {
-    const t = normalizeEventType(text.eventType);
-    if (t === OsEventTypeList.CLICK_EVENT) return { type: "TAP" };
-    if (t === OsEventTypeList.DOUBLE_CLICK_EVENT) return { type: "DOUBLE_TAP" };
+    const mapped = mapGestureEventType(normalizeEventType(text.eventType));
+    if (mapped) return mapped;
   }
   const sys = event.sysEvent;
   if (sys) {
-    const t = normalizeEventType(sys.eventType);
-    if (t === OsEventTypeList.CLICK_EVENT) return { type: "TAP" };
-    if (t === OsEventTypeList.DOUBLE_CLICK_EVENT) return { type: "DOUBLE_TAP" };
+    const mapped = mapGestureEventType(normalizeEventType(sys.eventType));
+    if (mapped) return mapped;
   }
+  return null;
+}
+
+/** Map a touchpad-gesture `OsEventTypeList` value to a `ScreenEvent`. */
+function mapGestureEventType(t: OsEventTypeList): ScreenEvent | null {
+  if (t === OsEventTypeList.CLICK_EVENT) return { type: "TAP" };
+  if (t === OsEventTypeList.DOUBLE_CLICK_EVENT) return { type: "DOUBLE_TAP" };
+  if (t === OsEventTypeList.SCROLL_TOP_EVENT) return { type: "SCROLL_UP" };
+  if (t === OsEventTypeList.SCROLL_BOTTOM_EVENT) return { type: "SCROLL_DOWN" };
   return null;
 }
 
@@ -140,65 +248,158 @@ export function isSystemExit(event: EvenHubEvent): boolean {
 }
 
 /**
- * Build the page container spec. Exposed for tests / future reuse.
+ * Build the page container spec. Each section is a bordered
+ * `TextContainerProperty`:
  *
- * We mount two containers per page: a TextContainer that fills the
- * 576x288 panel, and a 1x1 ListContainer parked at (0,0) that exists
- * only to receive SCROLL_TOP/SCROLL_BOTTOM swipes. The text is drawn
- * over the (invisible) list, so the user sees only the text.
+ *   ┌───────────────────────────────┐ HEADER (compact title bar)
+ *   │ Station name           14:32  │
+ *   ├───────────────────────────────┤
+ *   │  > RD SHADY GROVE      4 min  │ BODY (event capturer)
+ *   │    RD GLENMONT        12 min  │
+ *   ├───────────────────────────────┤
+ *   │ ! Service alert text wrapped  │ FOOTER (3-section only)
+ *   │   across multiple lines…      │
+ *   └───────────────────────────────┘
+ *
+ * The body holds `isEventCapture: 1`; all touchpad gestures (TAP,
+ * DOUBLE_TAP, SCROLL_UP, SCROLL_DOWN) arrive as `textEvent` on the
+ * body — see `eventToScreenEvent`. Header / footer are decorative.
  */
-function buildPage(initialContent: string): CreateStartUpPageContainer {
-  // SDK rule (README "Important Notes"): when a page has multiple
-  // containers, EXACTLY ONE may carry `isEventCapture: 1` — all others
-  // must be `0`. The on-device deserialiser and the simulator both
-  // reject the whole page when this is violated, surfacing a stale
-  // "missing field `itemContainer`" parse error rather than a useful
-  // validation message. We park the capture flag on the list (it is
-  // the documented source for SCROLL_TOP/SCROLL_BOTTOM, and taps
-  // fall through via `listEvent.CLICK` or `sysEvent`).
-  const text = new TextContainerProperty({
+/** Compose the clock-cell text: the wall clock + an optional staleness
+ *  marker the screen surfaced via `ScreenSections.clockMarker`. */
+export function clockContent(nowMs: number, marker: string | undefined): string {
+  return formatClock(nowMs) + (marker ?? "");
+}
+
+/** Build the host-owned clock container for a given layout. */
+function makeClockContainer(
+  layout: "two-section" | "three-section",
+  content: string,
+): TextContainerProperty {
+  return new TextContainerProperty({
+    xPosition: CLOCK_X_PX,
+    yPosition: CLOCK_Y_PX,
+    width: CLOCK_WIDTH_PX,
+    height: CLOCK_HEIGHT_PX,
+    borderWidth: 0,
+    paddingLength: 0,
+    containerID: clockContainerId(layout),
+    containerName: "wmata.clock",
+    isEventCapture: 0,
+    content,
+  });
+}
+
+/** Build the borderless value-column overlay for a two-column body. */
+function makeBodyRightContainer(
+  layout: "two-section" | "three-section",
+  content: string,
+): TextContainerProperty {
+  const is3 = layout === "three-section";
+  return new TextContainerProperty({
+    xPosition: BODY_RIGHT_X_PX,
+    yPosition: is3 ? THREE_BODY_Y_PX : TWO_BODY_Y_PX,
+    width: BODY_RIGHT_WIDTH_PX,
+    height: is3 ? THREE_BODY_HEIGHT_PX : TWO_BODY_HEIGHT_PX,
+    borderWidth: 0,
+    paddingLength: BODY_PADDING,
+    containerID: BODY_RIGHT_CONTAINER_ID,
+    containerName: "wmata.bodyR",
+    isEventCapture: 0,
+    content,
+  });
+}
+
+function buildPage(
+  layout: "two-section" | "three-section",
+  initialHeader: string,
+  initialBody: string,
+  initialFooter: string,
+  initialClock: string,
+  hasColumns: boolean,
+  initialBodyRight: string,
+): CreateStartUpPageContainer {
+  if (layout === "three-section") {
+    const header = new TextContainerProperty({
+      xPosition: 0,
+      yPosition: 0,
+      width: SCREEN_WIDTH_PX,
+      height: THREE_HEADER_HEIGHT_PX,
+      borderWidth: 1,
+      borderColor: BORDER_COLOR,
+      borderRadius: BORDER_RADIUS,
+      paddingLength: HEADER_PADDING,
+      containerID: HEADER_CONTAINER_ID,
+      containerName: "wmata.header",
+      isEventCapture: 0,
+      content: initialHeader,
+    });
+    const body = new TextContainerProperty({
+      xPosition: 0,
+      yPosition: THREE_BODY_Y_PX,
+      width: SCREEN_WIDTH_PX,
+      height: THREE_BODY_HEIGHT_PX,
+      borderWidth: 1,
+      borderColor: BORDER_COLOR,
+      borderRadius: BORDER_RADIUS,
+      paddingLength: BODY_PADDING,
+      containerID: BODY_CONTAINER_ID,
+      containerName: "wmata.body",
+      isEventCapture: 1,
+      content: initialBody,
+    });
+    const footer = new TextContainerProperty({
+      xPosition: 0,
+      yPosition: THREE_FOOTER_Y_PX,
+      width: SCREEN_WIDTH_PX,
+      height: THREE_FOOTER_HEIGHT_PX,
+      borderWidth: 1,
+      borderColor: BORDER_COLOR,
+      borderRadius: BORDER_RADIUS,
+      paddingLength: FOOTER_PADDING,
+      containerID: FOOTER_CONTAINER_ID,
+      containerName: "wmata.footer",
+      isEventCapture: 0,
+      content: initialFooter,
+    });
+    const three = [header, body, footer, makeClockContainer(layout, initialClock)];
+    if (hasColumns) three.push(makeBodyRightContainer(layout, initialBodyRight));
+    return new CreateStartUpPageContainer({
+      containerTotalNum: three.length,
+      textObject: three,
+    });
+  }
+  const header = new TextContainerProperty({
     xPosition: 0,
     yPosition: 0,
     width: SCREEN_WIDTH_PX,
-    height: SCREEN_HEIGHT_PX,
-    borderWidth: 0,
-    borderColor: 5,
-    paddingLength: 4,
-    containerID: TEXT_CONTAINER_ID,
-    containerName: "wmata.main",
+    height: TWO_HEADER_HEIGHT_PX,
+    borderWidth: 1,
+    borderColor: BORDER_COLOR,
+    paddingLength: HEADER_PADDING,
+    containerID: HEADER_CONTAINER_ID,
+    containerName: "wmata.header",
     isEventCapture: 0,
-    content: initialContent,
+    content: initialHeader,
   });
-  // `itemContainer` is non-optional in the host-side (Rust simulator /
-  // Dart glasses) deserialiser, even though the SDK's TypeScript model
-  // marks it `?`. Omitting it makes the simulator reject the whole
-  // `CreateStartUpPageContainer` with "missing field `itemContainer`",
-  // after which container 1 doesn't exist and every subsequent
-  // `textContainerUpgrade` fails with "container 1 not found". The
-  // scroll list never actually renders any items, so we hand it a
-  // zero-item descriptor purely to satisfy the schema.
-  const list = new ListContainerProperty({
+  const body = new TextContainerProperty({
     xPosition: 0,
-    yPosition: 0,
-    width: 1,
-    height: 1,
-    borderWidth: 0,
-    borderColor: 0,
-    paddingLength: 0,
-    containerID: LIST_CONTAINER_ID,
-    containerName: "wmata.scroll",
+    yPosition: TWO_BODY_Y_PX,
+    width: SCREEN_WIDTH_PX,
+    height: TWO_BODY_HEIGHT_PX,
+    borderWidth: 1,
+    borderColor: BORDER_COLOR,
+    paddingLength: BODY_PADDING,
+    containerID: BODY_CONTAINER_ID,
+    containerName: "wmata.body",
     isEventCapture: 1,
-    itemContainer: new ListItemContainerProperty({
-      itemCount: 0,
-      itemWidth: 0,
-      isItemSelectBorderEn: 0,
-      itemName: [],
-    }),
+    content: initialBody,
   });
+  const two = [header, body, makeClockContainer(layout, initialClock)];
+  if (hasColumns) two.push(makeBodyRightContainer(layout, initialBodyRight));
   return new CreateStartUpPageContainer({
-    containerTotalNum: 2,
-    textObject: [text],
-    listObject: [list],
+    containerTotalNum: two.length,
+    textObject: two,
   });
 }
 
@@ -241,12 +442,24 @@ export async function mountGlassesScreen<S>(
    */
   let clockTimer: ReturnType<typeof setInterval> | null = null;
   /**
-   * Last content string we successfully pushed to the bridge. Used
-   * to skip a redundant `textContainerUpgrade` when a clock tick
+   * Last content strings we successfully pushed to each container.
+   * Used to skip a redundant `textContainerUpgrade` when a clock tick
    * lands inside the same minute (i.e. the rendered string is byte-
-   * identical to the previous one). Reset on unmount.
+   * identical to the previous one). One entry per container.
    */
-  let lastRenderedContent: string | null = null;
+  let lastRenderedHeader: string | null = null;
+  let lastRenderedBody: string | null = null;
+  let lastRenderedBodyRight: string | null = null;
+  let lastRenderedFooter: string | null = null;
+  let lastRenderedClock: string | null = null;
+
+  /**
+   * The screen's static layout mode. Cached because it controls
+   * whether the footer container exists; switching it at runtime
+   * would require re-creating the page.
+   */
+  const layoutMode: "two-section" | "three-section" =
+    screen.layout ?? "two-section";
 
   // Single-flight tick guard.
   //
@@ -292,28 +505,123 @@ export async function mountGlassesScreen<S>(
   // steady between fetch ticks).
   const render = async (): Promise<void> => {
     if (!active) return;
-    const lines = screen.view(snapshot, nav, makeCtx());
-    const content = joinForRender(lines);
-    if (content === lastRenderedContent) return;
-    const update = new TextContainerUpgrade({
-      containerID: TEXT_CONTAINER_ID,
-      content,
-    });
-    try {
-      await bridge.textContainerUpgrade(update);
-      lastRenderedContent = content;
-    } catch (err) {
-      console.warn(`[glasses-host] textContainerUpgrade failed:`, err);
+    const ctx = makeCtx();
+    const sections = screen.view(snapshot, nav, ctx);
+    const headerContent = joinForRender(sections.header);
+    // Two-column body: the LEFT lines go in the normal body container,
+    // the RIGHT (value) lines in the borderless overlay. Single-column
+    // screens just render `body`.
+    const cols = sections.bodyColumns;
+    const bodyContent = joinForRender(cols ? cols.left : sections.body);
+    const bodyRightContent = cols ? joinForRender(cols.right) : null;
+    const footerContent = joinForRender(sections.footer ?? []);
+    const clockText = clockContent(ctx.nowMs, sections.clockMarker);
+    // Each container is independently de-duped — the clock-only tick
+    // changes the header inside the minute but body/footer stay
+    // identical, so we typically push at most one upgrade per second.
+    if (headerContent !== lastRenderedHeader) {
+      try {
+        await bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: HEADER_CONTAINER_ID,
+            content: headerContent,
+          }),
+        );
+        lastRenderedHeader = headerContent;
+      } catch (err) {
+        console.warn(`[glasses-host] header textContainerUpgrade failed:`, err);
+      }
+    }
+    if (bodyContent !== lastRenderedBody) {
+      try {
+        await bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: BODY_CONTAINER_ID,
+            content: bodyContent,
+          }),
+        );
+        lastRenderedBody = bodyContent;
+      } catch (err) {
+        console.warn(`[glasses-host] body textContainerUpgrade failed:`, err);
+      }
+    }
+    if (bodyRightContent !== null && bodyRightContent !== lastRenderedBodyRight) {
+      try {
+        await bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: BODY_RIGHT_CONTAINER_ID,
+            content: bodyRightContent,
+          }),
+        );
+        lastRenderedBodyRight = bodyRightContent;
+      } catch (err) {
+        console.warn(`[glasses-host] body-right textContainerUpgrade failed:`, err);
+      }
+    }
+    if (
+      layoutMode === "three-section" &&
+      footerContent !== lastRenderedFooter
+    ) {
+      try {
+        await bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: FOOTER_CONTAINER_ID,
+            content: footerContent,
+          }),
+        );
+        lastRenderedFooter = footerContent;
+      } catch (err) {
+        console.warn(`[glasses-host] footer textContainerUpgrade failed:`, err);
+      }
+    }
+    // Host-owned clock container (top-right, every screen). Updated
+    // here so the minute flip + any staleness marker stay live on the
+    // 1Hz tick; de-duped so a same-minute tick is a no-op.
+    if (clockText !== lastRenderedClock) {
+      try {
+        await bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: clockContainerId(layoutMode),
+            content: clockText,
+          }),
+        );
+        lastRenderedClock = clockText;
+      } catch (err) {
+        console.warn(`[glasses-host] clock textContainerUpgrade failed:`, err);
+      }
     }
   };
 
   // Mount the page. A non-success result still leaves event handlers
   // wired so the user can double-tap out.
-  const initialContent = joinForRender(screen.view(snapshot, nav, makeCtx()));
-  lastRenderedContent = initialContent;
+  const initialCtx = makeCtx();
+  const initialSections = screen.view(snapshot, nav, initialCtx);
+  // Two-column mode is static per screen (decided by whether `view`
+  // returns `bodyColumns`), so it's safe to commit the container set at
+  // mount from the first render.
+  const initialCols = initialSections.bodyColumns;
+  const hasColumns = initialCols != null;
+  const initialHeader = joinForRender(initialSections.header);
+  const initialBody = joinForRender(initialCols ? initialCols.left : initialSections.body);
+  const initialBodyRight = initialCols ? joinForRender(initialCols.right) : "";
+  const initialFooter = joinForRender(initialSections.footer ?? []);
+  const initialClock = clockContent(initialCtx.nowMs, initialSections.clockMarker);
+  lastRenderedHeader = initialHeader;
+  lastRenderedBody = initialBody;
+  lastRenderedBodyRight = hasColumns ? initialBodyRight : null;
+  lastRenderedFooter = initialFooter;
+  lastRenderedClock = initialClock;
   try {
     const result = await bridge.createStartUpPageContainer(
-      buildPage(initialContent),
+      buildPage(
+        layoutMode,
+        initialHeader,
+        initialBody,
+        initialFooter,
+        initialClock,
+        hasColumns,
+        initialBodyRight,
+      ),
     );
     if (result !== StartUpPageCreateResult.success) {
       console.warn(
@@ -458,7 +766,11 @@ export async function mountGlassesScreen<S>(
     }
     // Forget the dedupe cache so a future re-mount of the same screen
     // doesn't accidentally short-circuit its first render.
-    lastRenderedContent = null;
+    lastRenderedHeader = null;
+    lastRenderedBody = null;
+    lastRenderedBodyRight = null;
+    lastRenderedFooter = null;
+    lastRenderedClock = null;
     try {
       unsubscribe();
     } catch (err) {

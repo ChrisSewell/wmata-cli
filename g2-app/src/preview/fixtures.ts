@@ -60,6 +60,7 @@ export const HOME_EMPTY: HomeSnapshot = {
   affectedLines: [],
   accessOutageCount: 0,
   quietHours: false,
+  favoriteEtas: {},
 };
 
 export const HOME_THREE_FAVS: HomeSnapshot = {
@@ -71,6 +72,13 @@ export const HOME_THREE_FAVS: HomeSnapshot = {
   affectedLines: [],
   accessOutageCount: 0,
   quietHours: false,
+  // Live departure board: a numeric ETA, a 2-digit ETA, and an ARR
+  // sentinel — exercises every ETA-cell variant in the gallery.
+  favoriteEtas: {
+    [FAV_METRO_CENTER.code]: '4',
+    [FAV_GALLERY_PL.code]: '12',
+    [FAV_UNION_STN.code]: 'ARR',
+  },
 };
 
 export const HOME_WITH_ALERTS: HomeSnapshot = {
@@ -102,6 +110,15 @@ export const HOME_FIVE_FAVS: HomeSnapshot = {
   affectedLines: [],
   accessOutageCount: 0,
   quietHours: false,
+  // Mix of variants incl. one BRD and one not-yet-loaded (absent key →
+  // blank, aligned cell) to show the full board at the 5-favorite cap.
+  favoriteEtas: {
+    [FAV_METRO_CENTER.code]: 'BRD',
+    [FAV_GALLERY_PL.code]: '3',
+    [FAV_UNION_STN.code]: '8',
+    [FAV_FOGGY_BTM.code]: '15',
+    // FAV_LENFANT intentionally omitted → loading / blank cell.
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -373,7 +390,7 @@ export const JOURNEY_SAME_LINE: JourneySnapshot = {
   destinationName: 'Foggy Bottom-GWU',
   transferName: '',
   legs: [SAME_LINE_LEG],
-  nextTrain: { line: 'BL', min: '5', destination: 'Franc-Spr' },
+  nextTrain: { line: 'BL', min: '5', destination: 'Franconia-Springfield' },
   fetchedAt: NOW,
   fetchError: null,
 };
@@ -394,7 +411,7 @@ export const JOURNEY_TWO_LEG: JourneySnapshot = {
   destinationName: 'Pentagon City',
   transferName: "L'Enfant Plaza",
   legs: [LEG_A, LEG_B],
-  nextTrain: { line: 'OR', min: '3', destination: 'New Carr' },
+  nextTrain: { line: 'OR', min: '3', destination: 'New Carrollton' },
   fetchedAt: NOW,
   fetchError: null,
 };

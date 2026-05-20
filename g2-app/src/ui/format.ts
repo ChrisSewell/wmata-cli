@@ -45,6 +45,30 @@ export function formatEta(min: string): string {
 }
 
 /**
+ * Format an epoch-millis wall clock as a 12-hour HUD label. Always
+ * exactly 6 chars: 2-char hour (space-padded), ":", 2-char minute, and
+ * a 1-char `a`/`p` suffix — e.g. " 2:32p", "12:05a". An invalid /
+ * non-positive input renders " --:--" (also 6 chars) so the clock cell
+ * stays a fixed width.
+ *
+ * This is the single source of truth for the HUD clock. The host
+ * (`glasses-host.ts`) renders it into a dedicated top-right clock
+ * container on every screen; screens no longer embed the clock in their
+ * header string. The 12-hour convention matches `formatEta` and the
+ * predictions/journey time labels.
+ */
+export function formatClock(epochMs: number): string {
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
+  const d = new Date(epochMs);
+  const h24 = d.getHours();
+  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+  const hh = String(h12).padStart(2, " ");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ap = h24 < 12 ? "a" : "p";
+  return `${hh}:${mm}${ap}`;
+}
+
+/**
  * Render a line code as a fixed-width 2-character glyph. Unknown,
  * blank, or non-revenue line codes collapse to `--` so the column stays
  * aligned in a `row(...)` composition.
@@ -60,6 +84,32 @@ export function lineGlyph(line: string): string {
   ]);
   if (known.has(line as LineCode)) return line;
   return "--";
+}
+
+/**
+ * Map a WMATA line code (`RD` / `BL` / …) to its spelled-out
+ * line name (`RED` / `BLUE` / …). Used wherever the glasses panel
+ * has room for the full word — which, at LINE_WIDTH≥48, is most
+ * places. Unknown codes collapse to the original input (so the
+ * caller can fall back to truncation rather than getting "--").
+ */
+export function lineName(line: string): string {
+  switch (line) {
+    case "RD":
+      return "RED";
+    case "BL":
+      return "BLUE";
+    case "YL":
+      return "YELLOW";
+    case "OR":
+      return "ORANGE";
+    case "GR":
+      return "GREEN";
+    case "SV":
+      return "SILVER";
+    default:
+      return line;
+  }
 }
 
 /**
@@ -189,6 +239,44 @@ export function abbreviateStation(name: string, maxLen: number): string {
   // truncating the abbrev (shorter source = less information loss).
   const source = abbr ?? name;
   return source.length <= maxLen ? source : truncate(source, maxLen);
+}
+
+/**
+ * Title-case a strict-uppercase string. Used to normalise WMATA's
+ * all-caps destination strings ("SHADY GROVE") into readable Title
+ * Case ("Shady Grove") without mangling mixed-case input.
+ *
+ * Behaviour:
+ *   - Input containing any lowercase letter is returned unchanged —
+ *     "Vienna/Fairfax-GMU", "Foggy Bottom-GWU", "L'Enfant Plaza" all
+ *     pass through verbatim. This is the typical case for the
+ *     `DestinationName` field.
+ *   - Input that is entirely uppercase (or has no letters at all)
+ *     gets first-letter-of-each-word capitalisation — "SHADY
+ *     GROVE" → "Shady Grove".
+ *   - Word boundaries are whitespace only; in-word punctuation like
+ *     `-` and `/` is preserved (so "WIEHLE-RESTON EAST" becomes
+ *     "Wiehle-reston East" — the inner-token capitalisation is
+ *     left to the caller / fixture data).
+ *   - Empty or null-ish input returns "".
+ */
+export function toTitleCase(text: string): string {
+  if (!text) return "";
+  // Already has lowercase → trust the source casing and pass through.
+  if (/[a-z]/.test(text)) return text;
+  // A single all-caps token that's either short (≤3 chars) or
+  // contains a hyphen reads as a status code or abbreviation
+  // ("VN", "ARR", "T-BRD"). Preserve verbatim.
+  if (!/\s/.test(text) && (text.length <= 3 || text.includes("-"))) {
+    return text;
+  }
+  return text
+    .split(/(\s+)/)
+    .map((token) => {
+      if (token.length === 0 || /^\s+$/.test(token)) return token;
+      return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase();
+    })
+    .join("");
 }
 
 // Re-export ELLIPSIS so screens can match the rendering layer without a

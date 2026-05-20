@@ -9,8 +9,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LINE_WIDTH } from "../ui/render";
-import { initialNav, type ViewContext } from "./router";
-import { makeTutorialScreen, TUTORIAL_LINES } from "./tutorial";
+import {
+  flattenSections, initialNav, type ViewContext } from "./router";
+import {
+  TUTORIAL_BODY_LINES,
+  TUTORIAL_TITLE,
+  makeTutorialScreen,
+  renderHeader,
+} from "./tutorial";
 import { loadSettings, markTutorialSeen } from "../storage/settings";
 
 // ---------------------------------------------------------------------------
@@ -52,7 +58,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const CTX: ViewContext = { nowMs: 0 };
+/** Fixed wall clock — May 18 2026 14:32 local. */
+const NOW = new Date(2026, 4, 18, 14, 32, 0).getTime();
+const CTX: ViewContext = { nowMs: NOW };
 
 // ---------------------------------------------------------------------------
 // view
@@ -61,22 +69,28 @@ const CTX: ViewContext = { nowMs: 0 };
 describe("tutorial view", () => {
   it("renders EXACTLY 8 lines (lock per the WP6 pattern)", () => {
     const screen = makeTutorialScreen();
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expect(lines.length).toBe(8);
   });
 
   it("every line is ≤ LINE_WIDTH columns", () => {
     const screen = makeTutorialScreen();
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     for (const line of lines) {
       expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
     }
   });
 
-  it("matches the canonical TUTORIAL_LINES verbatim", () => {
+  it("renders the title in the header and the body cheat sheet", () => {
     const screen = makeTutorialScreen();
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines).toEqual([...TUTORIAL_LINES]);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    // Header at the top: title only — the host renders the clock in its
+    // own top-right container, so it's no longer in the header string.
+    expect(lines[0]).toBe(renderHeader());
+    expect(lines[0]).toBe(TUTORIAL_TITLE);
+    expect(lines[0]).not.toContain(" 2:32p");
+    // Body matches the canonical cheat-sheet verbatim.
+    expect(lines.slice(1)).toEqual([...TUTORIAL_BODY_LINES]);
   });
 });
 

@@ -10,7 +10,13 @@
 // The composer runs entirely in the browser — no SDK bridge needed.
 // `npm run dev` then visit `/preview.html`.
 
-import { initialNav, type NavState, type Screen, type ViewContext } from '../screens/router';
+import {
+  flattenSections,
+  initialNav,
+  type NavState,
+  type Screen,
+  type ViewContext,
+} from '../screens/router';
 import { LINE_WIDTH, USABLE_ROWS } from '../ui/render';
 
 import { makeHomeScreen } from '../screens/home';
@@ -23,7 +29,7 @@ import { makeTutorialScreen } from '../screens/tutorial';
 
 import * as F from './fixtures';
 
-interface ScreenCard<S> {
+export interface ScreenCard<S> {
   title: string;
   caption: string;
   screen: Screen<S>;
@@ -37,7 +43,7 @@ interface ScreenCard<S> {
  * its snapshot fixture + the right `nav` and `nowMs` to surface the
  * intended state.
  */
-function buildCards(): ScreenCard<unknown>[] {
+export function buildCards(): ScreenCard<unknown>[] {
   const dayCtx: ViewContext = { nowMs: F.NOW };
   const eveningCtx: ViewContext = { nowMs: F.EVENING };
   const noopHomeFetcher = () => Promise.resolve([]);
@@ -411,7 +417,9 @@ function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 function renderCard(card: ScreenCard<unknown>): HTMLElement {
-  const lines = card.screen.view(card.snapshot, card.nav, card.ctx);
+  const lines = flattenSections(
+    card.screen.view(card.snapshot, card.nav, card.ctx),
+  );
   const wrapper = el('section', { class: 'wmata-preview__card' });
   wrapper.appendChild(el('h2', { class: 'wmata-preview__title' }, [card.title]));
   wrapper.appendChild(
