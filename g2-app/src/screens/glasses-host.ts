@@ -100,9 +100,15 @@ function clockContainerId(layout: "two-section" | "three-section"): number {
  * `clockMarker`.
  */
 const CLOCK_X_PX = 486;
-const CLOCK_Y_PX = 8;
+const CLOCK_Y_PX = 6;
 const CLOCK_WIDTH_PX = 84;
-const CLOCK_HEIGHT_PX = 24;
+/**
+ * Height must exceed the font's line height with margin — at 24px (≈ the
+ * line height) the single clock line sat exactly at the container bound
+ * and LVGL drew an auto-scrollbar in the top-right of the header. 30px
+ * leaves slack so no scrollbar appears (6 + 30 = 36 ≤ the 44px header).
+ */
+const CLOCK_HEIGHT_PX = 30;
 
 // --- Body value-column overlay (two-column bodies) ---
 /**
@@ -124,15 +130,19 @@ const BODY_RIGHT_WIDTH_PX = SCREEN_WIDTH_PX - BODY_RIGHT_X_PX; // 110
 
 // --- Two-section layout (default) ---
 /** Header section height for two-section pages. */
-const TWO_HEADER_HEIGHT_PX = 40;
+// 44 (not 40): at 40 the header's inner area (40 − 2 border − 2×6
+// padding = 26px) exactly equalled the font line height, so LVGL drew an
+// auto-scrollbar in the header's top-right. 44 gives the single title
+// line clear room (inner 30px) — no scrollbar.
+const TWO_HEADER_HEIGHT_PX = 44;
 /** Body section y-position for two-section pages. */
 const TWO_BODY_Y_PX = TWO_HEADER_HEIGHT_PX;
 /** Body section height for two-section pages. */
-const TWO_BODY_HEIGHT_PX = 248; // 288 - 40
+const TWO_BODY_HEIGHT_PX = 244; // 288 - 44
 
 // --- Three-section layout (Predictions) ---
 /** Header section height for three-section pages — same as two-section. */
-const THREE_HEADER_HEIGHT_PX = 40;
+const THREE_HEADER_HEIGHT_PX = 44; // see TWO_HEADER_HEIGHT_PX (scrollbar fix)
 /** Body section y-position for three-section pages. */
 const THREE_BODY_Y_PX = THREE_HEADER_HEIGHT_PX;
 /**
@@ -152,7 +162,7 @@ const THREE_FOOTER_Y_PX = THREE_HEADER_HEIGHT_PX + THREE_BODY_HEIGHT_PX; // 200
  * broken box; the screen fills it with a quiet line when there's no
  * alert.
  */
-const THREE_FOOTER_HEIGHT_PX = 88; // = 288 - 200
+const THREE_FOOTER_HEIGHT_PX = 84; // = 288 - 204
 
 /**
  * Container border colour index (16-shade greyscale, 0..15). Index 8

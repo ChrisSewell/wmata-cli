@@ -37,21 +37,22 @@ const FOOTER_ID = 3;
 const clockId = (layout: Layout): number =>
   layout === "three-section" ? 4 : 3;
 
-const TWO_HEADER_H = 40;
-const TWO_BODY_Y = 40;
-const TWO_BODY_H = 248;
+const TWO_HEADER_H = 44;
+const TWO_BODY_Y = 44;
+const TWO_BODY_H = 244;
 
-const THREE_HEADER_H = 40;
-const THREE_BODY_Y = 40;
+const THREE_HEADER_H = 44;
+const THREE_BODY_Y = 44;
 const THREE_BODY_H = 160;
-const THREE_FOOTER_Y = 200;
-const THREE_FOOTER_H = 88;
+const THREE_FOOTER_Y = 204;
+const THREE_FOOTER_H = 84;
 
-// Clock container (mirrors glasses-host.ts).
+// Clock container (mirrors glasses-host.ts). Height > line height so the
+// single clock line doesn't trip LVGL's auto-scrollbar in the header.
 const CLOCK_X = 486;
-const CLOCK_Y = 8;
+const CLOCK_Y = 6;
 const CLOCK_W = 84;
-const CLOCK_H = 24;
+const CLOCK_H = 30;
 
 // Body value-column overlay (mirrors glasses-host.ts).
 const BODY_RIGHT_ID = 7;
