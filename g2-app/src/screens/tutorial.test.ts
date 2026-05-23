@@ -8,7 +8,8 @@
 //     are absorbed as a no-op).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LINE_WIDTH } from "../ui/render";
+import { textWidth } from "../ui/render";
+import { SECTION_INNER_WIDTH_PX } from "../ui/geometry";
 import {
   flattenSections, initialNav, type ViewContext } from "./router";
 import {
@@ -73,11 +74,11 @@ describe("tutorial view", () => {
     expect(lines.length).toBe(8);
   });
 
-  it("every line is ≤ LINE_WIDTH columns", () => {
+  it("every line fits the section inner pixel width", () => {
     const screen = makeTutorialScreen();
     const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     for (const line of lines) {
-      expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+      expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
     }
   });
 

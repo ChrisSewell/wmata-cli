@@ -165,8 +165,16 @@ export interface ScreenSections {
    * states). When present the host renders these INSTEAD of `body`;
    * `flattenSections` reconstructs a flat row list (for tests / the
    * monospace gallery) by zipping the two columns.
+   *
+   * `rightWidthPx` is the RESERVED pixel width of the value column's
+   * content. The host sizes and right-positions the overlay container
+   * from it ONCE at mount (container geometry can't change afterward —
+   * only content), so it must be the worst-case value width, not the
+   * current render's. The screen budgets its left column around the same
+   * reserve so the two never overlap. Defaults to a small fixed width
+   * when omitted.
    */
-  bodyColumns?: { left: string[]; right: string[] };
+  bodyColumns?: { left: string[]; right: string[]; rightWidthPx?: number };
 }
 
 /** Char width of the left column in the flat (`flattenSections`)

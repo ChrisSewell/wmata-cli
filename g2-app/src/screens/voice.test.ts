@@ -20,7 +20,8 @@
 //     exact rendered line array.
 
 import { describe, expect, it } from "vitest";
-import { LINE_WIDTH } from "../ui/render";
+import { textWidth } from "../ui/render";
+import { HEADER_CONTENT_WIDTH_PX, SECTION_INNER_WIDTH_PX } from "../ui/geometry";
 import type { Station } from "../wmata";
 import {
   flattenSections, initialNav, type ScreenEvent, type ViewContext } from "./router";
@@ -46,7 +47,7 @@ import {
 
 function expectFits(lines: string[]): void {
   for (const line of lines) {
-    expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   }
 }
 
@@ -108,9 +109,9 @@ describe("voice renderHeader", () => {
     expect(out).toBe("VOICE");
     // The clock is no longer embedded in the header string.
     expect(out).not.toContain(" 2:32p");
-    // Stays within the 50-col title budget so it can't collide with the
-    // host's top-right clock container.
-    expect(out.length).toBeLessThanOrEqual(50);
+    // Stays within the header title pixel budget so it can't collide with
+    // the host's top-right clock container.
+    expect(textWidth(out)).toBeLessThanOrEqual(HEADER_CONTENT_WIDTH_PX);
   });
 });
 

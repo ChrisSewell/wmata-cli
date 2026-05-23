@@ -5,147 +5,123 @@
 import { describe, expect, it } from "vitest";
 import {
   ELLIPSIS,
-  LINE_WIDTH,
   SCREEN_HEIGHT_PX,
   SCREEN_WIDTH_PX,
-  TOTAL_ROWS,
-  USABLE_ROWS,
+  SPACE_PX,
   highlightPrefix,
   padLeft,
   padRight,
   row,
   scrollWindow,
   scrollWindowWithMarkers,
+  textWidth,
   truncate,
   withEdgeMarkers,
   wrapText,
 } from "./render";
+import { SECTION_INNER_WIDTH_PX, TWO_BODY_MAX_LINES } from "./geometry";
 
-describe("grid constants", () => {
+describe("panel constants", () => {
   it("matches the 576x288 G2 panel", () => {
     expect(SCREEN_WIDTH_PX).toBe(576);
     expect(SCREEN_HEIGHT_PX).toBe(288);
   });
 
-  it("reserves 3 rows for header/footer/status", () => {
-    expect(TOTAL_ROWS).toBe(10);
-    expect(USABLE_ROWS).toBe(7);
-    expect(TOTAL_ROWS - USABLE_ROWS).toBe(3);
-  });
-
-  it("uses a 72-column line width (empirically tuned from simulator)", () => {
-    expect(LINE_WIDTH).toBe(72);
+  it("exposes a positive space advance and a body inner width under the panel", () => {
+    expect(SPACE_PX).toBeGreaterThan(0);
+    expect(SECTION_INNER_WIDTH_PX).toBeGreaterThan(0);
+    expect(SECTION_INNER_WIDTH_PX).toBeLessThan(SCREEN_WIDTH_PX);
   });
 });
 
 describe("truncate", () => {
   it("returns '' for empty input", () => {
-    expect(truncate("", 5)).toBe("");
+    expect(truncate("", 500)).toBe("");
   });
 
-  it("returns '' when maxLen is zero", () => {
+  it("returns '' for a non-positive pixel budget", () => {
     expect(truncate("hello", 0)).toBe("");
-  });
-
-  it("returns '' when maxLen is negative", () => {
     expect(truncate("hello", -1)).toBe("");
   });
 
-  it("returns the text unchanged at an exact fit", () => {
-    expect(truncate("hello", 5)).toBe("hello");
+  it("returns the text unchanged when it already fits", () => {
+    expect(truncate("hello", SECTION_INNER_WIDTH_PX)).toBe("hello");
   });
 
-  it("returns the text unchanged when shorter than maxLen", () => {
-    expect(truncate("hi", 5)).toBe("hi");
+  it("truncates with an ellipsis and never exceeds the pixel budget", () => {
+    const long = "Foggy Bottom-GWU station entrance closed for repairs";
+    const budget = 120;
+    const out = truncate(long, budget);
+    expect(out).not.toBe(long);
+    expect(out.endsWith(ELLIPSIS)).toBe(true);
+    expect(textWidth(out)).toBeLessThanOrEqual(budget);
   });
 
-  it("cuts the last char and appends an ellipsis when one over", () => {
-    // "hello!" is 6 chars; into 5 cols becomes "hell…" (also 5 cols).
-    const out = truncate("hello!", 5);
-    expect(out).toBe("hell" + ELLIPSIS);
-    expect(out.length).toBe(5);
-  });
-
-  it("returns just the ellipsis when maxLen is 1 and text must be cut", () => {
-    expect(truncate("hello", 1)).toBe(ELLIPSIS);
+  it("returns '' when not even the ellipsis fits", () => {
+    // The ellipsis glyph alone is wider than a 1px budget.
+    expect(truncate("hello", 1)).toBe("");
   });
 });
 
 describe("padRight", () => {
-  it("returns text unchanged at the exact width", () => {
-    expect(padRight("hi", 2)).toBe("hi");
-  });
-
-  it("pads with trailing spaces when shorter than width", () => {
-    expect(padRight("hi", 5)).toBe("hi   ");
-  });
-
-  it("truncates with ellipsis when longer than width", () => {
-    // 'overflow' is 8 chars; into 5 cols becomes 'over' + ellipsis.
-    expect(padRight("overflow", 5)).toBe("over" + ELLIPSIS);
-  });
-
-  it("always returns exactly `width` columns", () => {
-    expect(padRight("a", 4).length).toBe(4);
-    expect(padRight("foobarbaz", 4).length).toBe(4);
-  });
-
-  it("returns '' when width is zero", () => {
+  it("returns '' when the target width is non-positive", () => {
     expect(padRight("hi", 0)).toBe("");
+  });
+
+  it("pads with trailing spaces to approximately the target pixel width", () => {
+    const out = padRight("hi", 100);
+    expect(out.startsWith("hi")).toBe(true);
+    expect(out.length).toBeGreaterThan(2); // trailing spaces were added
+    // Space granularity means we land within half a space of target.
+    expect(Math.abs(textWidth(out) - 100)).toBeLessThanOrEqual(SPACE_PX);
+  });
+
+  it("truncates within budget when the text is wider than the target", () => {
+    const out = padRight("overflowing station name", 60);
+    expect(textWidth(out)).toBeLessThanOrEqual(60);
+    expect(out.endsWith(ELLIPSIS)).toBe(true);
   });
 });
 
 describe("padLeft", () => {
-  it("returns text unchanged at the exact width", () => {
-    expect(padLeft("hi", 2)).toBe("hi");
-  });
-
-  it("pads with leading spaces when shorter than width", () => {
-    expect(padLeft("hi", 5)).toBe("   hi");
-  });
-
-  it("drops the left side when longer than width (rare numeric case)", () => {
-    expect(padLeft("12345", 3)).toBe("345");
-  });
-
-  it("returns '' when width is zero", () => {
+  it("returns '' when the target width is non-positive", () => {
     expect(padLeft("hi", 0)).toBe("");
+  });
+
+  it("right-aligns by padding leading spaces to ~target pixel width", () => {
+    const out = padLeft("hi", 100);
+    expect(out.endsWith("hi")).toBe(true);
+    expect(out.startsWith(" ")).toBe(true);
+    expect(Math.abs(textWidth(out) - 100)).toBeLessThanOrEqual(SPACE_PX);
+  });
+
+  it("drops glyphs from the left when the text is wider than the target", () => {
+    const out = padLeft("123456789", 20);
+    expect(textWidth(out)).toBeLessThanOrEqual(20);
+    // Keeps the tail (right-aligned numeric field).
+    expect("123456789".endsWith(out)).toBe(true);
   });
 });
 
 describe("row", () => {
-  it("composes a 2-column row joined by a single space", () => {
-    // widths: 4 + 1 + 5 = 10 columns total
-    const r = row(["RD", "ARR"], [4, 5]);
-    expect(r).toBe("RD   ARR  ");
-    expect(r.length).toBe(10);
+  it("composes cells padded to their pixel widths, space-separated", () => {
+    const r = row(["RD", "ARR"], [60, 80]);
+    expect(r.startsWith("RD")).toBe(true);
+    expect(r).toContain("ARR");
+    // Total stays within the column budgets plus the separator, allowing
+    // for space-padding granularity.
+    expect(textWidth(r)).toBeLessThanOrEqual(60 + 80 + 2 * SPACE_PX);
   });
 
-  it("composes a 3-column row joined by single spaces", () => {
-    // widths: 2 + 1 + 4 + 1 + 5 = 13 columns total
-    const r = row(["RD", "DCA", "5 min"], [2, 4, 5]);
-    expect(r).toBe("RD DCA  5 min");
-    expect(r.length).toBe(13);
+  it("truncates an over-wide cell within its column budget", () => {
+    const r = row(["Anacostia-very-long", "ARR"], [40, 40]);
+    expect(textWidth(r)).toBeLessThanOrEqual(40 + 40 + 2 * SPACE_PX);
   });
 
-  it("right-pads short cells and truncates long ones", () => {
-    const r = row(["Anacostia", "ARR"], [6, 3]);
-    // "Anacostia" is 9 chars truncated into 6 -> "Anaco" + ellipsis = 6
-    expect(r).toBe("Anaco" + ELLIPSIS + " ARR");
-    expect(r.length).toBe(10);
-  });
-
-  it("fits exactly at LINE_WIDTH (72 cols)", () => {
-    // 35 + 1 + 36 = 72 columns, no overflow.
-    const r = row(["a".repeat(35), "b".repeat(36)], [35, 36]);
-    expect(r.length).toBe(LINE_WIDTH);
-  });
-
-  it("throws when total width + separators exceeds LINE_WIDTH", () => {
-    // 36 + 1 + 36 = 73 > 72
-    expect(() => row(["x".repeat(36), "y".repeat(36)], [36, 36])).toThrow(
-      /LINE_WIDTH/,
-    );
+  it("throws when the total exceeds the section inner width", () => {
+    expect(() =>
+      row(["x", "y"], [SECTION_INNER_WIDTH_PX, SECTION_INNER_WIDTH_PX]),
+    ).toThrow(/exceeds/);
   });
 
   it("throws when cells and widths array lengths differ", () => {
@@ -250,10 +226,10 @@ describe("scrollWindow", () => {
     expect(w.hasMoreBelow).toBe(false);
   });
 
-  it("defaults maxRows to USABLE_ROWS when not provided", () => {
-    const rows = Array.from({ length: 10 }, (_, i) => `r${i}`);
+  it("defaults maxRows to the two-section body budget when not provided", () => {
+    const rows = Array.from({ length: 20 }, (_, i) => `r${i}`);
     const w = scrollWindow(rows, 0);
-    expect(w.lines.length).toBe(USABLE_ROWS);
+    expect(w.lines.length).toBe(TWO_BODY_MAX_LINES);
   });
 });
 
@@ -392,64 +368,58 @@ describe("highlightPrefix", () => {
 });
 
 describe("wrapText", () => {
-  it("returns an empty array for empty input", () => {
-    expect(wrapText("", 24, 3)).toEqual([]);
-    expect(wrapText("   ", 24, 3)).toEqual([]);
+  it("returns an empty array for empty / whitespace input", () => {
+    expect(wrapText("", 200, 3)).toEqual([]);
+    expect(wrapText("   ", 200, 3)).toEqual([]);
   });
 
   it("returns an empty array when the budget is non-positive", () => {
     expect(wrapText("hello world", 0, 3)).toEqual([]);
-    expect(wrapText("hello world", 24, 0)).toEqual([]);
+    expect(wrapText("hello world", 200, 0)).toEqual([]);
   });
 
-  it("returns a single line when the text fits", () => {
-    expect(wrapText("hello world", 24, 3)).toEqual(["hello world"]);
+  it("returns a single line when the text fits the pixel budget", () => {
+    expect(wrapText("hello world", SECTION_INNER_WIDTH_PX, 3)).toEqual([
+      "hello world",
+    ]);
   });
 
-  it("wraps at word boundaries when the text overflows one line", () => {
+  it("wraps at word boundaries; every line fits the pixel budget", () => {
+    const maxPx = 150;
     const out = wrapText(
       "Single-tracking on RD between Foggy Bottom and Rosslyn",
-      24,
-      4,
+      maxPx,
+      6,
     );
     expect(out.length).toBeGreaterThan(1);
-    expect(out.length).toBeLessThanOrEqual(4);
-    for (const line of out) expect(line.length).toBeLessThanOrEqual(24);
-    // No information lost: every word from the input appears across
-    // the wrapped lines (in order).
+    expect(out.length).toBeLessThanOrEqual(6);
+    for (const line of out) expect(textWidth(line)).toBeLessThanOrEqual(maxPx);
+    // No information lost: words survive across the wrapped lines.
     expect(out.join(" ")).toContain("Single-tracking");
     expect(out.join(" ")).toContain("Rosslyn");
   });
 
-  it("packs words greedily — never leaves a line shorter than necessary", () => {
-    // "a a a a" (7 chars) all fits on one 7-col line; we should NOT
-    // pre-emptively break.
-    expect(wrapText("a a a a", 7, 3)).toEqual(["a a a a"]);
-    // At 5 cols "a a a" (5) fits, "a" is the overflow → 2 lines.
-    expect(wrapText("a a a a", 5, 3)).toEqual(["a a a", "a"]);
-  });
-
-  it("hard-breaks a single word longer than the line width", () => {
-    // "abcdefghij" (10 chars) at width=4 -> "abcd","efgh","ij"
-    expect(wrapText("abcdefghij", 4, 5)).toEqual(["abcd", "efgh", "ij"]);
+  it("hard-breaks a single word wider than the budget into fitting pieces", () => {
+    const maxPx = 40;
+    const out = wrapText("supercalifragilisticexpialidocious", maxPx, 8);
+    expect(out.length).toBeGreaterThan(1);
+    for (const line of out) expect(textWidth(line)).toBeLessThanOrEqual(maxPx);
   });
 
   it("appends the canonical ellipsis when content overflows maxLines", () => {
+    const maxPx = 60;
     const out = wrapText(
       "one two three four five six seven eight nine ten",
-      6,
+      maxPx,
       2,
     );
     expect(out.length).toBe(2);
-    for (const line of out) expect(line.length).toBeLessThanOrEqual(6);
-    // The last line ends with "…" to signal "more content was
-    // dropped" — without this, the user has no signal that the
-    // message was cut.
-    expect(out[1]!.endsWith(ELLIPSIS)).toBe(true);
+    for (const line of out) expect(textWidth(line)).toBeLessThanOrEqual(maxPx);
+    expect(out[out.length - 1]!.endsWith(ELLIPSIS)).toBe(true);
   });
 
   it("does NOT append ellipsis when the entire input fits", () => {
-    const out = wrapText("hello world", 6, 3);
+    const out = wrapText("hello world", SECTION_INNER_WIDTH_PX, 3);
     expect(out.join("")).not.toContain(ELLIPSIS);
   });
 });

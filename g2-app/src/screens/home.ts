@@ -45,12 +45,12 @@
 import type { FavoriteStation } from "../storage/settings";
 import { MAX_FAVORITES } from "../storage/settings";
 import type { LineCode } from "../wmata";
+import { highlightPrefix, textWidth, truncate } from "../ui/render";
 import {
-  LINE_WIDTH,
-  SAFE_TEXT_WIDTH,
-  highlightPrefix,
-  truncate,
-} from "../ui/render";
+  HEADER_CONTENT_WIDTH_PX,
+  SECTION_INNER_WIDTH_PX,
+  VALUE_COL_GAP_PX,
+} from "../ui/geometry";
 import { abbreviateStation, lineName } from "../ui/format";
 // `formatClock` now lives in the shared field-formatter module and is
 // rendered by the host into its own top-right clock container. Re-export
@@ -71,32 +71,27 @@ import type { ReduceResult, Screen, ScreenSections } from "./router";
 const FAVORITE_SEPARATOR = " · ";
 
 /**
- * Width (in columns) of the left-aligned ETA cell that sits between the
- * cursor prefix and the station name on every favorite row. The widest
- * realistic content is `"12 min"` (6 chars); 1-digit ETAs (`"4 min"`)
- * and the sentinels (`"ARR"` / `"BRD"`) are shorter and get
- * space-padded to this width. A trailing space is added AFTER the cell
- * by the caller, so station names start at a constant column whether or
- * not an ETA is present. Three-digit ETAs ("100 min") don't occur on
- * the real network — trains are scheduled minutes apart — but if WMATA
- * ever surprises us the cell simply widens for that one row rather than
- * truncating the datum.
+ * Pixel width reserved on the right for the value column (ETA / alert /
+ * outage count). Sized for the widest realistic value so the host's
+ * overlay — whose geometry is committed once at mount — always has room.
+ * The left column is budgeted around this reserve so the two never
+ * overlap, and the screen passes it to the host as `bodyColumns.rightWidthPx`.
  */
-export const ETA_CELL_WIDTH = 6;
+export const VALUE_COL_RESERVE_PX = Math.max(
+  textWidth("12 min"),
+  textWidth("99 alerts"),
+  textWidth("99 outages"),
+);
 
 /**
- * Max real-text width (columns) of the LEFT column in the two-column
- * body. The host overlays the RIGHT (value) column in a borderless
- * container pinned at a fixed pixel x (≈ x=466 ≈ column 50 in the
- * monospace stand-in), so the left content must stay clear of that
- * overlay or the two collide. We truncate the left cell to this budget
- * (preferring to trim the STATION NAME, keeping the line names intact)
- * so a long favorite never runs under the ETA. Sits at 50 — comfortably
- * under SAFE_TEXT_WIDTH (58) since the value lives in its own container
- * now (the old single-row budget had to fit name + ETA + lines on ONE
- * line; the split frees ~8 columns).
+ * Max pixel width of the LEFT column in the two-column body. The host
+ * overlays the value column flush-right, so the left content must stay
+ * clear of it. We truncate the left cell to this budget (preferring to
+ * trim the STATION NAME, keeping the line names intact) so a long
+ * favorite never runs under the value column.
  */
-export const LEFT_COL_MAX = 50;
+export const LEFT_COL_MAX_PX =
+  SECTION_INNER_WIDTH_PX - VALUE_COL_RESERVE_PX - VALUE_COL_GAP_PX;
 
 /** Label rendered for the synthetic voice-lookup row. */
 export const VOICE_LABEL = "VOICE LOOKUP";
@@ -268,36 +263,6 @@ export function soonestEta(mins: readonly string[]): string | null {
 }
 
 /**
- * Render the left-aligned, fixed-width ETA cell that precedes the
- * station name on a favorite row. The cell is always exactly
- * `ETA_CELL_WIDTH` columns (plus a trailing space the caller appends),
- * so station names line up regardless of ETA length / presence.
- *
- *   - numeric token (`"4"`)  -> `"4 min "`  (padded to width)
- *   - `"ARR"` / `"BRD"`      -> `"ARR   "` / `"BRD   "` (verbatim, padded)
- *   - `null` / unknown       -> all spaces (loading or no-train; the
- *                               column width is preserved so names stay
- *                               aligned — we never print "null").
- *
- * A numeric token wider than the cell (pathological 3-digit ETA) is
- * allowed to overflow the cell rather than be truncated — losing the
- * ETA digit would be worse than a one-row misalignment. The row-level
- * `SAFE_TEXT_WIDTH` guard in `renderFavoriteRow` still prevents a
- * hard-wrap.
- */
-export function renderEtaCell(min: string | null): string {
-  if (min === null) return " ".repeat(ETA_CELL_WIDTH);
-  const text =
-    min === "ARR" || min === "BRD"
-      ? min
-      : /^\d+$/.test(min)
-        ? `${min} min`
-        : ""; // unknown sentinel ("" / "---") -> blank cell, kept aligned
-  if (text.length >= ETA_CELL_WIDTH) return text;
-  return text + " ".repeat(ETA_CELL_WIDTH - text.length);
-}
-
-/**
  * Render the ETA as the borderless RIGHT-column VALUE for the
  * two-column body. Unlike `renderEtaCell`, this is NOT space-padded —
  * the host pins the value container at a fixed pixel x, so alignment
@@ -346,11 +311,11 @@ export function renderFavoriteLeft(
   const lines = renderLinesSuffix(fav.lines);
   const suffix = lines.length > 0 ? FAVORITE_SEPARATOR + lines : "";
 
-  // Budget for the station name = the left-column width minus the fixed
-  // parts (prefix + separator + line names). When positive we keep the
-  // codes whole and trim the name to fit; abbreviateStation
+  // Budget for the station name = the left-column pixel width minus the
+  // fixed parts (prefix + separator + line names). When positive we keep
+  // the codes whole and trim the name to fit; abbreviateStation
   // short-circuits when the name already fits.
-  const nameBudget = LEFT_COL_MAX - prefix.length - suffix.length;
+  const nameBudget = LEFT_COL_MAX_PX - textWidth(prefix) - textWidth(suffix);
   if (nameBudget >= 1) {
     const name = abbreviateStation(fav.name, nameBudget);
     return prefix + name + suffix;
@@ -360,7 +325,7 @@ export function renderFavoriteLeft(
   // Keep at least one character of the name and truncate the whole
   // composed string so nothing runs under the value overlay.
   const firstNameChar = fav.name.slice(0, 1);
-  return truncate(prefix + firstNameChar + suffix, LEFT_COL_MAX);
+  return truncate(prefix + firstNameChar + suffix, LEFT_COL_MAX_PX);
 }
 
 /**
@@ -386,7 +351,7 @@ export function renderAlertsLeft(
     affectedNames.length === 0
       ? "ALERTS"
       : `ALERTS · ${affectedNames.join(" · ")}`;
-  return truncate(prefix + linesPart, LEFT_COL_MAX);
+  return truncate(prefix + linesPart, LEFT_COL_MAX_PX);
 }
 
 /** The ALERTS row's right-column VALUE: the pluralised count. */
@@ -401,75 +366,12 @@ export function renderAlertsValue(alertCount: number): string {
  *   "  ACCESS"   (count "2 outages" lives in right[i])
  */
 export function renderAccessLeft(isHighlighted: boolean): string {
-  return truncate(highlightPrefix(isHighlighted) + ACCESS_LABEL_PREFIX, LEFT_COL_MAX);
+  return truncate(highlightPrefix(isHighlighted) + ACCESS_LABEL_PREFIX, LEFT_COL_MAX_PX);
 }
 
 /** The ACCESS row's right-column VALUE: the pluralised outage count. */
 export function renderAccessValue(count: number): string {
   return count === 1 ? "1 outage" : `${count} outages`;
-}
-
-/**
- * Build a single favorite row — a live departure-board line:
- *
- *   "▸ 4 min  Metro Center · RED BLUE ORANGE SILVER"
- *   "  12 min Gallery Pl-Chinatown · RED YELLOW GREEN"
- *   "  ARR    Union Station · RED"
- *
- * Structure, left to right:
- *   <prefix><eta cell (ETA_CELL_WIDTH)><space><station name>· <LINES>
- *
- * The ETA cell is a LEFT-aligned fixed-width column right after the
- * cursor prefix, so the soonest-train ETAs form a clean aligned column
- * and the station names all start at the same position (digits are
- * near-uniform width in the LVGL font). When the ETA is `null`
- * (not-yet-loaded or no upcoming train) the cell is rendered as spaces
- * — never "null" — so the names stay aligned either way.
- *
- * Everything is left-flowing / left-aligned: no right-alignment, so the
- * line codes never float raggedly the way a space-padded right column
- * does in the variable-width LVGL font.
- *
- * Overflow guard: the returned string never exceeds `SAFE_TEXT_WIDTH`
- * (= 58) columns of real text — the wrap point of the 576px container.
- * The prefix + ETA cell + its trailing space are fixed-width and
- * always survive; we prefer to truncate the STATION NAME, keeping the
- * separator and the full line names intact (the codes are the
- * higher-value datum). Only when those fixed parts plus the line names
- * already fill the row do we fall back to truncating the whole composed
- * string. A favorite with no lines drops the separator entirely.
- *
- * @param eta soonest-train `Min` token for this station (`"4"` /
- *   `"ARR"` / `"BRD"`), or `null` for loading / no-train (blank cell).
- */
-export function renderFavoriteRow(
-  fav: FavoriteStation,
-  isHighlighted: boolean,
-  eta: string | null = null,
-): string {
-  const prefix = highlightPrefix(isHighlighted);
-  // The ETA cell + its single trailing space is a fixed-width column
-  // that always renders (blank when unknown) so names align.
-  const etaCol = renderEtaCell(eta) + " ";
-  const lead = prefix + etaCol;
-  const lines = renderLinesSuffix(fav.lines);
-  const suffix = lines.length > 0 ? FAVORITE_SEPARATOR + lines : "";
-
-  // Budget for the station name = the safe width minus the fixed parts
-  // (prefix + ETA column + separator + line names). When that's
-  // positive we keep the codes whole and trim the name to fit;
-  // abbreviateStation short-circuits when the name already fits.
-  const nameBudget = SAFE_TEXT_WIDTH - lead.length - suffix.length;
-  if (nameBudget >= 1) {
-    const name = abbreviateStation(fav.name, nameBudget);
-    return lead + name + suffix;
-  }
-
-  // Pathological case: the fixed parts (prefix + ETA column) plus the
-  // line names already overflow the row. Keep at least one character of
-  // the name and truncate the whole composed string so nothing wraps.
-  const firstNameChar = fav.name.slice(0, 1);
-  return truncate(lead + firstNameChar + suffix, SAFE_TEXT_WIDTH);
 }
 
 /** Build the always-present "VOICE LOOKUP" row. */
@@ -478,74 +380,6 @@ export function renderVoiceRow(isHighlighted: boolean): string {
   // physical panel does not care about right-padding for monospace rows,
   // and shorter strings serialise less data over the bridge.
   return highlightPrefix(isHighlighted) + VOICE_LABEL;
-}
-
-/**
- * Build the ALERTS row — decoded prose form. The label "ALERTS"
- * sits at the left, the affected line codes inline as a
- * `·`-separated list, and a right-aligned count of alerts.
- *
- *   `ALERTS · RED                                 1 alert`
- *   `ALERTS · RED · ORANGE                       3 alerts`
- *
- * Replaces the older glyph-row form (`> RD!BL YL OR GR SV`) which
- * showed the entire 6-line palette with `!` markers on affected
- * lines — readable as a glance pattern but cryptic.
- *
- * Width contract: returns exactly `LINE_WIDTH` columns.
- */
-export function renderAlertsRow(
-  affected: ReadonlySet<LineCode>,
-  alertCount: number,
-  isHighlighted: boolean,
-): string {
-  const prefix = highlightPrefix(isHighlighted);
-  // Preserve canonical line order so `RED · ORANGE` always lists
-  // lines in the same order regardless of how the Set was constructed.
-  const affectedNames = STATUS_ROW_LINE_ORDER
-    .filter((c) => affected.has(c))
-    .map((c) => lineName(c));
-  const linesPart =
-    affectedNames.length === 0
-      ? "ALERTS"
-      : `ALERTS · ${affectedNames.join(" · ")}`;
-  const countPart =
-    alertCount === 1 ? "1 alert" : `${alertCount} alerts`;
-  const spaces = Math.max(
-    1,
-    LINE_WIDTH - prefix.length - linesPart.length - countPart.length,
-  );
-  return truncate(
-    prefix + linesPart + " ".repeat(spaces) + countPart,
-    LINE_WIDTH,
-  );
-}
-
-/**
- * Build the ACCESS row in the same right-aligned-count form as
- * `renderAlertsRow`:
- *
- *   `ACCESS                                      2 outages`
- *
- * (singular "1 outage" / plural "N outages").
- *
- * Width contract: always exactly LINE_WIDTH cols.
- */
-export function renderAccessRow(
-  count: number,
-  isHighlighted: boolean,
-): string {
-  const prefix = highlightPrefix(isHighlighted);
-  const label = ACCESS_LABEL_PREFIX;
-  const countPart = count === 1 ? "1 outage" : `${count} outages`;
-  const spaces = Math.max(
-    1,
-    LINE_WIDTH - prefix.length - label.length - countPart.length,
-  );
-  return truncate(
-    prefix + label + " ".repeat(spaces) + countPart,
-    LINE_WIDTH,
-  );
 }
 
 /**
@@ -564,7 +398,7 @@ export function renderAccessRow(
  * is now a constant.
  */
 export function renderHeader(): string {
-  return truncate("WMATA  Favorites", 50);
+  return truncate("WMATA  Favorites", HEADER_CONTENT_WIDTH_PX);
 }
 
 // ---------------------------------------------------------------------------
@@ -793,18 +627,22 @@ export function makeHomeScreen(
         if (showStatus || showAccess) pushRow("", "");
         // Friendly two-line empty state. These are real-text (prose)
         // lines with no value column, so each carries an empty `right`
-        // cell. They wrap at SAFE_TEXT_WIDTH; both sit comfortably under
-        // the budget. We deliberately do not pad with filler — the
-        // favorites list is meant to grow.
+        // cell. They sit comfortably within the body inner width. We
+        // deliberately do not pad with filler — the favorites list is
+        // meant to grow.
         pushRow(
-          truncate("No favorites yet. Open the phone app", SAFE_TEXT_WIDTH),
+          truncate("No favorites yet. Open the phone app", SECTION_INNER_WIDTH_PX),
           "",
         );
         pushRow(
-          truncate("to add your home + commute stations.", SAFE_TEXT_WIDTH),
+          truncate("to add your home + commute stations.", SECTION_INNER_WIDTH_PX),
           "",
         );
-        return { header, body: [], bodyColumns: { left, right } };
+        return {
+        header,
+        body: [],
+        bodyColumns: { left, right, rightWidthPx: VALUE_COL_RESERVE_PX },
+      };
       }
 
       const total = rowCount(clamped);
@@ -839,7 +677,11 @@ export function makeHomeScreen(
           renderEtaValue(eta),
         );
       }
-      return { header, body: [], bodyColumns: { left, right } };
+      return {
+        header,
+        body: [],
+        bodyColumns: { left, right, rightWidthPx: VALUE_COL_RESERVE_PX },
+      };
     },
     reduce(snapshot, nav, event): ReduceResult<HomeSnapshot> {
       const clamped = clampedSnapshot(snapshot);

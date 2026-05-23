@@ -16,7 +16,8 @@
 //     instead of the empty-state copy.
 
 import { describe, expect, it } from "vitest";
-import { LINE_WIDTH, SAFE_TEXT_WIDTH } from "../ui/render";
+import { ELLIPSIS, textWidth } from "../ui/render";
+import { SECTION_INNER_WIDTH_PX, TWO_BODY_MAX_LINES } from "../ui/geometry";
 import type { RailIncident } from "../wmata";
 import {
   flattenSections, initialNav, type ViewContext } from "./router";
@@ -46,9 +47,12 @@ import {
 
 function expectFits(lines: string[]): void {
   for (const line of lines) {
-    expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   }
 }
+
+/** Pixel budget used to exercise the (now pixel-based) `wrap` helper. */
+const WRAP_BUDGET_PX = 150;
 
 /** Fixed wall clock — May 18 2026 14:32 local. */
 const NOW = new Date(2026, 4, 18, 14, 32, 0).getTime();
@@ -89,42 +93,49 @@ const noopFetcher = (): Promise<IncidentsFetchResult> =>
 
 describe("wrap", () => {
   it("returns [] for empty input", () => {
-    expect(wrap("", 22)).toEqual([]);
+    expect(wrap("", WRAP_BUDGET_PX)).toEqual([]);
   });
 
   it("greedily packs words into width-bounded lines", () => {
-    const out = wrap("Single-tracking between Foggy Bottom and Rosslyn.", 22);
-    for (const l of out) expect(l.length).toBeLessThanOrEqual(22);
+    const out = wrap(
+      "Single-tracking between Foggy Bottom and Rosslyn.",
+      WRAP_BUDGET_PX,
+    );
+    expect(out.length).toBeGreaterThan(1);
+    for (const l of out) expect(textWidth(l)).toBeLessThanOrEqual(WRAP_BUDGET_PX);
     // Each consecutive pair must not have been combinable into one line:
-    // i.e. previous + " " + next would have exceeded 22.
+    // i.e. previous + " " + next-first-word would have exceeded the budget.
     for (let i = 1; i < out.length; i++) {
-      const merged = out[i - 1]!.length + 1 + out[i]!.split(" ")[0]!.length;
-      expect(merged).toBeGreaterThan(22);
+      const merged = out[i - 1]! + " " + out[i]!.split(" ")[0]!;
+      expect(textWidth(merged)).toBeGreaterThan(WRAP_BUDGET_PX);
     }
+    // No information lost: the words survive across the wrapped lines.
+    expect(out.join(" ")).toContain("Single-tracking");
+    expect(out.join(" ")).toContain("Rosslyn");
   });
 
-  it("hard-breaks a word wider than `width` with a `…` continuation marker", () => {
-    const monster = "Antidisestablishmentarianism"; // 28 chars
-    const out = wrap(monster, 10);
-    for (const l of out) expect(l.length).toBeLessThanOrEqual(10);
+  it("hard-breaks a word wider than the budget with a `…` continuation marker", () => {
+    const monster = "Antidisestablishmentarianism";
+    const out = wrap(monster, 40);
+    expect(out.length).toBeGreaterThan(1);
+    for (const l of out) expect(textWidth(l)).toBeLessThanOrEqual(40);
     // First (and any intermediate) chunks end with the ellipsis.
-    expect(out[0]!.endsWith("…")).toBe(true);
+    expect(out[0]!.endsWith(ELLIPSIS)).toBe(true);
   });
 
   it("collapses runs of whitespace into single spaces", () => {
-    const out = wrap("a  b\t\nc", 22);
+    const out = wrap("a  b\t\nc", WRAP_BUDGET_PX);
     expect(out).toEqual(["a b c"]);
   });
 
-  it("returns [] at the degenerate width=1 (avoids infinite-loop)", () => {
-    // The hard-break path would do slice(0, 0) -> "" and slice(0) ->
-    // the same string, looping forever. Callers always use
-    // BODY_TEXT_WIDTH = 22; this guard makes the helper safe to call
-    // with a degenerate budget rather than crashing.
+  it("returns [] at a degenerate 1px budget (avoids infinite-loop)", () => {
+    // Not even the continuation ellipsis fits at 1px, so the hard-break
+    // loop bails rather than spinning. Callers always pass a real pixel
+    // budget; this guard makes the helper safe with a degenerate one.
     expect(wrap("Antidisestablishmentarianism", 1)).toEqual([]);
   });
 
-  it("returns [] at width=0 as well", () => {
+  it("returns [] at a 0px budget as well", () => {
     expect(wrap("anything at all", 0)).toEqual([]);
   });
 
@@ -132,10 +143,15 @@ describe("wrap", () => {
     // The hard-break path should leave the residue word in `current`
     // (no trailing ellipsis on the last chunk) and the next short
     // words must pack onto the line normally.
-    const out = wrap("Antidisestablishmentarianism more text", 22);
-    for (const l of out) expect(l.length).toBeLessThanOrEqual(22);
-    // First chunk is a 21-char prefix + "…" = 22 cols.
-    expect(out[0]).toBe("Antidisestablishmenta…");
+    const out = wrap("Antidisestablishmentarianism more text", WRAP_BUDGET_PX);
+    expect(out.length).toBeGreaterThan(1);
+    for (const l of out) expect(textWidth(l)).toBeLessThanOrEqual(WRAP_BUDGET_PX);
+    // The first chunk is a hard-broken prefix of the giant word, marked
+    // with the continuation ellipsis.
+    expect(out[0]!.endsWith(ELLIPSIS)).toBe(true);
+    expect("Antidisestablishmentarianism".startsWith(out[0]!.slice(0, -1))).toBe(
+      true,
+    );
     // Subsequent lines must contain the trailing short words.
     const tail = out.slice(1).join(" ");
     expect(tail).toContain("more");
@@ -292,13 +308,13 @@ describe("renderHeader", () => {
     expect(out).not.toContain("*");
   });
 
-  it("keeps the title within the 50-col budget at n=999 (three-digit count)", () => {
+  it("keeps the title within the header pixel budget at n=999 (three-digit count)", () => {
     const incs = Array.from({ length: 999 }, (_, i) =>
       incident({ IncidentID: `${i}` }),
     );
     const out = renderHeader(makeSnap(incs));
     expect(out).toBe("ALERTS (999)");
-    expect(out.length).toBeLessThanOrEqual(50);
+    expect(textWidth(out)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   });
 });
 
@@ -375,7 +391,7 @@ describe("incidents view: empty state", () => {
 // ---------------------------------------------------------------------------
 
 describe("incidents view: 1 incident, short description", () => {
-  it("fits in fewer than USABLE_ROWS, no scroll, no edge markers", () => {
+  it("fits within the body row budget, no scroll, no edge markers", () => {
     const incs = [
       incident({ LinesAffected: "BL;", Description: "Train OK." }),
     ];
@@ -399,9 +415,9 @@ describe("incidents view: 1 incident, short description", () => {
 
 describe("incidents view: 1 incident, very long description", () => {
   it("wraps to ≤ MAX_DESC_LINES lines and ends the last line with `…` when cut", () => {
-    // Description deliberately long enough to overflow the
-    // MAX_DESC_LINES cap at the current SAFE_TEXT_WIDTH=58, desc wrap
-    // width=54 (SAFE_TEXT_WIDTH minus the 2-col gutter and 2-col inset).
+    // Description deliberately long enough to overflow the MAX_DESC_LINES
+    // cap at the current description wrap pixel budget (the body inner
+    // width minus the section gutter and the inner inset).
     const long =
       "Single tracking between Foggy Bottom and Rosslyn due to a disabled train. " +
       "Expect significant delays on Orange, Blue, and Silver Line trains for the next two hours. " +
@@ -432,9 +448,9 @@ describe("incidents view: 1 incident, very long description", () => {
  *
  *   [glyph][desc][BLANK][glyph][desc][BLANK][glyph][desc][BLANK][glyph][desc][BLANK][glyph][desc]
  *
- * = 5*2 + 4 = 14 body rows. With USABLE_ROWS = 7 + room for edge
- * markers, scrolling is required and the `▾` arrow must show on the
- * initial render.
+ * = 5*2 + 4 = 14 body rows. With the two-section body budget
+ * (`TWO_BODY_MAX_LINES`) plus room for edge markers, scrolling is
+ * required and the `▾` arrow must show on the initial render.
  */
 const FIVE_INCIDENTS: RailIncident[] = [
   incident({ IncidentID: "1", LinesAffected: "RD;", Description: "Inc one." }),
@@ -449,8 +465,8 @@ describe("incidents view: 5 incidents — scrolling required", () => {
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(FIVE_INCIDENTS));
     const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    // Header + 7 body rows (= USABLE_ROWS budget).
-    expect(lines.length).toBe(1 + 7);
+    // Header + the two-section body row budget.
+    expect(lines.length).toBe(1 + TWO_BODY_MAX_LINES);
     expect(lines.some((l) => l === "▾")).toBe(true);
     expect(lines.some((l) => l === "▴")).toBe(false);
   });
@@ -489,20 +505,20 @@ describe("incidents view: 5 incidents — scrolling required", () => {
   });
 
   it("a mid-list scroll position shows BOTH `▴` and `▾` simultaneously", () => {
-    // FIVE_INCIDENTS yields 14 body rows. After ~5 SCROLL_DOWNs the
-    // window sits in the middle of the body, so both edge markers
-    // must be present in the same frame.
+    // FIVE_INCIDENTS yields 14 body rows. After enough SCROLL_DOWNs the
+    // window sits in the middle of the body (content hidden both above
+    // and below), so both edge markers must be present in the same frame.
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(FIVE_INCIDENTS));
     let nav = initialNav();
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 8; i++) {
       nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
     }
     const lines = flattenSections(screen.view(screen.init(), nav, CTX));
     expectFits(lines);
     expect(lines.some((l) => l === "▴")).toBe(true);
     expect(lines.some((l) => l === "▾")).toBe(true);
-    // Whole frame still fits the budget: header + 7 body rows.
-    expect(lines.length).toBe(1 + 7);
+    // Whole frame still fits the budget: header + the body row budget.
+    expect(lines.length).toBe(1 + TWO_BODY_MAX_LINES);
   });
 });
 
@@ -665,15 +681,15 @@ describe("incidents view snapshot: 1 incident with a multi-line desc", () => {
     const sections = screen.view(screen.init(), initialNav(), CTX);
     const lines = flattenSections(sections);
     expectFits(lines);
-    // The wrapper packs greedily into 22-col lines. We assert the exact
-    // rendered lines explicitly so a future change to the wrap rules
+    // The wrapper packs greedily into pixel-budgeted lines. We assert the
+    // exact rendered lines explicitly so a future change to the wrap rules
     // surfaces as a test failure. The header is now the bare title — the
     // host renders the clock in its own container.
     expect(lines).toEqual([
       "ALERTS (1)",
       "  BLUE ORANGE SILVER",
-      "    Single-tracking between Foggy Bottom and Rosslyn due",
-      "    to a disabled train",
+      "    Single-tracking between Foggy Bottom and Rosslyn due to a",
+      "    disabled train",
     ]);
     expect(sections.clockMarker).toBe("");
   });
@@ -844,11 +860,11 @@ describe("trimTrailingSeparators", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Overflow invariant: no rendered body line exceeds SAFE_TEXT_WIDTH
+// Overflow invariant: no rendered body line exceeds the section inner width
 // ---------------------------------------------------------------------------
 
-describe("incidents view: SAFE_TEXT_WIDTH overflow invariant", () => {
-  it("keeps every rendered body line at or below SAFE_TEXT_WIDTH real chars", () => {
+describe("incidents view: section-inner-width overflow invariant", () => {
+  it("keeps every rendered body line at or below the section inner pixel width", () => {
     // Worst-case fixtures: a 4-line affected-lines header plus prose
     // long enough to exercise the greedy wrap. This is the regression
     // guard for the orphan-word overflow ("to a" / "crews" at col 0).
@@ -874,14 +890,13 @@ describe("incidents view: SAFE_TEXT_WIDTH overflow invariant", () => {
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(incs));
     // Walk the full scroll range so every body row is rendered at least
     // once across the windows. The header row (index 0) is excluded:
-    // it is intentionally space-padded to LINE_WIDTH for right-aligned
-    // clock placement, and trailing spaces are the narrowest glyph (they
-    // never overflow). Only real-text body rows must respect the cap.
+    // it carries the bare title and the host renders the clock in its own
+    // container. Only real-text body rows must respect the pixel cap.
     let nav = initialNav();
     for (let step = 0; step < 30; step++) {
       const lines = flattenSections(screen.view(screen.init(), nav, CTX));
       for (const line of lines.slice(1)) {
-        expect(line.length).toBeLessThanOrEqual(SAFE_TEXT_WIDTH);
+        expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
       }
       nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
     }

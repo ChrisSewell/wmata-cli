@@ -40,12 +40,15 @@
 
 import {
   ELLIPSIS,
-  LINE_WIDTH,
-  SAFE_TEXT_WIDTH,
-  USABLE_ROWS,
   scrollWindowWithMarkers,
+  textWidth,
   truncate,
 } from "../ui/render";
+import {
+  HEADER_CONTENT_WIDTH_PX,
+  SECTION_INNER_WIDTH_PX,
+  TWO_BODY_MAX_LINES,
+} from "../ui/geometry";
 import { abbreviateStation } from "../ui/format";
 import type { ElevatorIncident } from "../wmata";
 import type {
@@ -70,12 +73,11 @@ export { formatClock } from "../ui/format";
 const INDENT = "  ";
 
 /**
- * Real-text width budget for the station-header row. The header carries
- * only the 2-col section gutter (added by `flattenBlocks`), so it must
- * fit `SAFE_TEXT_WIDTH - INDENT.length` real chars before the LVGL
- * container hard-wraps at the 576px border.
+ * Pixel-width budget for the station-header row. It carries only the
+ * 2-space section gutter (added by `flattenBlocks`), so it gets the body
+ * inner width minus that gutter before the LVGL container hard-wraps.
  */
-const STATION_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length; // 56
+const STATION_TEXT_WIDTH_PX = SECTION_INNER_WIDTH_PX - textWidth(INDENT);
 
 /**
  * Inner inset (extra indent) applied to per-unit detail rows so they
@@ -84,18 +86,17 @@ const STATION_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length; // 56
 const DETAIL_INSET = "  ";
 
 /**
- * Real-text width budget for a wrapped detail line ("Type · location").
- * A detail line carries BOTH the 2-col section gutter (added by
- * `flattenBlocks`) AND the 2-col inner inset (added in
- * `formatStationGroup`), so its total indent is 4 cols. Wrapping the
- * detail content at `SAFE_TEXT_WIDTH - 4` keeps every rendered line at
- * or below `SAFE_TEXT_WIDTH` real chars — past which the container
- * re-wraps and dumps orphan words at column 0.
+ * Pixel-width budget for a wrapped detail line ("Type · location"). A
+ * detail line carries BOTH the section gutter (added by `flattenBlocks`)
+ * AND the inner inset (added in `formatStationGroup`), so we wrap at the
+ * body inner width minus both — keeping indent + text in the container.
  */
-const DETAIL_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length - DETAIL_INSET.length; // 54
+const DETAIL_TEXT_WIDTH_PX =
+  SECTION_INNER_WIDTH_PX - textWidth(INDENT) - textWidth(DETAIL_INSET);
 
-/** Width budget for the abbreviated station name on the unit-header row. */
-const STATION_NAME_BUDGET = STATION_TEXT_WIDTH - 2; // 54  ("X " glyph cell)
+/** Pixel budget for the abbreviated station name on the unit-header row
+ *  (the "X " glyph cell precedes it). */
+const STATION_NAME_BUDGET_PX = STATION_TEXT_WIDTH_PX - textWidth("E ");
 
 /**
  * Per-incident location-description lines cap. Matches the
@@ -154,29 +155,34 @@ export interface ElevatorSnapshot {
  * implementations are kept in sync by `wrap.test.ts` style golden
  * tests; if the algorithm ever diverges, lift to `ui/render.ts`.
  */
-export function wrap(text: string, width: number): string[] {
+export function wrap(text: string, maxPx: number): string[] {
   if (!text) return [];
-  if (width <= 1) return [];
+  if (maxPx <= 0) return [];
+  const fits = (s: string): boolean => textWidth(s) <= maxPx;
+  if (!fits(ELLIPSIS)) return [];
   const words = text.split(/\s+/).filter((w) => w.length > 0);
   const lines: string[] = [];
   let current = "";
   for (const word of words) {
-    if (word.length > width) {
+    if (!fits(word)) {
       if (current.length > 0) {
         lines.push(current);
         current = "";
       }
       let remaining = word;
-      while (remaining.length > width) {
-        lines.push(remaining.slice(0, width - 1) + ELLIPSIS);
-        remaining = remaining.slice(width - 1);
+      while (!fits(remaining)) {
+        let k = remaining.length - 1;
+        while (k > 0 && !fits(remaining.slice(0, k) + ELLIPSIS)) k--;
+        if (k <= 0) break;
+        lines.push(remaining.slice(0, k) + ELLIPSIS);
+        remaining = remaining.slice(k);
       }
       if (remaining.length > 0) current = remaining;
       continue;
     }
     if (current.length === 0) {
       current = word;
-    } else if (current.length + 1 + word.length <= width) {
+    } else if (fits(current + " " + word)) {
       current = current + " " + word;
     } else {
       lines.push(current);
@@ -221,11 +227,10 @@ export function capDescription(lines: readonly string[]): string[] {
   const last = out[MAX_DESC_LINES - 1] ?? "";
   if (!last.endsWith(ELLIPSIS)) {
     const trimmed = trimTrailingSeparators(last);
-    if (trimmed.length < DETAIL_TEXT_WIDTH) {
-      out[MAX_DESC_LINES - 1] = trimmed + ELLIPSIS;
-    } else {
-      out[MAX_DESC_LINES - 1] = trimmed.slice(0, DETAIL_TEXT_WIDTH - 1) + ELLIPSIS;
-    }
+    out[MAX_DESC_LINES - 1] =
+      textWidth(trimmed + ELLIPSIS) <= DETAIL_TEXT_WIDTH_PX
+        ? trimmed + ELLIPSIS
+        : truncate(trimmed, DETAIL_TEXT_WIDTH_PX);
   }
   return out;
 }
@@ -268,10 +273,9 @@ export function renderUnitHeader(incident: ElevatorIncident): string {
   const glyph = unitGlyph(incident.UnitType);
   const station = abbreviateStation(
     stationNameOnly(incident.StationName),
-    STATION_NAME_BUDGET,
+    STATION_NAME_BUDGET_PX,
   );
-  // glyph(1) + " "(1) + station(≤STATION_NAME_BUDGET) = ≤STATION_TEXT_WIDTH
-  return truncate(`${glyph} ${station}`, STATION_TEXT_WIDTH);
+  return truncate(`${glyph} ${station}`, STATION_TEXT_WIDTH_PX);
 }
 
 /**
@@ -316,7 +320,7 @@ export function formatStationGroup(
   incidents: readonly ElevatorIncident[],
 ): string[] {
   const out: string[] = [
-    truncate(stationName, STATION_TEXT_WIDTH),
+    truncate(stationName, STATION_TEXT_WIDTH_PX),
   ];
   for (const inc of incidents) {
     const type = inc.UnitType === "ELEVATOR" ? "Elevator" : "Escalator";
@@ -333,7 +337,7 @@ export function formatStationGroup(
     // words at column 0). `capDescription` trims any dangling trailing
     // separator off the final fragment line.
     const wrapped = capDescription(
-      wrap(`${type} · ${desc}`, DETAIL_TEXT_WIDTH),
+      wrap(`${type} · ${desc}`, DETAIL_TEXT_WIDTH_PX),
     );
     for (const line of wrapped) {
       out.push(DETAIL_INSET + line);
@@ -418,7 +422,7 @@ export function stalenessMarker(
 export function renderHeader(snapshot: ElevatorSnapshot): string {
   const count = snapshot.incidents.length;
   const left = count > 0 ? `ACCESS (${count})` : "ACCESS";
-  return truncate(left, 50);
+  return truncate(left, HEADER_CONTENT_WIDTH_PX);
 }
 
 /**
@@ -477,23 +481,23 @@ export function makeElevatorScreen(
         snapshot.fetchedAt === 0 &&
         snapshot.fetchError !== null
       ) {
-        body.push(truncate("Couldn't reach WMATA. Will retry shortly.", LINE_WIDTH));
+        body.push(truncate("Couldn't reach WMATA. Will retry shortly.", SECTION_INNER_WIDTH_PX));
         body.push("");
-        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
         return { header, body, clockMarker };
       }
 
       if (snapshot.incidents.length === 0) {
-        body.push(truncate("All access points open at your stations.", LINE_WIDTH));
+        body.push(truncate("All access points open at your stations.", SECTION_INNER_WIDTH_PX));
         body.push("");
-        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
         return { header, body, clockMarker };
       }
 
       const flat = flattenBlocks(snapshot.preformatted);
       const offset = clamp(nav.highlightedIndex, Math.max(0, flat.length - 1));
-      const decorated = scrollWindowWithMarkers(flat, offset, USABLE_ROWS);
-      for (const r of decorated) body.push(truncate(r, LINE_WIDTH));
+      const decorated = scrollWindowWithMarkers(flat, offset, TWO_BODY_MAX_LINES);
+      for (const r of decorated) body.push(truncate(r, SECTION_INNER_WIDTH_PX));
       return { header, body, clockMarker };
     },
     reduce(snapshot, nav, event: ScreenEvent): ReduceResult<ElevatorSnapshot> {

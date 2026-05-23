@@ -53,13 +53,19 @@
 import type { StandardRoute, Train } from "../wmata";
 import {
   ELLIPSIS,
-  LINE_WIDTH,
-  SAFE_TEXT_WIDTH,
+  SPACE_PX,
   padLeft,
   padRight,
+  textWidth,
   truncate,
   wrapText,
 } from "../ui/render";
+import {
+  FOOTER_MAX_LINES,
+  HEADER_CONTENT_WIDTH_PX,
+  SECTION_INNER_WIDTH_PX,
+  VALUE_COL_GAP_PX,
+} from "../ui/geometry";
 import {
   abbreviateStation,
   formatEta,
@@ -88,30 +94,48 @@ import type {
 export { formatClock } from "../ui/format";
 
 // ---------------------------------------------------------------------------
-// Column budget constants
+// Column budget constants — PIXELS, measured in the firmware font.
 // ---------------------------------------------------------------------------
 
-/** Width of the line-name cell on a body row. Sized for the widest
- *  spelled-out WMATA line name ("YELLOW" / "ORANGE" / "SILVER" = 6). */
-const GLYPH_WIDTH = 6;
-/** Upper bound (in chars) for a destination on a LEFT body cell. The
- *  destination is left-aligned and NOT padded in the two-column body —
- *  this only bounds `abbreviateStation` so an over-long name can't push
- *  the left column past its safe width. The value column is a separate,
- *  pixel-aligned overlay (`RIGHT`), so the destination no longer needs a
- *  fixed-width cell to align the ETA.
- *
- *  Sized at 41 so the left cell — inset(2) + glyph(6) + " "(1) + dest —
- *  tops out at 50 chars (the value overlay sits at x≈466 ≈ col 50). 41
- *  is also wide enough to render even the longest real WMATA
- *  destinations in full ("Ronald Reagan Washington National Airport" =
- *  41, "Mt Vernon Sq 7th St-Convention Center" = 37) without falling
- *  back to a hand-tuned abbreviation. */
-const DEST_WIDTH = 41;
-/** Width of the cars cell ("6c" / "8c"). */
-const CARS_WIDTH = 2;
-/** Width of the ETA cell — sized to fit "12 min". */
-const ETA_WIDTH = 6;
+/** Spelled-out line names plus the unknown-line fallback. */
+const LINE_NAME_GLYPHS = ["RED", "BLUE", "GREEN", "SILVER", "YELLOW", "ORANGE", "--"];
+/** Width of the line-name cell — the widest spelled-out line name, so the
+ *  destination column starts at a consistent x on every row. */
+const GLYPH_CELL_PX = Math.max(...LINE_NAME_GLYPHS.map(textWidth));
+/** The 2-space body inset that sets a row in from the bordered frame. */
+const INSET_PX = textWidth("  ");
+/** Cars cell ("6c" / "8c"), right-aligned within the value column. */
+const CARS_CELL_PX = textWidth("8c");
+/** ETA cell, sized for the widest label "12 min", right-aligned. */
+const ETA_CELL_PX = textWidth("12 min");
+/** Width reserved on the right for the host's value-column overlay
+ *  ("<cars> <eta>"). Beyond the two content cells and the one-space
+ *  separator, we budget an extra SPACE_PX of slop: `padLeft` pads to the
+ *  NEAREST space, so each padded sub-cell can round up by ~one space, and
+ *  the overlay — whose width is committed once at mount — must not clip
+ *  the widest rendered cell. The left column is budgeted around this
+ *  reserve so the two never overlap. */
+const VALUE_COL_RESERVE_PX = CARS_CELL_PX + ETA_CELL_PX + 3 * SPACE_PX;
+/** Pixel budget for the LEFT column content (inset already consumed). */
+const BODY_LEFT_BUDGET_PX =
+  SECTION_INNER_WIDTH_PX - INSET_PX - VALUE_COL_RESERVE_PX - VALUE_COL_GAP_PX;
+/** Pixel budget for the destination after the inset + line cell + space. */
+const DEST_BUDGET_PX = BODY_LEFT_BUDGET_PX - GLYPH_CELL_PX - SPACE_PX;
+
+/**
+ * Render the line-name cell, padded to a consistent pixel width so the
+ * destination column aligns row-to-row. When `marker` is set ("*" pin /
+ * ">" cursor) it occupies the cell's right edge; the name is shortened
+ * (no ellipsis) just enough to make room, matching the v1.2 convention of
+ * the cursor reading as part of the line column.
+ */
+function lineCell(fullName: string, marker: "" | "*" | ">"): string {
+  if (marker === "") return padRight(fullName, GLYPH_CELL_PX);
+  const room = GLYPH_CELL_PX - textWidth(marker);
+  let name = fullName;
+  while (name.length > 0 && textWidth(name) > room) name = name.slice(0, -1);
+  return padRight(name, room) + marker;
+}
 
 /**
  * One body row, split into its two pixel-aligned columns:
@@ -299,7 +323,7 @@ export interface PredictionsFetchResult {
 
 /** Resolved position info for the pinned train. */
 export interface PinnedPosition {
-  /** Schematic row, exactly LINE_WIDTH cols. Renders below the pin. */
+  /** Fixed-width ASCII line diagram. Renders below the pin. */
   schematic: string;
   /** "<N> stops away" / "at this station" / "approaching" label. */
   label: string;
@@ -458,7 +482,10 @@ export function stalenessMarker(
  * `clockMarker` field instead.
  */
 export function renderHeader(snapshot: PredictionsSnapshot): string {
-  return truncate(abbreviateStation(toTitleCase(snapshot.stationName), 50), 50);
+  return truncate(
+    abbreviateStation(toTitleCase(snapshot.stationName), HEADER_CONTENT_WIDTH_PX),
+    HEADER_CONTENT_WIDTH_PX,
+  );
 }
 
 /**
@@ -492,15 +519,7 @@ export function renderTrainRow(
   // `lineGlyph` fallback ("--") covers unknown / blank codes.
   const code = lineGlyph(train.Line);
   const fullName = code === "--" ? "--" : lineName(code);
-  // When a marker is present, replace the LAST char of the line cell
-  // with the marker glyph so the cursor still reads as part of the
-  // line column (matching the v1.2 pin-a-train convention) but the
-  // line name is otherwise readable in full.
-  const padded = padRight(fullName, GLYPH_WIDTH);
-  const glyph =
-    marker === ""
-      ? padded
-      : padded.slice(0, GLYPH_WIDTH - 1) + marker;
+  const glyph = lineCell(fullName, marker);
   // `Destination` is WMATA's primary field; some rows have a tighter
   // 8-char code in `Destination` plus a full name in `DestinationName`.
   // Keep the existing `Destination || DestinationName` preference
@@ -509,16 +528,16 @@ export function renderTrainRow(
   // come out reading as "Shady Grove". Left-aligned, NOT padded — the
   // ETA lives in the right overlay column.
   const destSource = toTitleCase(train.Destination || train.DestinationName);
-  const dest = abbreviateStation(destSource, DEST_WIDTH);
+  const dest = abbreviateStation(destSource, DEST_BUDGET_PX);
   // Cars: "6c" / "8c". WMATA occasionally returns "" for non-revenue or
-  // unknown consist length; render that as "  " (two spaces) so the
-  // column doesn't collapse.
+  // unknown consist length; render that as blank so the column doesn't
+  // collapse.
   const carsRaw = train.Car && train.Car.trim().length > 0 ? `${train.Car}c` : "";
-  const cars = padLeft(carsRaw, CARS_WIDTH);
-  const eta = padLeft(formatEta(train.Min), ETA_WIDTH);
-  // LEFT: 2-char "  " indent so the row reads as content INSIDE the body
-  // container, not flush to the border. RIGHT: cars + a space + the
-  // right-aligned ETA — 2 + 1 + 6 = 9 chars, within the ~10-char overlay.
+  const cars = padLeft(carsRaw, CARS_CELL_PX);
+  const eta = padLeft(formatEta(train.Min), ETA_CELL_PX);
+  // LEFT: 2-space indent so the row reads as content INSIDE the body
+  // container, not flush to the border. RIGHT: cars + space + the
+  // right-aligned ETA, which the host overlays at a measured pixel x.
   return {
     left: "  " + glyph + " " + dest,
     right: cars + " " + eta,
@@ -570,14 +589,17 @@ export function renderPinRow(
     if (snapshot.pinnedGone) {
       const code = lineGlyph(snapshot.pinned.line);
       const fullName = code === "--" ? "--" : lineName(code);
-      const lineCell = padRight(fullName, GLYPH_WIDTH);
+      const glyphCell = padRight(fullName, GLYPH_CELL_PX);
       const dest = abbreviateStation(
         toTitleCase(snapshot.pinned.destination),
-        DEST_WIDTH,
+        DEST_BUDGET_PX,
       );
       // The "(gone)" tag rides the LEFT cell (it's not a value); no
       // right-column ETA for a departed train.
-      const left = truncate("* " + lineCell + " " + dest + " (gone)", SAFE_TEXT_WIDTH);
+      const left = truncate(
+        "* " + glyphCell + " " + dest + " (gone)",
+        BODY_LEFT_BUDGET_PX,
+      );
       return { left, right: "" };
     }
     return null;
@@ -585,16 +607,16 @@ export function renderPinRow(
   const t = visibleTrains[idx]!;
   const code = lineGlyph(t.Line);
   const fullName = code === "--" ? "--" : lineName(code);
-  const line = padRight(fullName, GLYPH_WIDTH);
+  const glyphCell = padRight(fullName, GLYPH_CELL_PX);
   const dest = abbreviateStation(
     toTitleCase(t.Destination || t.DestinationName),
-    DEST_WIDTH,
+    DEST_BUDGET_PX,
   );
-  const eta = padLeft(formatEta(t.Min), ETA_WIDTH);
-  // LEFT: "* "(2) + line glyph cell + " " + destination, clamped to the
-  // safe text width so the LVGL container can't hard-wrap. RIGHT: the
+  const eta = padLeft(formatEta(t.Min), ETA_CELL_PX);
+  // LEFT: "* "(inset+pin marker) + line glyph cell + " " + destination,
+  // clamped so the LVGL container can't hard-wrap. RIGHT: the
   // right-aligned ETA in the value overlay.
-  const left = truncate("* " + line + " " + dest, SAFE_TEXT_WIDTH);
+  const left = truncate("* " + glyphCell + " " + dest, BODY_LEFT_BUDGET_PX);
   return { left, right: eta };
 }
 
@@ -656,7 +678,7 @@ export function pinnedDistancePhrase(
  *
  * The "* " marker doubles as the 2-char body inset so the line cell
  * aligns with the train rows below. The left segment is clamped to
- * `SAFE_TEXT_WIDTH` so the LVGL container can't hard-wrap it; the ETA is
+ * the left-column budget so the LVGL container can't hard-wrap it; the ETA is
  * the host's right overlay column (pixel-aligned with the train ETAs).
  */
 export function renderPinnedSummary(
@@ -671,7 +693,7 @@ export function renderPinnedSummary(
   const fullName = code === "--" ? "--" : lineName(code);
   const dest = abbreviateStation(
     toTitleCase(t.Destination || t.DestinationName),
-    DEST_WIDTH,
+    DEST_BUDGET_PX,
   );
   // Distance phrase from the resolved position (when present).
   const phrase =
@@ -683,23 +705,13 @@ export function renderPinnedSummary(
   // rows below ("  " + glyph + …).
   const head = `* ${fullName} ${dest}`;
   const left = phrase ? `${head} (${phrase})` : head;
-  // Clamp real text to the safe width so the LVGL container can't
+  // Clamp real text to the left-column budget so the LVGL container can't
   // hard-wrap it. The ETA goes in the right overlay column.
   return {
-    left: truncate(left, SAFE_TEXT_WIDTH),
+    left: truncate(left, BODY_LEFT_BUDGET_PX),
     right: formatEta(t.Min),
   };
 }
-
-/**
- * Maximum lines we'll spend on an incident footer. The footer
- * container is ~88px (~3 text rows) in the rebalanced three-section
- * geometry, so we cap the wrapped headline at 3 lines: enough to read
- * the first sentence of a typical service alert at SAFE_TEXT_WIDTH,
- * while the `wrapText` ellipsis path terminates anything longer
- * cleanly rather than overflowing the bordered box.
- */
-const FOOTER_MAX_LINES = 3;
 
 /**
  * Build the QUIET fallback line shown in the footer when there's no
@@ -714,7 +726,7 @@ const FOOTER_MAX_LINES = 3;
  *      navigation hint:
  *        "Double-tap for stations"
  *
- * Always a single line, clamped to `SAFE_TEXT_WIDTH` and 2-char inset
+ * Always a single line, clamped to the footer inner width with a 2-space inset
  * to match the incident footer's prefix rhythm.
  */
 export function renderFooterQuiet(
@@ -732,10 +744,10 @@ export function renderFooterQuiet(
   }
   if (names.length === 0) {
     // No revenue lines to summarise — fall back to a gentle hint.
-    return "  " + truncate("Double-tap for stations", SAFE_TEXT_WIDTH - 2);
+    return "  " + truncate("Double-tap for stations", SECTION_INNER_WIDTH_PX - INSET_PX);
   }
   const body = "Serving " + names.join(", ");
-  return "  " + truncate(body, SAFE_TEXT_WIDTH - 2);
+  return "  " + truncate(body, SECTION_INNER_WIDTH_PX - INSET_PX);
 }
 
 /**
@@ -750,7 +762,7 @@ export function renderFooterQuiet(
  *
  * Never returns `null` for the three-section layout: the footer
  * container always exists, so we always give it gentle content. The
- * incident text is wrapped at `SAFE_TEXT_WIDTH` (via `wrapWithPrefix`)
+ * incident text is wrapped to the footer inner width (via `wrapWithPrefix`)
  * so long alerts can't trip the container's hard-wrap.
  *
  * `visibleTrains` feeds the quiet fallback's served-lines summary;
@@ -792,11 +804,10 @@ export function renderFooter(
  */
 function wrapWithPrefix(prefix: string, body: string): string[] {
   const indent = " ".repeat(prefix.length);
-  // Wrap real prose at SAFE_TEXT_WIDTH (NOT LINE_WIDTH) so a long alert
-  // can't push past the container's 576px hard-wrap point and dump an
-  // orphan word at column 0. The prefix/indent consumes from that
-  // budget so wrapped + inset still fits.
-  const innerWidth = SAFE_TEXT_WIDTH - prefix.length;
+  // Wrap real prose at the footer's inner pixel width minus the prefix,
+  // so a long alert can't push past the container's hard-wrap point and
+  // dump an orphan word at the left edge.
+  const innerWidth = SECTION_INNER_WIDTH_PX - textWidth(prefix);
   const wrapped = wrapText(body.trim(), innerWidth, FOOTER_MAX_LINES);
   if (wrapped.length === 0) return [];
   // Strip a single dangling comma/period from the final line when the
@@ -863,17 +874,17 @@ export function renderLastTrainRow(
     return `${lineName(e.line)} ${n ? to12hLabel(n) : e.time}`;
   };
   if (sorted.length === 1) {
-    return truncate(`Last ${label(sorted[0]!)}`, SAFE_TEXT_WIDTH);
+    return truncate(`Last ${label(sorted[0]!)}`, SECTION_INNER_WIDTH_PX);
   }
   if (sorted.length === 2) {
     const cells = sorted.map(label).join("  ");
-    return truncate(`Last ${cells}`, SAFE_TEXT_WIDTH);
+    return truncate(`Last ${cells}`, SECTION_INNER_WIDTH_PX);
   }
   // 3+ — drop cell #2; the +N marker takes the slot.
   const overflow = sorted.length - 1;
   return truncate(
     `Last ${label(sorted[0]!)} +${overflow}`,
-    SAFE_TEXT_WIDTH,
+    SECTION_INNER_WIDTH_PX,
   );
 }
 
@@ -948,7 +959,7 @@ export function resolvePinnedPosition(
     trainIdx,
   );
   return {
-    label: truncate(label, LINE_WIDTH),
+    label: truncate(label, SECTION_INNER_WIDTH_PX),
     schematic,
   };
 }
@@ -1062,12 +1073,12 @@ export function makePredictionsScreen(
         // "Loading…" cue; otherwise show "No trains predicted". These are
         // value-less prose rows: all content in the LEFT column.
         if (snapshot.fetchedAt === 0 && snapshot.fetchError === null) {
-          pushRow({ left: truncate("Loading…", LINE_WIDTH), right: "" });
+          pushRow({ left: truncate("Loading…", SECTION_INNER_WIDTH_PX), right: "" });
         } else {
-          pushRow({ left: truncate("No trains predicted.", LINE_WIDTH), right: "" });
+          pushRow({ left: truncate("No trains predicted.", SECTION_INNER_WIDTH_PX), right: "" });
         }
         pushRow({ left: "", right: "" });
-        pushRow({ left: truncate("(double-tap to exit)", LINE_WIDTH), right: "" });
+        pushRow({ left: truncate("(double-tap to exit)", SECTION_INNER_WIDTH_PX), right: "" });
       } else {
         // Cursor: `nav.highlightedIndex` is clamped to the visible
         // range. The pinned train (if any) is marked with "*"; the
@@ -1120,7 +1131,7 @@ export function makePredictionsScreen(
         // `body` is ignored by the host when `bodyColumns` is present;
         // we set it to [] per the two-column contract (router.ts).
         body: [],
-        bodyColumns: { left: bodyLeft, right: bodyRight },
+        bodyColumns: { left: bodyLeft, right: bodyRight, rightWidthPx: VALUE_COL_RESERVE_PX },
         footer,
         clockMarker: stalenessMarker(snapshot, ctx.nowMs),
       };

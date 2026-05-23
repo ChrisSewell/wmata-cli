@@ -2,7 +2,8 @@
 
 import { describe, expect, it } from "vitest";
 import type { StandardRoute } from "../wmata";
-import { LINE_WIDTH } from "./render";
+import { textWidth } from "./render";
+import { SECTION_INNER_WIDTH_PX } from "./geometry";
 import {
   SCHEMATIC_GLYPH_PLAIN,
   SCHEMATIC_GLYPH_TRAIN,
@@ -154,8 +155,29 @@ describe("stationsBetween", () => {
 describe("renderLineSchematic", () => {
   const stations = ["A01", "A02", "A03", "A04", "A05"];
 
-  it("returns exactly LINE_WIDTH columns", () => {
-    expect(renderLineSchematic("RD", stations, 0, 2).length).toBe(LINE_WIDTH);
+  // The schematic is a monospace ASCII stand-in (one char per station
+  // cell). The source sizes the fixed column count by the body inner
+  // pixel width divided by the WIDEST glyph it can hold, so the row never
+  // overflows the body regardless of which cells land on markers. Mirror
+  // that derivation here (the column count is not exported).
+  const SCHEMATIC_GLYPH_MAX_PX = Math.max(
+    textWidth("-"),
+    textWidth("*"),
+    textWidth("@"),
+    textWidth(" "),
+    textWidth("W"),
+  );
+  const SCHEMATIC_COLS = Math.floor(
+    SECTION_INNER_WIDTH_PX / SCHEMATIC_GLYPH_MAX_PX,
+  );
+
+  it("returns a fixed column count that fits the body inner width", () => {
+    const out = renderLineSchematic("RD", stations, 0, 2);
+    expect(out.length).toBe(SCHEMATIC_COLS);
+    // The widest possible rendering still fits the body inner pixel width.
+    expect(textWidth("W".repeat(out.length))).toBeLessThanOrEqual(
+      SECTION_INNER_WIDTH_PX,
+    );
   });
 
   it("starts with the line code + space", () => {
@@ -194,7 +216,7 @@ describe("renderLineSchematic", () => {
     const long: string[] = [];
     for (let i = 0; i < 40; i++) long.push(`X${String(i)}`);
     const out = renderLineSchematic("RD", long, 5, 30);
-    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.length).toBe(SCHEMATIC_COLS);
     // Both markers should still appear despite the compression.
     expect(out).toContain(SCHEMATIC_GLYPH_USER);
     expect(out).toContain(SCHEMATIC_GLYPH_TRAIN);
@@ -202,6 +224,6 @@ describe("renderLineSchematic", () => {
 
   it("renders a blank schematic for an unknown line", () => {
     const out = renderLineSchematic("--", [], -1, -1);
-    expect(out.length).toBe(LINE_WIDTH);
+    expect(out.length).toBe(SCHEMATIC_COLS);
   });
 });

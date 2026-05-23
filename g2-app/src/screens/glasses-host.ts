@@ -53,6 +53,7 @@ import {
 } from "@evenrealities/even_hub_sdk";
 
 import { SCREEN_WIDTH_PX } from "../ui/render";
+import { SECTION_INSET_PX, VALUE_COL_PADDING_PX } from "../ui/geometry";
 import { formatClock } from "../ui/format";
 
 import type {
@@ -118,15 +119,20 @@ const CLOCK_HEIGHT_PX = 30;
  * this small BORDERLESS container on the body's right portion with the
  * value lines — so the value column starts at a fixed pixel x and is
  * truly aligned (a space-padded column in the body can't be, given the
- * variable-width font). Like the clock, it's an additive overlay, so
- * the header/body/footer/clock IDs and geometry are unchanged. The
- * high, fixed ID avoids colliding with the layout-dependent footer/
- * clock IDs.
+ * variable-width font). Its width and x are COMPUTED from the screen's
+ * declared `rightWidthPx` (measured in real pixels) and right-anchored to
+ * the body's inner edge, replacing the old eyeballed x=466. Like the
+ * clock, it's an additive overlay, so the header/body/footer/clock IDs
+ * and geometry are unchanged. The high, fixed ID avoids colliding with
+ * the layout-dependent footer/clock IDs.
  */
 const BODY_RIGHT_CONTAINER_ID = 7;
-/** Left x of the value-column overlay (and width to the right border). */
-const BODY_RIGHT_X_PX = 466;
-const BODY_RIGHT_WIDTH_PX = SCREEN_WIDTH_PX - BODY_RIGHT_X_PX; // 110
+/** Fallback value-column content width (px) when a screen doesn't declare
+ *  `rightWidthPx`. Matches the legacy overlay's inner width. */
+const DEFAULT_VALUE_COL_CONTENT_PX = 98;
+/** Right inner edge of the full-width body container (where the value
+ *  column's content is anchored flush). */
+const BODY_INNER_RIGHT_PX = SCREEN_WIDTH_PX - SECTION_INSET_PX;
 
 // --- Two-section layout (default) ---
 /** Header section height for two-section pages. */
@@ -304,15 +310,26 @@ function makeClockContainer(
 function makeBodyRightContainer(
   layout: "two-section" | "three-section",
   content: string,
+  contentWidthPx: number,
 ): TextContainerProperty {
   const is3 = layout === "three-section";
+  // Right-anchor the value column flush to the body's inner right edge:
+  // the content's right edge sits at BODY_INNER_RIGHT_PX, so every value
+  // line shares a right edge regardless of the (variable-width) left
+  // content. Width/x are computed (not eyeballed) from the screen's
+  // declared content width.
+  const overlayWidth = contentWidthPx + 2 * VALUE_COL_PADDING_PX;
+  const overlayX = Math.max(
+    0,
+    BODY_INNER_RIGHT_PX - VALUE_COL_PADDING_PX - contentWidthPx,
+  );
   return new TextContainerProperty({
-    xPosition: BODY_RIGHT_X_PX,
+    xPosition: overlayX,
     yPosition: is3 ? THREE_BODY_Y_PX : TWO_BODY_Y_PX,
-    width: BODY_RIGHT_WIDTH_PX,
+    width: overlayWidth,
     height: is3 ? THREE_BODY_HEIGHT_PX : TWO_BODY_HEIGHT_PX,
     borderWidth: 0,
-    paddingLength: BODY_PADDING,
+    paddingLength: VALUE_COL_PADDING_PX,
     containerID: BODY_RIGHT_CONTAINER_ID,
     containerName: "wmata.bodyR",
     isEventCapture: 0,
@@ -328,6 +345,7 @@ function buildPage(
   initialClock: string,
   hasColumns: boolean,
   initialBodyRight: string,
+  valueColContentPx: number,
 ): CreateStartUpPageContainer {
   if (layout === "three-section") {
     const header = new TextContainerProperty({
@@ -373,7 +391,9 @@ function buildPage(
       content: initialFooter,
     });
     const three = [header, body, footer, makeClockContainer(layout, initialClock)];
-    if (hasColumns) three.push(makeBodyRightContainer(layout, initialBodyRight));
+    if (hasColumns) {
+      three.push(makeBodyRightContainer(layout, initialBodyRight, valueColContentPx));
+    }
     return new CreateStartUpPageContainer({
       containerTotalNum: three.length,
       textObject: three,
@@ -406,7 +426,9 @@ function buildPage(
     content: initialBody,
   });
   const two = [header, body, makeClockContainer(layout, initialClock)];
-  if (hasColumns) two.push(makeBodyRightContainer(layout, initialBodyRight));
+  if (hasColumns) {
+    two.push(makeBodyRightContainer(layout, initialBodyRight, valueColContentPx));
+  }
   return new CreateStartUpPageContainer({
     containerTotalNum: two.length,
     textObject: two,
@@ -614,6 +636,9 @@ export async function mountGlassesScreen<S>(
   const initialHeader = joinForRender(initialSections.header);
   const initialBody = joinForRender(initialCols ? initialCols.left : initialSections.body);
   const initialBodyRight = initialCols ? joinForRender(initialCols.right) : "";
+  // The value-column overlay's geometry is committed once here (containers
+  // can't be resized after mount), so use the screen's declared reserve.
+  const valueColContentPx = initialCols?.rightWidthPx ?? DEFAULT_VALUE_COL_CONTENT_PX;
   const initialFooter = joinForRender(initialSections.footer ?? []);
   const initialClock = clockContent(initialCtx.nowMs, initialSections.clockMarker);
   lastRenderedHeader = initialHeader;
@@ -631,6 +656,7 @@ export async function mountGlassesScreen<S>(
         initialClock,
         hasColumns,
         initialBodyRight,
+        valueColContentPx,
       ),
     );
     if (result !== StartUpPageCreateResult.success) {

@@ -6,25 +6,25 @@
 // glasses surface has even tighter width constraints than the CLI, so
 // `abbreviateStation` is also defined here.
 //
-// Abbreviation length budget (per WP6 Reviewer):
+// Abbreviation budget:
 //
-//   Every value in `STATION_ABBREVIATIONS` must be ≤ NAME_WIDTH (10)
-//   columns. Anything longer is invisibly truncated with `…` at render
-//   time, which defeats the purpose of having a hand-tuned abbreviation.
-//   The fix-up pass shortened these entries:
+//   Every value in `STATION_ABBREVIATIONS` must fit the narrowest column
+//   it's rendered into (the predictions destination cell). Anything wider
+//   is invisibly truncated with `…` at render time, defeating the purpose
+//   of a hand-tuned abbreviation. These entries were shortened by hand so
+//   they read cleanly rather than getting machine-truncated:
 //
-//     "Federal Triangle"  "Fed Triangle" (12) -> "Fed Tri"    (7)
-//     "Morgan Boulevard"  "Morgan Blvd"  (11) -> "Morgan Bv"  (9)
-//     "Virginia Sq-GMU"   "Virginia Sq"  (11) -> "Virgnia Sq" (10)
-//     "Eastern Market"    "Eastern Mkt"  (11) -> "Eastern Mk" (10)
-//     "Smithsonian"       "Smithsonian"  (11) -> "Smithson"   (8)
+//     "Federal Triangle"  "Fed Triangle" -> "Fed Tri"
+//     "Morgan Boulevard"  "Morgan Blvd"  -> "Morgan Bv"
+//     "Virginia Sq-GMU"   "Virginia Sq"  -> "Virgnia Sq"
+//     "Eastern Market"    "Eastern Mkt"  -> "Eastern Mk"
+//     "Smithsonian"       "Smithsonian"  -> "Smithson"
 //
-//   The "Federal Center SW" entry was left as "Fed Center" (10) because
-//   it already fits within budget. A guard test in `format.test.ts`
-//   asserts the ≤ 10-char invariant so future entries can't drift.
+//   A guard test in `format.test.ts` asserts every entry's PIXEL width
+//   stays within that column budget so future entries can't drift.
 
 import type { LineCode } from "../wmata";
-import { ELLIPSIS, truncate } from "./render";
+import { ELLIPSIS, textWidth, truncate } from "./render";
 
 /**
  * Map a WMATA `Min` string to its glasses-ready form.
@@ -214,7 +214,8 @@ export const STATION_ABBREVIATIONS: Record<string, string> = {
 };
 
 /**
- * Abbreviate a station name to fit `maxLen` columns.
+ * Abbreviate a station name to fit `maxPx` pixels (measured in the
+ * firmware font, kerning included).
  *
  * Strategy:
  *   1. If the canonical name fits, return it unchanged.
@@ -223,22 +224,20 @@ export const STATION_ABBREVIATIONS: Record<string, string> = {
  *
  * The map is consulted whether or not the canonical name fits, because
  * a known short form is almost always more readable than a truncated
- * long one (e.g., "Vienna" beats "Vienna/Fai…" at 11 cols).
+ * long one (e.g., "Vienna" beats "Vienna/Fai…").
  */
-export function abbreviateStation(name: string, maxLen: number): string {
+export function abbreviateStation(name: string, maxPx: number): string {
   if (!name) return "";
-  if (maxLen <= 0) return "";
+  if (maxPx <= 0) return "";
   const abbr = STATION_ABBREVIATIONS[name];
-  // Prefer the canonical name when it already fits AND there's no
-  // shorter abbrev that would be tidier. Practically: if the abbrev
-  // fits, use it for names longer than maxLen; otherwise keep the full
-  // name.
-  if (name.length <= maxLen) return name;
-  if (abbr && abbr.length <= maxLen) return abbr;
-  // Fall back to truncation. If even the abbrev is too long, prefer
+  // Prefer the canonical name when it already fits; otherwise reach for a
+  // hand-tuned abbreviation that fits before falling back to truncation.
+  if (textWidth(name) <= maxPx) return name;
+  if (abbr && textWidth(abbr) <= maxPx) return abbr;
+  // Fall back to truncation. If even the abbrev is too wide, prefer
   // truncating the abbrev (shorter source = less information loss).
   const source = abbr ?? name;
-  return source.length <= maxLen ? source : truncate(source, maxLen);
+  return textWidth(source) <= maxPx ? source : truncate(source, maxPx);
 }
 
 /**

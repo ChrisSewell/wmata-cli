@@ -1,17 +1,21 @@
 // Unit tests for the Home screen.
 //
 // Acceptance contract:
-//   - `view()` always returns lines ≤ LINE_WIDTH columns, and favorite
-//     rows additionally stay within SAFE_TEXT_WIDTH (the real-text wrap
-//     budget) because they are left-flowing prose, not space-padded.
+//   - `view()` always returns lines within the section inner pixel width,
+//     and the LEFT body column additionally stays within LEFT_COL_MAX_PX
+//     so it never runs under the host's value-column overlay.
 //   - `reduce()` clamps the highlight to [0, rowCount-1].
 //   - TAP / DOUBLE_TAP return the right navigation intent.
 //   - The empty state renders a friendly help message.
 //   - The 5-favorite adversarial case (longest names, many lines each)
-//     never overflows SAFE_TEXT_WIDTH.
+//     never overflows the LEFT column pixel budget.
 
 import { describe, expect, it } from "vitest";
-import { LINE_WIDTH, SAFE_TEXT_WIDTH } from "../ui/render";
+import { textWidth } from "../ui/render";
+import {
+  HEADER_CONTENT_WIDTH_PX,
+  SECTION_INNER_WIDTH_PX,
+} from "../ui/geometry";
 import type { FavoriteStation } from "../storage/settings";
 import type { LineCode } from "../wmata";
 import {
@@ -21,9 +25,7 @@ import {
   type ViewContext,
 } from "./router";
 import {
-  ACCESS_LABEL_PREFIX,
-  ETA_CELL_WIDTH,
-  LEFT_COL_MAX,
+  LEFT_COL_MAX_PX,
   STATUS_ROW_LINE_ORDER,
   etaSortValue,
   favoritesOffset,
@@ -34,15 +36,11 @@ import {
   isVoiceIndex,
   makeHomeScreen,
   renderAccessLeft,
-  renderAccessRow,
   renderAccessValue,
   renderAlertsLeft,
   renderAlertsValue,
-  renderEtaCell,
   renderEtaValue,
   renderFavoriteLeft,
-  renderFavoriteRow,
-  renderAlertsRow,
   renderHeader,
   renderLinesSuffix,
   rowCount,
@@ -98,30 +96,21 @@ const F = {
 
 function expectFits(lines: string[]): void {
   for (const line of lines) {
-    expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   }
 }
 
 /**
- * Assert a left-flowing favorite row stays within the real-text wrap
- * budget. Favorite rows are prose (no space padding), so the binding
- * constraint is SAFE_TEXT_WIDTH, not LINE_WIDTH.
- */
-function expectFavoriteRowFits(row: string): void {
-  expect(row.length).toBeLessThanOrEqual(SAFE_TEXT_WIDTH);
-}
-
-/**
- * Assert every LEFT-column body line stays within `LEFT_COL_MAX` so it
- * can never run under the borderless right-column value overlay (pinned
- * at ≈ column 50). The right column is positioned by container geometry,
- * not padding, so only the left column needs this guard.
+ * Assert every LEFT-column body line stays within `LEFT_COL_MAX_PX` (in
+ * pixels) so it can never run under the borderless right-column value
+ * overlay. The right column is positioned by container geometry, not
+ * padding, so only the left column needs this guard.
  */
 function expectLeftColumnFits(sections: {
   bodyColumns?: { left: string[]; right: string[] };
 }): void {
   for (const l of sections.bodyColumns!.left) {
-    expect(l.length).toBeLessThanOrEqual(LEFT_COL_MAX);
+    expect(textWidth(l)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
   }
 }
 
@@ -160,11 +149,11 @@ describe("renderHeader", () => {
     const h = renderHeader();
     expect(h).toBe("WMATA  Favorites");
     expect(h).toContain("Favorites");
-    // The clock is no longer embedded; the title stays within the 50-col
-    // budget so it can't collide with the host's top-right clock cell.
+    // The clock is no longer embedded; the title stays within the header
+    // content pixel budget so it can't collide with the host's top-right
+    // clock cell.
     expect(h).not.toContain(" 2:32p");
-    expect(h.length).toBeLessThanOrEqual(50);
-    expect(h.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(h)).toBeLessThanOrEqual(HEADER_CONTENT_WIDTH_PX);
   });
 });
 
@@ -252,92 +241,11 @@ describe("soonestEta", () => {
 });
 
 // ---------------------------------------------------------------------------
-// ETA cell rendering (left-aligned, fixed-width, blank when unknown)
-// ---------------------------------------------------------------------------
-
-describe("renderEtaCell", () => {
-  it("renders a numeric ETA as '<n> min' left-aligned in a 6-col cell", () => {
-    expect(renderEtaCell("4")).toBe("4 min ");
-    expect(renderEtaCell("4").length).toBe(ETA_CELL_WIDTH);
-  });
-
-  it("renders a 2-digit ETA filling the whole cell", () => {
-    expect(renderEtaCell("12")).toBe("12 min");
-    expect(renderEtaCell("12").length).toBe(ETA_CELL_WIDTH);
-  });
-
-  it("renders ARR / BRD verbatim, padded to the cell width", () => {
-    expect(renderEtaCell("ARR")).toBe("ARR   ");
-    expect(renderEtaCell("BRD")).toBe("BRD   ");
-    expect(renderEtaCell("ARR").length).toBe(ETA_CELL_WIDTH);
-    expect(renderEtaCell("BRD").length).toBe(ETA_CELL_WIDTH);
-  });
-
-  it("renders null as an all-spaces cell (loading / no train), never 'null'", () => {
-    expect(renderEtaCell(null)).toBe(" ".repeat(ETA_CELL_WIDTH));
-    expect(renderEtaCell(null)).not.toContain("null");
-  });
-
-  it("renders unknown sentinels ('', '---') as a blank cell (kept aligned)", () => {
-    expect(renderEtaCell("")).toBe(" ".repeat(ETA_CELL_WIDTH));
-    expect(renderEtaCell("---")).toBe(" ".repeat(ETA_CELL_WIDTH));
-  });
-
-  it("lets a pathological 3-digit ETA overflow the cell rather than truncate", () => {
-    // Losing the digit would be worse than a one-row misalignment.
-    expect(renderEtaCell("100")).toBe("100 min");
-    expect(renderEtaCell("100").length).toBeGreaterThan(ETA_CELL_WIDTH);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// renderFavoriteRow: ETA column placement + overflow guard
-// ---------------------------------------------------------------------------
-
-describe("renderFavoriteRow: ETA column", () => {
-  it("places the ETA cell between the cursor prefix and the station name", () => {
-    const row = renderFavoriteRow(F.metroCenter, false, "4");
-    expect(row).toBe("  4 min  Metro Center · RED BLUE ORANGE SILVER");
-    // Name starts at the constant column: 2 prefix + 6 cell + 1 space.
-    expect(row.indexOf("Metro Center")).toBe(9);
-  });
-
-  it("aligns names across ETAs of different widths (numeric vs ARR vs blank)", () => {
-    const numeric = renderFavoriteRow(F.unionStn, false, "4");
-    const twoDigit = renderFavoriteRow(F.unionStn, false, "12");
-    const arr = renderFavoriteRow(F.unionStn, false, "ARR");
-    const brd = renderFavoriteRow(F.unionStn, false, "BRD");
-    const blank = renderFavoriteRow(F.unionStn, false, null);
-    for (const row of [numeric, twoDigit, arr, brd, blank]) {
-      // Every variant lands the station name at the same column.
-      expect(row.indexOf("Union Station")).toBe(9);
-    }
-  });
-
-  it("defaults to a blank ETA cell when no eta arg is passed", () => {
-    expect(renderFavoriteRow(F.unionStn, false)).toBe(
-      "         Union Station · RED",
-    );
-  });
-
-  it("never exceeds SAFE_TEXT_WIDTH even with a long name + ETA + many lines", () => {
-    // Worst case: longest name, widest 5-line set, plus an ETA column.
-    const fav: FavoriteStation = {
-      code: "E03",
-      name: "U Street/African-Amer Civil War Memorial/Cardozo",
-      lines: ["RD", "BL", "YL", "OR", "GR"],
-    };
-    for (const eta of ["4", "12", "ARR", "BRD", null]) {
-      const row = renderFavoriteRow(fav, true, eta);
-      expectFavoriteRowFits(row);
-      // Codes survive intact at the tail (the name gives way first).
-      expect(row.endsWith("RED BLUE YELLOW ORANGE GREEN")).toBe(true);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Two-column helpers: renderEtaValue + renderFavoriteLeft
+//
+// (The dead char-grid single-column renderers — `renderEtaCell`,
+// `renderFavoriteRow` — were removed in the pixel-accurate refactor; the
+// two-column path below is the live one.)
 // ---------------------------------------------------------------------------
 
 describe("renderEtaValue", () => {
@@ -384,7 +292,7 @@ describe("renderFavoriteLeft", () => {
     expect(renderFavoriteLeft(fav, false)).not.toContain("·");
   });
 
-  it("stays within LEFT_COL_MAX, truncating the NAME but keeping line codes", () => {
+  it("stays within LEFT_COL_MAX_PX, truncating the NAME but keeping line codes", () => {
     const fav: FavoriteStation = {
       code: "E03",
       name: "U Street/African-Amer Civil War Memorial/Cardozo",
@@ -392,7 +300,7 @@ describe("renderFavoriteLeft", () => {
     };
     for (const hl of [false, true]) {
       const left = renderFavoriteLeft(fav, hl);
-      expect(left.length).toBeLessThanOrEqual(LEFT_COL_MAX);
+      expect(textWidth(left)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
       // Line names survive intact at the tail; the name gives way first.
       expect(left.endsWith("RED BLUE YELLOW ORANGE GREEN")).toBe(true);
     }
@@ -490,7 +398,7 @@ describe("home view: 5 favorites (cap)", () => {
 });
 
 describe("home view: adversarial 5 favorites (longest names + many lines)", () => {
-  it("keeps every LEFT column within LEFT_COL_MAX with long names + 5 lines each", () => {
+  it("keeps every LEFT column within LEFT_COL_MAX_PX with long names + 5 lines each", () => {
     // All five entries get the same lines payload (the maximum
     // realistic 5-line set) so each row's line-name list is as wide as
     // it gets — forcing the station-name truncation path.
@@ -525,7 +433,7 @@ describe("home view: adversarial 5 favorites (longest names + many lines)", () =
       const sections = screen.view(snap, { highlightedIndex: idx }, CTX);
       const lines = flattenSections(sections);
       expectFits(lines);
-      // LEFT column: no line may run under the value overlay (≤ 50).
+      // LEFT column: no line may run under the value overlay.
       expectLeftColumnFits(sections);
       // Each left line still keeps the full line names at its tail (the
       // station name gives way first).
@@ -536,53 +444,55 @@ describe("home view: adversarial 5 favorites (longest names + many lines)", () =
       for (const r of sections.bodyColumns!.right) {
         expect(r).toBe("12 min");
       }
-      // Flat zip stays within the panel width too.
+      // Flat zip stays within the section inner width too.
       for (const l of lines.slice(1)) {
-        expect(l.length).toBeLessThanOrEqual(LINE_WIDTH);
+        expect(textWidth(l)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
       }
     }
   });
 
-  it("shortens the station name but keeps the full line names when a row overflows", () => {
+  it("shortens the station name but keeps the full line names when the left cell overflows", () => {
     // Worst case from the design brief: the longest station name with
     // four wide line names. The codes must survive intact; the name
-    // gives way (here via its hand-tuned abbreviation "Mt Vernon").
+    // gives way (here via its hand-tuned abbreviation "Mt Vernon"). This
+    // exercises the LIVE two-column left-cell renderer.
     const fav: FavoriteStation = {
       code: "F03",
       name: "Mt Vernon Sq 7th St-Convention Center",
       lines: ["RD", "BL", "OR", "SV"],
     };
-    const row = renderFavoriteRow(fav, false);
-    expectFavoriteRowFits(row);
+    const left = renderFavoriteLeft(fav, false);
+    expect(textWidth(left)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
     // Line names are preserved verbatim at the tail.
-    expect(row.endsWith("RED BLUE ORANGE SILVER")).toBe(true);
-    // The separator survives, so the row reads as "<name> · <lines>".
-    expect(row).toContain(" · RED BLUE ORANGE SILVER");
+    expect(left.endsWith("RED BLUE ORANGE SILVER")).toBe(true);
+    // The separator survives, so the cell reads as "<name> · <lines>".
+    expect(left).toContain(" · RED BLUE ORANGE SILVER");
     // The name gave way — the full canonical name does NOT appear, but a
     // shortened form (the abbreviation) does.
-    expect(row).not.toContain("Mt Vernon Sq 7th St-Convention Center");
-    expect(row).toContain("Mt Vernon");
+    expect(left).not.toContain("Mt Vernon Sq 7th St-Convention Center");
+    expect(left).toContain("Mt Vernon");
   });
 
-  it("falls back to whole-row truncation when the line names alone overflow", () => {
+  it("falls back to whole-cell truncation when the line names alone overflow", () => {
     // Pathological: a name plus an absurd line list that exceeds the
-    // budget even with an empty name. The row must still not overflow.
+    // budget even with an empty name. The left cell must still not
+    // overflow the column budget.
     const fav: FavoriteStation = {
       code: "Z99",
       name: "Anytown",
-      // 6 full names = "RED BLUE YELLOW ORANGE GREEN SILVER" (35 chars);
-      // doubled here purely to force the line-names-too-wide branch.
+      // 6 full names = "RED BLUE YELLOW ORANGE GREEN SILVER"; doubled here
+      // purely to force the line-names-too-wide branch.
       lines: [
         "RD", "BL", "YL", "OR", "GR", "SV",
         "RD", "BL", "YL", "OR", "GR", "SV",
       ],
     };
-    const row = renderFavoriteRow(fav, false);
-    expectFavoriteRowFits(row);
+    const left = renderFavoriteLeft(fav, false);
+    expect(textWidth(left)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
     // The canonical full station name cannot fit, so it's cut down.
-    expect(row).not.toContain("Anytown");
-    // The row terminates with the ellipsis from whole-row truncation.
-    expect(row.endsWith("…")).toBe(true);
+    expect(left).not.toContain("Anytown");
+    // The cell terminates with the ellipsis from whole-cell truncation.
+    expect(left.endsWith("…")).toBe(true);
   });
 });
 
@@ -852,48 +762,15 @@ describe("home view snapshot: 3 favorites, highlight idx 1", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Alerts row (decoded prose form: `ALERTS · RD · OR        N alerts`)
+// Alerts row canonical ordering
+//
+// (The dead single-column `renderAlertsRow` was removed in the
+// pixel-accurate refactor; the two-column `renderAlertsLeft` /
+// `renderAlertsValue` split below is the live path. The canonical
+// line-order export it relied on is still exercised here.)
 // ---------------------------------------------------------------------------
 
-describe("renderAlertsRow", () => {
-  it("renders 'ALERTS · <line>' on the left with the count on the right", () => {
-    const out = renderAlertsRow(new Set<LineCode>(["RD"]), 1, false);
-    expect(out.startsWith("  ALERTS · RED")).toBe(true);
-    expect(out.endsWith("1 alert")).toBe(true);
-    expect(out.length).toBe(LINE_WIDTH);
-  });
-
-  it("joins multiple affected lines with ' · ' in canonical order", () => {
-    const out = renderAlertsRow(new Set<LineCode>(["OR", "RD"]), 2, false);
-    // STATUS_ROW_LINE_ORDER puts RD before OR — preserve that.
-    expect(out).toContain("ALERTS · RED · ORANGE");
-    expect(out.endsWith("2 alerts")).toBe(true);
-  });
-
-  it("pluralises the count correctly (1 alert vs N alerts)", () => {
-    expect(renderAlertsRow(new Set<LineCode>(["RD"]), 1, false)).toContain(
-      "1 alert",
-    );
-    expect(renderAlertsRow(new Set<LineCode>(["RD"]), 3, false)).toContain(
-      "3 alerts",
-    );
-  });
-
-  it("uses the highlight prefix when selected", () => {
-    const out = renderAlertsRow(new Set<LineCode>(["RD"]), 1, true);
-    expect(out.startsWith("> ")).toBe(true);
-    expect(out.length).toBe(LINE_WIDTH);
-  });
-
-  it("collapses to just 'ALERTS' (no separator) when the affected set is empty", () => {
-    // Defensive — production code only renders the row when at least
-    // one line is affected, but the pure renderer should still
-    // produce a non-overflowing string for the empty case.
-    const out = renderAlertsRow(new Set<LineCode>(), 0, false);
-    expect(out.startsWith("  ALERTS")).toBe(true);
-    expect(out).not.toContain(" · ");
-  });
-
+describe("STATUS_ROW_LINE_ORDER", () => {
   it("exposes the canonical line order for callers", () => {
     expect(STATUS_ROW_LINE_ORDER).toEqual(["RD", "BL", "YL", "OR", "GR", "SV"]);
   });
@@ -1009,26 +886,11 @@ describe("home reduce: status row navigation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// ACCESS row (elevator/escalator outages at favorite stations)
-// ---------------------------------------------------------------------------
-
-describe("renderAccessRow", () => {
-  it("fits exactly LINE_WIDTH cols with the right-aligned outage count", () => {
-    const out = renderAccessRow(2, false);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("  " + ACCESS_LABEL_PREFIX)).toBe(true);
-    expect(out.endsWith("2 outages")).toBe(true);
-  });
-
-  it("renders the highlight prefix when selected", () => {
-    const out = renderAccessRow(1, true);
-    expect(out.startsWith("> ")).toBe(true);
-    expect(out.length).toBe(LINE_WIDTH);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Two-column synthetic-row helpers (alerts / access split)
+//
+// (The dead single-column `renderAccessRow` was removed in the
+// pixel-accurate refactor; the two-column `renderAccessLeft` /
+// `renderAccessValue` split below is the live path.)
 // ---------------------------------------------------------------------------
 
 describe("renderAlertsLeft / renderAlertsValue", () => {
@@ -1053,12 +915,12 @@ describe("renderAlertsLeft / renderAlertsValue", () => {
     );
   });
 
-  it("stays within LEFT_COL_MAX", () => {
+  it("stays within LEFT_COL_MAX_PX", () => {
     const left = renderAlertsLeft(
       new Set<LineCode>(["RD", "BL", "YL", "OR", "GR", "SV"]),
       true,
     );
-    expect(left.length).toBeLessThanOrEqual(LEFT_COL_MAX);
+    expect(textWidth(left)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
   });
 });
 

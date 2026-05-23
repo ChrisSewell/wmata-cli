@@ -34,7 +34,8 @@
 // effect is `markTutorialSeen()` inside `onUnmount`.
 
 import { markTutorialSeen } from "../storage/settings";
-import { LINE_WIDTH, truncate } from "../ui/render";
+import { truncate } from "../ui/render";
+import { HEADER_CONTENT_WIDTH_PX, SECTION_INNER_WIDTH_PX } from "../ui/geometry";
 // `formatClock` now lives in the shared field-formatter module and is
 // rendered by the host into its own top-right clock container. Re-export
 // it here so existing imports (`import { formatClock } from "./tutorial"`)
@@ -86,7 +87,7 @@ export const TUTORIAL_BODY_LINES: readonly string[] = [
  * clock cell (which starts at x≈486px ≈ column 50).
  */
 export function renderHeader(): string {
-  return truncate(TUTORIAL_TITLE, 50);
+  return truncate(TUTORIAL_TITLE, HEADER_CONTENT_WIDTH_PX);
 }
 
 /**
@@ -101,11 +102,10 @@ export function makeTutorialScreen(): Screen<TutorialSnapshot> {
     view(_snapshot, _nav, _ctx: ViewContext): ScreenSections {
       return {
         header: [renderHeader()],
-        // Defensive truncate — `TUTORIAL_BODY_LINES` are constants
-        // under LINE_WIDTH, but a future copy-edit could slip an
-        // oversize line in. Truncate-at-render keeps the contract
-        // honest.
-        body: TUTORIAL_BODY_LINES.map((l) => truncate(l, LINE_WIDTH)),
+        // Defensive truncate — `TUTORIAL_BODY_LINES` are short constants,
+        // but a future copy-edit could slip an oversize line in.
+        // Truncate-at-render keeps the contract honest.
+        body: TUTORIAL_BODY_LINES.map((l) => truncate(l, SECTION_INNER_WIDTH_PX)),
       };
     },
 

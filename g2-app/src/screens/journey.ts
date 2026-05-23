@@ -35,7 +35,8 @@
 
 import type { JourneyPlan } from "../storage/settings";
 import type { PathStep } from "../wmata";
-import { SAFE_TEXT_WIDTH, truncate } from "../ui/render";
+import { truncate } from "../ui/render";
+import { HEADER_CONTENT_WIDTH_PX, SECTION_INNER_WIDTH_PX } from "../ui/geometry";
 import { lineName } from "../ui/format";
 // `formatClock` now lives in the shared field-formatter module and is
 // rendered by the host into its own top-right clock container. Re-export
@@ -142,7 +143,10 @@ export function renderHeader(snapshot: JourneySnapshot): string {
   ) {
     return "Journey";
   }
-  return truncate(`${snapshot.originName} → ${snapshot.destinationName}`, 50);
+  return truncate(
+    `${snapshot.originName} → ${snapshot.destinationName}`,
+    HEADER_CONTENT_WIDTH_PX,
+  );
 }
 
 /**
@@ -193,7 +197,7 @@ export function stopsAcrossLegs(
  * `LineCode`, spelled out via `lineName` for consistency with the
  * rest of the app (Home / Predictions / Incidents). Dedups
  * consecutive identical codes (a same-line transfer collapses to one
- * name). The wider grid + per-line SAFE_TEXT_WIDTH truncation in the
+ * name). The wider grid + per-line SECTION_INNER_WIDTH_PX truncation in the
  * caller keep even "ORANGE→YELLOW · N stops" inside the panel.
  */
 export function formatLineSummary(
@@ -229,22 +233,22 @@ export function makeJourneyScreen(
         snapshot.plan.origin.length === 0 ||
         snapshot.plan.destination.length === 0
       ) {
-        body.push(truncate("No journey saved. Open the phone app", SAFE_TEXT_WIDTH));
-        body.push(truncate("to set an origin + destination.", SAFE_TEXT_WIDTH));
+        body.push(truncate("No journey saved. Open the phone app", SECTION_INNER_WIDTH_PX));
+        body.push(truncate("to set an origin + destination.", SECTION_INNER_WIDTH_PX));
         body.push("");
-        body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+        body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
         return { header, body };
       }
 
       // Unresolved (first tick still pending or fetcher failed).
       if (snapshot.legs === null) {
         if (snapshot.fetchError !== null && snapshot.fetchedAt === 0) {
-          body.push(truncate("Couldn't reach WMATA. Will retry shortly.", SAFE_TEXT_WIDTH));
+          body.push(truncate("Couldn't reach WMATA. Will retry shortly.", SECTION_INNER_WIDTH_PX));
         } else {
-          body.push(truncate("Loading path…", SAFE_TEXT_WIDTH));
+          body.push(truncate("Loading path…", SECTION_INNER_WIDTH_PX));
         }
         body.push("");
-        body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+        body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
         return { header, body };
       }
 
@@ -252,10 +256,10 @@ export function makeJourneyScreen(
       // transfer configured (legs === []), or one of the two legs
       // returned empty (a malformed transfer code).
       if (snapshot.legs.length === 0) {
-        body.push(truncate("Not a routable journey. Add a transfer", SAFE_TEXT_WIDTH));
-        body.push(truncate("station from the phone app.", SAFE_TEXT_WIDTH));
+        body.push(truncate("Not a routable journey. Add a transfer", SECTION_INNER_WIDTH_PX));
+        body.push(truncate("station from the phone app.", SECTION_INNER_WIDTH_PX));
         body.push("");
-        body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+        body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
         return { header, body };
       }
 
@@ -263,19 +267,19 @@ export function makeJourneyScreen(
       // count, using full line names: "ORANGE→YELLOW · 11 stops".
       const lineSummary = formatLineSummary(snapshot.legs);
       const stops = stopsAcrossLegs(snapshot.legs);
-      body.push(truncate(`${lineSummary} · ${stops} stops`, SAFE_TEXT_WIDTH));
+      body.push(truncate(`${lineSummary} · ${stops} stops`, SECTION_INNER_WIDTH_PX));
 
       // Optional "via" row for transfer journeys (full transfer name).
       if (snapshot.legs.length > 1 && snapshot.transferName.length > 0) {
-        body.push(truncate(`via ${snapshot.transferName}`, SAFE_TEXT_WIDTH));
+        body.push(truncate(`via ${snapshot.transferName}`, SECTION_INNER_WIDTH_PX));
       }
 
       const minutes = estimateTravelMinutesForLegs(snapshot.legs);
-      body.push(truncate(`Est. travel: ~${minutes} min`, SAFE_TEXT_WIDTH));
+      body.push(truncate(`Est. travel: ~${minutes} min`, SECTION_INNER_WIDTH_PX));
 
       // Live next-train at origin. The line code is spelled out
       // (lineName) and the destination is rendered in full — it comes
-      // from live data, so only the SAFE_TEXT_WIDTH cap clips it.
+      // from live data, so only the SECTION_INNER_WIDTH_PX cap clips it.
       if (snapshot.nextTrain !== null) {
         const { line, min, destination } = snapshot.nextTrain;
         const minLabel =
@@ -285,13 +289,13 @@ export function makeJourneyScreen(
         body.push(
           truncate(
             `Next: ${lineName(line)} ${destination} ${minLabel}`,
-            SAFE_TEXT_WIDTH,
+            SECTION_INNER_WIDTH_PX,
           ),
         );
       }
 
       body.push("");
-      body.push(truncate("(double-tap to return)", SAFE_TEXT_WIDTH));
+      body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
       return { header, body };
     },
     reduce(_snapshot, nav, event: ScreenEvent): ReduceResult<JourneySnapshot> {

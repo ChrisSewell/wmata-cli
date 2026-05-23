@@ -1,7 +1,11 @@
 // Unit tests for the Journey / Commute screen.
 
 import { describe, expect, it } from "vitest";
-import { LINE_WIDTH } from "../ui/render";
+import { textWidth } from "../ui/render";
+import {
+  HEADER_CONTENT_WIDTH_PX,
+  SECTION_INNER_WIDTH_PX,
+} from "../ui/geometry";
 import type { PathStep } from "../wmata";
 import {
   flattenSections, initialNav, type ViewContext } from "./router";
@@ -131,15 +135,16 @@ describe("formatClock + renderHeader", () => {
     expect(out).toBe("Journey");
     // The clock is host-rendered now; it's not in the header string.
     expect(out).not.toContain(" 2:32p");
-    // Within the 50-col title budget so it can't collide with the clock.
-    expect(out.length).toBeLessThanOrEqual(50);
+    // Within the header title pixel budget so it can't collide with the
+    // host's top-right clock container.
+    expect(textWidth(out)).toBeLessThanOrEqual(HEADER_CONTENT_WIDTH_PX);
   });
 
   it("renderHeader includes the orig→dest pair when configured (no clock)", () => {
     const out = renderHeader(snap({}));
     expect(out).toContain("→");
     expect(out).not.toContain(" 2:32p");
-    expect(out.length).toBeLessThanOrEqual(50);
+    expect(textWidth(out)).toBeLessThanOrEqual(HEADER_CONTENT_WIDTH_PX);
   });
 });
 
@@ -155,7 +160,7 @@ describe("view: empty plan", () => {
     );
     const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     for (const line of lines) {
-      expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+      expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
     }
     expect(lines.some((l) => l.includes("No journey saved."))).toBe(true);
     expect(lines.some((l) => l.includes("Open the phone app"))).toBe(true);
@@ -189,7 +194,7 @@ describe("view: happy path (same line)", () => {
     );
     const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     for (const line of lines) {
-      expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+      expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
     }
     expect(lines.some((l) => l.includes("RED · 3 stops"))).toBe(true);
     expect(lines.some((l) => l.includes("6 min"))).toBe(true);
@@ -218,7 +223,7 @@ describe("view: cross-line (two legs)", () => {
     );
     const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     for (const line of lines) {
-      expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+      expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
     }
     expect(lines.some((l) => l.includes("ORANGE→YELLOW"))).toBe(true);
     expect(lines.some((l) => l.includes("via Lenfant Plaza"))).toBe(true);

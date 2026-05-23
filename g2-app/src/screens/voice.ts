@@ -53,7 +53,8 @@
 
 import type { Station } from "../wmata";
 import type { VoiceTargets } from "../storage/settings";
-import { LINE_WIDTH, SAFE_TEXT_WIDTH, truncate } from "../ui/render";
+import { textWidth, truncate } from "../ui/render";
+import { HEADER_CONTENT_WIDTH_PX, SECTION_INNER_WIDTH_PX } from "../ui/geometry";
 import { lineName } from "../ui/format";
 // `formatClock` now lives in the shared field-formatter module and is
 // rendered by the host into its own top-right clock container. Re-export
@@ -309,9 +310,9 @@ export const MAX_MATCHES = 3;
  * Window of the live transcript we render in `listening` phase.
  *
  * We show the *tail* of the transcript so the user always sees the
- * most recent words they spoke. 22 chars leaves room for the
- * single-char highlight prefix ("> ") that introduces the transcript
- * line — prefix(2) + window(22) = LINE_WIDTH(24).
+ * most recent words they spoke. A fixed character window keeps the
+ * live-input line short and stable; the body-width truncate is a
+ * generous backstop.
  */
 export const TRANSCRIPT_WINDOW = 22;
 
@@ -332,7 +333,7 @@ export const MIN_QUERY_LENGTH = 2;
  * clock cell (which starts at x≈486px ≈ column 50).
  */
 export function renderHeader(): string {
-  return truncate("VOICE", 50);
+  return truncate("VOICE", HEADER_CONTENT_WIDTH_PX);
 }
 
 /**
@@ -364,12 +365,12 @@ export function formatTranscriptWindow(transcript: string): string {
  * Incidents — Voice no longer uses the abbreviated `lineGlyph` codes.
  * The 2-char cursor marker (`> ` / `  `) leads the row; the name and
  * the `·`-separated line names follow, left-aligned. The whole row is
- * truncated to `SAFE_TEXT_WIDTH` real columns so it never hard-wraps
- * at the panel border (container padding supplies the frame inset, so
- * no manual leading space is added here).
+ * truncated to the body's inner pixel width so it never hard-wraps at
+ * the panel border (container padding supplies the frame inset, so no
+ * manual leading space is added here).
  *
- * Width contract: returns a string of ≤ `LINE_WIDTH` columns (and
- * ≤ prefix + `SAFE_TEXT_WIDTH` of real text).
+ * Width contract: the cursor marker plus the truncated content fit the
+ * body's inner pixel width.
  */
 export function renderMatchRow(
   station: Station,
@@ -386,10 +387,12 @@ export function renderMatchRow(
     if (code && lineName(code) !== "--") lineNames.push(lineName(code));
   }
   const linesPart = lineNames.length > 0 ? ` · ${lineNames.join(" ")}` : "";
-  // Truncate the visible content (name + line names) to SAFE_TEXT_WIDTH
-  // so the rendered row can't overflow the 576px border; the cursor
-  // marker sits outside that text budget.
-  const content = truncate(station.Name + linesPart, SAFE_TEXT_WIDTH);
+  // Truncate the visible content (name + line names) to the body inner
+  // width minus the cursor marker so the rendered row can't overflow.
+  const content = truncate(
+    station.Name + linesPart,
+    SECTION_INNER_WIDTH_PX - textWidth(prefix),
+  );
   return prefix + content;
 }
 
@@ -487,55 +490,55 @@ export function makeVoiceScreen(
 
       switch (snapshot.phase) {
         case "listening": {
-          body.push(truncate("Listening...", LINE_WIDTH));
+          body.push(truncate("Listening...", SECTION_INNER_WIDTH_PX));
           body.push("");
           const window = formatTranscriptWindow(snapshot.transcript);
           // Always render the transcript line, even when empty, so the
           // total line count is stable while the user is speaking and
           // the bridge dedupe doesn't oscillate the row height. The
           // `> ` prefix marks the live-input row visually.
-          body.push(truncate("> " + window, LINE_WIDTH));
+          body.push(truncate("> " + window, SECTION_INNER_WIDTH_PX));
           body.push("");
-          body.push(truncate("(double-tap to cancel)", LINE_WIDTH));
+          body.push(truncate("(double-tap to cancel)", SECTION_INNER_WIDTH_PX));
           return { header, body };
         }
         case "resolving": {
-          body.push(truncate("Resolving...", LINE_WIDTH));
+          body.push(truncate("Resolving...", SECTION_INNER_WIDTH_PX));
           body.push("");
           const q = formatTranscriptWindow(snapshot.lastQuery);
-          body.push(truncate("> " + q, LINE_WIDTH));
+          body.push(truncate("> " + q, SECTION_INNER_WIDTH_PX));
           return { header, body };
         }
         case "matches": {
-          body.push(truncate("Did you mean:", LINE_WIDTH));
+          body.push(truncate("Did you mean:", SECTION_INNER_WIDTH_PX));
           body.push("");
           for (let i = 0; i < snapshot.matches.length; i++) {
             const station = snapshot.matches[i]!;
             body.push(renderMatchRow(station, i === snapshot.matchIndex));
           }
           body.push("");
-          body.push(truncate("(scroll=pick, tap=ok)", LINE_WIDTH));
+          body.push(truncate("(scroll=pick, tap=ok)", SECTION_INNER_WIDTH_PX));
           return { header, body };
         }
         case "noMatch": {
-          body.push(truncate("No match.", LINE_WIDTH));
+          body.push(truncate("No match.", SECTION_INNER_WIDTH_PX));
           body.push("");
           // Quote the query verbatim so the user can tell whether the
           // STT misheard them or the station name is genuinely off.
           const q = formatTranscriptWindow(snapshot.lastQuery);
-          body.push(truncate('"' + q + '"', LINE_WIDTH));
+          body.push(truncate('"' + q + '"', SECTION_INNER_WIDTH_PX));
           body.push("");
-          body.push(truncate("(tap to retry)", LINE_WIDTH));
+          body.push(truncate("(tap to retry)", SECTION_INNER_WIDTH_PX));
           return { header, body };
         }
         case "error": {
-          body.push(truncate("Error.", LINE_WIDTH));
+          body.push(truncate("Error.", SECTION_INNER_WIDTH_PX));
           body.push("");
           body.push(
-            truncate(snapshot.errorMessage ?? "Unknown error", LINE_WIDTH),
+            truncate(snapshot.errorMessage ?? "Unknown error", SECTION_INNER_WIDTH_PX),
           );
           body.push("");
-          body.push(truncate("(double-tap to exit)", LINE_WIDTH));
+          body.push(truncate("(double-tap to exit)", SECTION_INNER_WIDTH_PX));
           return { header, body };
         }
       }

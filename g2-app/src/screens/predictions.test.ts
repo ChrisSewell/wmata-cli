@@ -1,7 +1,7 @@
 // Unit tests for the Predictions screen.
 //
 // Acceptance contract:
-//   - Every rendered line is ≤ LINE_WIDTH columns across every fixture
+//   - Every rendered line fits the section inner pixel width across every fixture
 //     (header, body, footer, empty state).
 //   - Header renders short and long station names correctly, and shows
 //     a stale marker (`*`) when the snapshot is older than STALE_THRESHOLD_MS
@@ -18,10 +18,13 @@
 //     freeze the on-glasses clock.
 
 import { describe, expect, it, vi } from "vitest";
-import { padRight, LINE_WIDTH } from "../ui/render";
+import { textWidth } from "../ui/render";
+import {
+  HEADER_CONTENT_WIDTH_PX,
+  SECTION_INNER_WIDTH_PX,
+} from "../ui/geometry";
 import type { Train } from "../wmata";
 import {
-  FLAT_LEFT_COLS,
   flattenSections,
   initialNav,
   type ViewContext,
@@ -66,9 +69,23 @@ import type { NavIntent, Router } from "./router";
 
 function expectFits(lines: string[]): void {
   for (const line of lines) {
-    expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   }
 }
+
+/**
+ * Pixel bound for the LEFT body column (line glyph cell + destination).
+ * The host overlays the value column flush-right starting near x≈466, so
+ * every left cell must measure under that to never run beneath it.
+ */
+const LEFT_COL_MAX_PX = 466;
+
+/**
+ * Pixel bound for the RIGHT value overlay ("<cars> <eta>"). It's a short,
+ * right-aligned cell; this generous bound guards against the value column
+ * silently widening (the widest current value measures ≈ 89px).
+ */
+const VALUE_COL_MAX_PX = 100;
 
 /** Construct a Train fixture with sensible defaults. */
 function train(over: Partial<Train>): Train {
@@ -187,24 +204,26 @@ describe("renderHeader", () => {
     expect(out).toBe("Metro Center");
   });
 
-  it("keeps a long station name within the 50-col title budget", () => {
-    // At a 50-col budget this 48-char name fits verbatim (the hand-tuned
-    // abbreviation only kicks in once the canonical name overflows the
-    // budget); either way the title must never exceed 50 cols so it can't
-    // collide with the host's top-right clock container.
+  it("keeps a long station name within the header title pixel budget", () => {
+    // This 48-char name measures under the header content budget, so it
+    // fits verbatim (the hand-tuned abbreviation only kicks in once the
+    // canonical name overflows the budget); either way the title must
+    // never exceed the budget so it can't collide with the host's
+    // top-right clock container.
     const out = renderHeader(
       snap({ stationName: "U Street/African-Amer Civil War Memorial/Cardozo" }),
     );
-    expect(out.length).toBeLessThanOrEqual(50);
+    expect(textWidth(out)).toBeLessThanOrEqual(HEADER_CONTENT_WIDTH_PX);
     expect(out.startsWith("U Street")).toBe(true);
   });
 
-  it("abbreviates an over-budget station name down to ≤ 50 cols", () => {
+  it("abbreviates an over-budget station name down to the header budget", () => {
     // A synthetic 60-char name forces the truncation path: the result is
-    // clamped to 50 cols with the canonical ellipsis.
+    // clamped to the header content pixel budget with the canonical
+    // ellipsis.
     const longName = "Very Long Station Name That Exceeds The Fifty Column Budget!!";
     const out = renderHeader(snap({ stationName: longName }));
-    expect(out.length).toBeLessThanOrEqual(50);
+    expect(textWidth(out)).toBeLessThanOrEqual(HEADER_CONTENT_WIDTH_PX);
     expect(out.endsWith("…")).toBe(true);
   });
 
@@ -281,24 +300,28 @@ describe("predictions view: clockMarker staleness escalation", () => {
 describe("renderTrainRow", () => {
   // `renderTrainRow` now returns the two pixel-aligned columns of a body
   // row: `left` (inset + line glyph cell + Title-Case destination,
-  // left-aligned, NOT padded) and `right` (the cars+ETA value, ≤ ~10
-  // chars). The host overlays `right` at a fixed pixel x, so the
-  // destination's variable glyph width no longer floats the ETA.
+  // left-aligned) and `right` (the cars+ETA value). The cells are
+  // space-padded to PIXEL widths (space granularity), so we assert their
+  // content + pixel fit rather than an exact monospace string.
   it("splits a typical row into a left dest cell and a right cars+ETA value", () => {
     const out = renderTrainRow(
       train({ Line: "RD", Destination: "Shady Grove", Car: "6", Min: "5" }),
     );
-    // Left: inset + "RED   " glyph cell + the (un-padded) destination.
-    expect(out.left).toBe("  RED    Shady Grove");
-    // Right: "6c" + " " + right-aligned "5 min" → "6c  5 min" (9 chars).
-    expect(out.right).toBe("6c  5 min");
-    expect(out.right.length).toBeLessThanOrEqual(10);
+    // Left: 2-space inset + the line-name glyph cell + the destination.
+    expect(out.left.startsWith("  RED")).toBe(true);
+    expect(out.left).toContain("Shady Grove");
+    expect(textWidth(out.left)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
+    // Right: the cars cell + the right-aligned ETA value.
+    expect(out.right).toContain("6c");
+    expect(out.right).toContain("5 min");
+    expect(textWidth(out.right)).toBeLessThanOrEqual(VALUE_COL_MAX_PX);
   });
 
   it("renders the ARR sentinel distinguishably in the right value", () => {
     const out = renderTrainRow(train({ Min: "ARR" }));
     expect(out.right).toContain("ARR");
-    expect(out.right).toBe("6c    ARR");
+    expect(out.right).toContain("6c");
+    expect(textWidth(out.right)).toBeLessThanOrEqual(VALUE_COL_MAX_PX);
   });
 
   it("renders the BRD sentinel distinguishably in the right value", () => {
@@ -322,7 +345,7 @@ describe("renderTrainRow", () => {
     );
     expect(out.right).toContain("8c");
     expect(out.right).toContain("12 min");
-    expect(out.right.length).toBeLessThanOrEqual(10);
+    expect(textWidth(out.right)).toBeLessThanOrEqual(VALUE_COL_MAX_PX);
   });
 
   it("collapses an unknown line code to the '--' glyph in the left cell", () => {
@@ -340,9 +363,9 @@ describe("renderTrainRow", () => {
     expect(out.right.startsWith("  ")).toBe(true);
   });
 
-  it("keeps the left cell within the ~50-char body container budget", () => {
+  it("keeps the left cell within the body container pixel budget", () => {
     // Even the longest destination must leave the left column short of
-    // the value overlay at x≈466 (~50 monospace chars).
+    // the value overlay (≈ x 466) so it never renders beneath it.
     const out = renderTrainRow(
       train({
         Line: "GR",
@@ -351,7 +374,7 @@ describe("renderTrainRow", () => {
         Min: "12",
       }),
     );
-    expect(out.left.length).toBeLessThanOrEqual(50);
+    expect(textWidth(out.left)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
   });
 });
 
@@ -576,7 +599,7 @@ describe("predictions view: 8+ trains caps at MAX_VISIBLE_TRAINS", () => {
 // ---------------------------------------------------------------------------
 
 describe("predictions view: adversarial fixtures", () => {
-  it("keeps every row ≤ LINE_WIDTH with the longest destinations and 99 min ETAs", () => {
+  it("keeps every row within the section inner width with the longest destinations and 99 min ETAs", () => {
     const trains: Train[] = [
       train({
         Line: "BL",
@@ -618,26 +641,26 @@ describe("predictions view: adversarial fixtures", () => {
     );
     const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    // The left destination cell is bounded by DEST_WIDTH=41 — wide
-    // enough that EVERY destination in the fixture renders in full:
-    // "Ronald Reagan Washington National Airport" (41) and "Mt Vernon Sq
-    // 7th St-Convention Center" (37) both fit without a hand-tuned
-    // abbreviation. The test's surviving job is to verify the rows still
-    // fit within LINE_WIDTH (handled by `expectFits`) and that the
-    // rendered text contains the original tokens somewhere on the screen.
+    // The left destination cell is bounded by a PIXEL budget. Most
+    // fixture destinations still render in full, but the very longest —
+    // "Ronald Reagan Washington National Airport" — exceeds the budget and
+    // correctly falls back to its hand-tuned abbreviation ("DCA"). The
+    // test's job is to verify the rows fit the section inner width
+    // (`expectFits`) and that each destination is present (in full or as
+    // its abbreviation).
     const allBody = lines.slice(1).join(" ");
     expect(allBody).toContain("Largo Town Center");
-    expect(allBody).toContain("National Airport");
+    expect(allBody).toContain("DCA"); // airport abbreviates under the pixel budget
     expect(allBody).toContain("Vienna/Fairfax-GMU");
     expect(allBody).toContain("Wiehle-Reston East");
   });
 
-  it("keeps every LEFT body cell ≤ 50 chars and every RIGHT value ≤ 10", () => {
+  it("keeps every LEFT body cell and RIGHT value within their pixel budgets", () => {
     // The two-column contract: LEFT lives in the full-width body
-    // container (the value overlay starts at x≈466 ≈ col 50) and RIGHT
-    // is the ~110px (~11-char) value overlay. Pin both bounds against an
-    // adversarial render (longest destinations, a pinned summary, a
-    // late-night last-train row) so neither column can silently overflow.
+    // container (the value overlay starts at x≈466) and RIGHT is the
+    // narrow value overlay. Pin both pixel bounds against an adversarial
+    // render (longest destinations, a pinned summary, a late-night
+    // last-train row) so neither column can silently overflow.
     const EVENING_CTX: ViewContext = {
       nowMs: new Date(2026, 4, 18, 22, 30, 0).getTime(),
     };
@@ -661,8 +684,10 @@ describe("predictions view: adversarial fixtures", () => {
     const cols = screen.view(screen.init(), { highlightedIndex: 0 }, EVENING_CTX)
       .bodyColumns!;
     expect(cols.left.length).toBe(cols.right.length); // lockstep rows
-    for (const l of cols.left) expect(l.length).toBeLessThanOrEqual(50);
-    for (const r of cols.right) expect(r.length).toBeLessThanOrEqual(10);
+    for (const l of cols.left)
+      expect(textWidth(l)).toBeLessThanOrEqual(LEFT_COL_MAX_PX);
+    for (const r of cols.right)
+      expect(textWidth(r)).toBeLessThanOrEqual(VALUE_COL_MAX_PX);
   });
 });
 
@@ -682,7 +707,8 @@ describe("renderFooter", () => {
     );
     expect(out[0]!.startsWith("  ")).toBe(true);
     expect(out[0]!).toContain("Single-tracking");
-    for (const line of out) expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    for (const line of out)
+      expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   });
 
   it("strips a dangling trailing comma from the final wrapped line", () => {
@@ -728,7 +754,8 @@ describe("renderFooter", () => {
       snap({ fetchError: "Network down", fetchedAt: 0 }),
     );
     expect(out[0]!.startsWith("? ")).toBe(true);
-    for (const line of out) expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    for (const line of out)
+      expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   });
 });
 
@@ -1042,7 +1069,7 @@ describe("renderLastTrainRow", () => {
       EVENING,
     );
     expect(out).toBe("Last RED 11:47p");
-    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(out!)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   });
 
   it("renders two-line form ascending by time (earliest-out first)", () => {
@@ -1058,7 +1085,7 @@ describe("renderLastTrainRow", () => {
       EVENING,
     );
     expect(out).toBe("Last ORANGE 10:50p  RED 11:47p");
-    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(out!)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   });
 
   it("drops cell #2 for 3+ lines and surfaces overflow count", () => {
@@ -1075,7 +1102,7 @@ describe("renderLastTrainRow", () => {
       }),
       EVENING,
     );
-    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(out!)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
     expect(out).toBe("Last BLUE 10:30p +3");
   });
 });
@@ -1303,7 +1330,7 @@ describe("predictions: clock decoupled from fetch (hung-fetch regression)", () =
 // ---------------------------------------------------------------------------
 
 describe("predictions view snapshot: 3 trains at Metro Center", () => {
-  it("matches the exact line array", () => {
+  it("pins the canonical two-column render (content + structure)", () => {
     const trains: Train[] = [
       train({ Line: "RD", Destination: "Shady Grove", Car: "6", Min: "ARR" }),
       train({ Line: "RD", Destination: "Glenmont", Car: "8", Min: "3" }),
@@ -1313,32 +1340,41 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
       noopFetcher,
       snap({ stationName: "Metro Center", trains }),
     );
-    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
-
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
     expectFits(lines);
-    // Exact-pin against the canonical render. The body is now TWO
-    // columns; `flattenSections` reconstructs a flat row as
-    //   padRight(left, FLAT_LEFT_COLS) + right
-    // (the device positions the two real containers by pixel). The LEFT
-    // cell is `inset(2) + glyph(6) + " " + destination` (left-aligned,
-    // un-padded); the RIGHT value is `cars + " " + right-aligned ETA`.
-    //
-    // The first train carries the `>` cursor in place of its last glyph
-    // char (v1.2 pin-a-train default cursor — TAP affordance).
-    // RD → "RED" → padRight("RED",6).slice(0,5)+">" = "RED  >"
+
+    // Header is the bare station title; the host renders the clock in its
+    // own container.
+    expect(sections.header).toEqual(["Metro Center"]);
+    // The body is TWO columns: each LEFT cell is `inset + line-name glyph
+    // cell + destination`; each RIGHT value is `cars + right-aligned ETA`.
+    // Columns are space-padded to PIXEL widths, so we pin content +
+    // structure rather than the exact monospace spacing.
+    const cols = sections.bodyColumns!;
+    expect(cols.left.length).toBe(3);
+    expect(cols.right.length).toBe(3);
+    // Row 0: RED / Shady Grove, with the default cursor `>` riding the
+    // line cell (v1.2 pin-a-train affordance), value "6c …ARR".
+    expect(cols.left[0]!.startsWith("  RED")).toBe(true);
+    expect(cols.left[0]).toContain(">");
+    expect(cols.left[0]).toContain("Shady Grove");
+    expect(cols.right[0]).toContain("6c");
+    expect(cols.right[0]).toContain("ARR");
+    // Row 1: RED / Glenmont, value "8c …3 min". No cursor (not selected).
+    expect(cols.left[1]!.startsWith("  RED")).toBe(true);
+    expect(cols.left[1]).toContain("Glenmont");
+    expect(cols.left[1]).not.toContain(">");
+    expect(cols.right[1]).toContain("8c");
+    expect(cols.right[1]).toContain("3 min");
+    // Row 2: ORANGE / Vienna/Fairfax-GMU, value "6c …5 min".
+    expect(cols.left[2]!.startsWith("  ORANGE")).toBe(true);
+    expect(cols.left[2]).toContain("Vienna/Fairfax-GMU");
+    expect(cols.right[2]).toContain("6c");
+    expect(cols.right[2]).toContain("5 min");
     // The footer is never empty: with no incident it carries the quiet
     // served-lines summary (distinct full line names in ETA order).
-    expect(lines).toEqual([
-      "Metro Center",
-      padRight("  RED  > Shady Grove", FLAT_LEFT_COLS) + "6c    ARR",
-      padRight("  RED    Glenmont", FLAT_LEFT_COLS) + "8c  3 min",
-      padRight("  ORANGE Vienna/Fairfax-GMU", FLAT_LEFT_COLS) + "6c  5 min",
-      "  Serving RED, ORANGE",
-    ]);
-    // Each zipped body row = FLAT_LEFT_COLS (left) + the right value.
-    expect(lines[1]!.length).toBe(FLAT_LEFT_COLS + "6c    ARR".length);
-    expect(lines[2]!.length).toBe(FLAT_LEFT_COLS + "8c  3 min".length);
-    expect(lines[3]!.length).toBe(FLAT_LEFT_COLS + "6c  5 min".length);
+    expect(sections.footer).toEqual(["  Serving RED, ORANGE"]);
   });
 });
 
@@ -1348,7 +1384,7 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
 // ---------------------------------------------------------------------------
 
 describe("predictions view snapshot: 3 trains + incident footer", () => {
-  it("matches the exact line array including the wrapped footer block", () => {
+  it("renders the body rows + the incident footer block", () => {
     const trains: Train[] = [
       train({ Line: "RD", Destination: "Shady Grove", Car: "6", Min: "ARR" }),
       train({ Line: "RD", Destination: "Glenmont", Car: "8", Min: "3" }),
@@ -1359,25 +1395,29 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
       snap({
         stationName: "Metro Center",
         trains,
-        // 42-char headline fits on one line at width=54 (LINE_WIDTH-2
-        // for the "! " prefix). No wrap needed at the new column
-        // budget.
+        // 41-char headline fits on one footer line at the section inner
+        // width — no wrap needed.
         incidentHeadline: "Single-tracking on RD between Foggy Bottom",
       }),
     );
-    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
     expectFits(lines);
-    // Two-column body rows zip to padRight(left, FLAT_LEFT_COLS) + right
-    // (see the canonical 3-train snapshot above). The incident footer is
-    // the 3rd section, unchanged.
-    expect(lines).toEqual([
-      "Metro Center",
-      padRight("  RED  > Shady Grove", FLAT_LEFT_COLS) + "6c    ARR",
-      padRight("  RED    Glenmont", FLAT_LEFT_COLS) + "8c  3 min",
-      padRight("  ORANGE Vienna/Fairfax-GMU", FLAT_LEFT_COLS) + "6c  5 min",
+    // The body is the same two-column 3-train render as the no-incident
+    // snapshot above; here the test's subject is the footer section, which
+    // carries the incident headline (2-space inset) instead of the quiet
+    // served-lines summary.
+    expect(sections.header).toEqual(["Metro Center"]);
+    const cols = sections.bodyColumns!;
+    expect(cols.left.length).toBe(3);
+    expect(cols.left[0]).toContain("Shady Grove");
+    expect(cols.left[1]).toContain("Glenmont");
+    expect(cols.left[2]).toContain("Vienna/Fairfax-GMU");
+    // Footer: the incident headline on one line with the 2-space inset
+    // (no leading "! " glyph — the bordered footer is the alert signal).
+    expect(sections.footer).toEqual([
       "  Single-tracking on RD between Foggy Bottom",
     ]);
-    expect(lines[4]!.startsWith("  ")).toBe(true);
   });
 });
 
@@ -1386,25 +1426,35 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderTrainRow: cursor + pin markers", () => {
-  // The marker glyph rides the LEFT cell exactly as before — only the
-  // row's shape changed (now {left,right}).
+  // The marker glyph rides the LEFT cell's line-name slot (now
+  // pixel-padded). The line cell sits between the 2-space inset and the
+  // destination word, so we assert the cell carries the line name + the
+  // marker rather than an exact monospace string.
   it("renders the full line glyph when no marker is supplied", () => {
     const out = renderTrainRow(train({ Line: "RD" }));
-    // The left cell is prefixed with a 2-char body inset for visual
-    // nesting. RD → "RED" → padRight("RED",6) = "RED   "
-    expect(out.left.startsWith("  RED   ")).toBe(true);
+    // 2-space body inset + the line-name glyph cell, then the destination.
+    expect(out.left.startsWith("  RED")).toBe(true);
+    expect(out.left).toContain("Shady Grove");
+    // No marker present in the line cell.
+    expect(out.left).not.toContain("*");
+    expect(out.left).not.toContain(">");
   });
 
-  it("replaces the last glyph char with `*` for a pinned train", () => {
+  it("rides the line cell with `*` for a pinned train", () => {
     const out = renderTrainRow(train({ Line: "RD" }), "*");
-    // RD → "RED" → padRight("RED",6).slice(0,5)+`*` = "RED  *"
-    expect(out.left.startsWith("  RED  *")).toBe(true);
+    expect(out.left.startsWith("  RED")).toBe(true);
+    // The `*` marker sits in the line cell, BEFORE the destination.
+    const cell = out.left.slice(0, out.left.indexOf("Shady Grove"));
+    expect(cell).toContain("*");
   });
 
-  it("replaces the last glyph char with `>` for the cursor target", () => {
+  it("rides the line cell with `>` for the cursor target", () => {
     const out = renderTrainRow(train({ Line: "OR" }), ">");
-    // OR → "ORANGE" → padRight("ORANGE",6).slice(0,5)+`>` = "ORANG>"
-    expect(out.left.startsWith("  ORANG>")).toBe(true);
+    // "ORANGE" fills the cell, so it's shortened to make room for the
+    // marker at the cell's right edge.
+    expect(out.left.startsWith("  ORANG")).toBe(true);
+    const cell = out.left.slice(0, out.left.indexOf("Shady Grove"));
+    expect(cell).toContain(">");
   });
 });
 
@@ -1594,7 +1644,7 @@ describe("renderFooterQuiet", () => {
     );
   });
 
-  it("stays within SAFE-text bounds even with all six lines", () => {
+  it("stays within the section inner width even with all six lines", () => {
     const out = renderFooterQuiet([
       train({ Line: "RD" }),
       train({ Line: "OR" }),
@@ -1603,7 +1653,7 @@ describe("renderFooterQuiet", () => {
       train({ Line: "GR" }),
       train({ Line: "YL" }),
     ]);
-    expect(out.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(out)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   });
 });
 
@@ -1651,9 +1701,15 @@ describe("predictions view: pinned + live position is compact (no clip)", () => 
     expect(left.some((l) => l.includes("@"))).toBe(false);
     // Every line still fits the column budget.
     expectFits(flattenSections(sections));
-    // The pinned train's own body row still carries the `*` marker.
+    // The pinned train's own body row still carries the `*` marker in its
+    // line cell (before the destination word).
     expect(
-      left.some((l) => l.startsWith("  RED  *") && l.includes("Glenmont")),
+      left.some(
+        (l) =>
+          l.startsWith("  RED") &&
+          l.includes("Glenmont") &&
+          l.slice(0, l.indexOf("Glenmont")).includes("*"),
+      ),
     ).toBe(true);
   });
 
@@ -1699,11 +1755,15 @@ describe("predictions view: pin + cursor rendering", () => {
       { highlightedIndex: 1 },
       CTX,
     ));
-    // header at 0; trains start at index 1 with no pin row.
-    // RD + ">" marker → "RED  >" so row starts "  RED  >"
-    const cursorRow = lines.find((l) => l.startsWith("  RED  >"));
+    // header at 0; trains start at index 1 with no pin row. The cursor's
+    // target (Glenmont) carries the `>` marker in its line cell.
+    const cursorRow = lines.find(
+      (l) =>
+        l.startsWith("  RED") &&
+        l.includes("Glenmont") &&
+        l.slice(0, l.indexOf("Glenmont")).includes(">"),
+    );
     expect(cursorRow).toBeDefined();
-    expect(cursorRow).toContain("Glenmont");
   });
 
   it("marks the pinned train with `*` regardless of cursor position", () => {
@@ -1722,11 +1782,16 @@ describe("predictions view: pin + cursor rendering", () => {
     // Pin row appears under the header (line index 1).
     expect(lines[1]).toMatch(/^\* /);
     expect(lines[1]).toContain("Vienna");
-    // The OR/Vienna row in the body carries `ORANG*` marker.
-    // OR → "ORANGE" → padRight("ORANGE",6).slice(0,5)+"*" = "ORANG*"
-    expect(lines.some((l) => l.startsWith("  ORANG*") && l.includes("Vienna"))).toBe(
-      true,
-    );
+    // The OR/Vienna row in the body carries the `*` marker in its line
+    // cell ("ORANGE" fills the cell, so it's shortened for the marker).
+    expect(
+      lines.some(
+        (l) =>
+          l.startsWith("  ORANG") &&
+          l.includes("Vienna") &&
+          l.slice(0, l.indexOf("Vienna")).includes("*"),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -1898,9 +1963,8 @@ describe("predictions: opt-in cursor (WP-M)", () => {
       snap({ trains: trains3(), cursorVisible: false }),
     );
     const lines = flattenSections(screen.view(screen.init(), { highlightedIndex: 0 }, CTX));
-    // None of the train rows should carry the ">" marker glyph.
-    // RD + ">" → "RED  >" so the row starts "  RED  >"
-    expect(lines.some((l) => l.startsWith("  RED  >"))).toBe(false);
+    // No train row should carry the ">" cursor marker glyph at all.
+    expect(lines.some((l) => l.includes(">"))).toBe(false);
   });
 
   it("shows the cursor again once cursorVisible is true", () => {
@@ -1909,8 +1973,16 @@ describe("predictions: opt-in cursor (WP-M)", () => {
       snap({ trains: trains3(), cursorVisible: true }),
     );
     const lines = flattenSections(screen.view(screen.init(), { highlightedIndex: 0 }, CTX));
-    // RD + ">" → "RED  >" so the row starts "  RED  >"
-    expect(lines.some((l) => l.startsWith("  RED  >"))).toBe(true);
+    // The cursor target (Shady Grove, idx 0) carries the ">" marker in its
+    // line cell.
+    expect(
+      lines.some(
+        (l) =>
+          l.startsWith("  RED") &&
+          l.includes("Shady Grove") &&
+          l.slice(0, l.indexOf("Shady Grove")).includes(">"),
+      ),
+    ).toBe(true);
   });
 
   it("a first SCROLL flips cursorVisible to true via the reducer", () => {

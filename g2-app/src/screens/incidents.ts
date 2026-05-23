@@ -44,12 +44,15 @@
 
 import {
   ELLIPSIS,
-  LINE_WIDTH,
-  SAFE_TEXT_WIDTH,
-  USABLE_ROWS,
   scrollWindowWithMarkers,
+  textWidth,
   truncate,
 } from "../ui/render";
+import {
+  HEADER_CONTENT_WIDTH_PX,
+  SECTION_INNER_WIDTH_PX,
+  TWO_BODY_MAX_LINES,
+} from "../ui/geometry";
 import { lineGlyph, lineName } from "../ui/format";
 import { parseLinesAffected } from "../wmata/incidents-cache";
 import type { LineCode, RailIncident } from "../wmata";
@@ -78,12 +81,11 @@ export { formatClock } from "../ui/format";
 const INDENT = "  ";
 
 /**
- * Real-text width budget for the affected-lines header row. The header
- * carries the 2-col section gutter only (no inner inset), so it must fit
- * `SAFE_TEXT_WIDTH - INDENT.length` columns of real text before the
- * LVGL container hard-wraps at the 576px border.
+ * Pixel-width budget for the affected-lines glyph row. It carries the
+ * 2-space section gutter only, so it gets the body inner width minus that
+ * gutter before the LVGL container would hard-wrap.
  */
-const HEADER_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length; // 56
+const GLYPH_ROW_WIDTH_PX = SECTION_INNER_WIDTH_PX - textWidth(INDENT);
 
 /**
  * Inner inset (extra indent) applied to description rows so they read as
@@ -92,15 +94,13 @@ const HEADER_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length; // 56
 const DESC_INSET = "  ";
 
 /**
- * Real-text width budget for a wrapped description line. A description
- * line carries BOTH the 2-col section gutter (added by `flattenBlocks`)
- * AND the 2-col inner inset (added in `formatIncidentBlock`), so its
- * total indent is 4 cols. Wrapping at `SAFE_TEXT_WIDTH - 4` keeps the
- * rendered line (indent + text) at or below `SAFE_TEXT_WIDTH`, which is
- * the point where the container would otherwise re-wrap and dump orphan
- * words at column 0.
+ * Pixel-width budget for a wrapped description line. A description line
+ * carries BOTH the section gutter (added by `flattenBlocks`) AND the
+ * inner inset (added in `formatIncidentBlock`), so we wrap at the body
+ * inner width minus both — keeping indent + text within the container.
  */
-const DESC_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length - DESC_INSET.length; // 54
+const DESC_TEXT_WIDTH_PX =
+  SECTION_INNER_WIDTH_PX - textWidth(INDENT) - textWidth(DESC_INSET);
 
 /** Maximum number of wrapped description lines per incident. */
 export const MAX_DESC_LINES = 6;
@@ -165,50 +165,53 @@ export interface IncidentsSnapshot {
 // ---------------------------------------------------------------------------
 
 /**
- * Word-break-only text wrap. Port of `wmata/cli/incidents.py:13` `_wrap`.
+ * Word-break-only text wrap, measured in PIXELS. Port of
+ * `wmata/cli/incidents.py:13` `_wrap`, with the fit test swapped from
+ * character count to real glyph width.
  *
  * Strategy:
  *   - Split the input on runs of whitespace.
- *   - Greedily pack words into lines of at most `width` columns,
+ *   - Greedily pack words into lines of at most `maxPx` pixels,
  *     separated by single spaces.
- *   - If a single word is wider than `width`, hard-break it across as
+ *   - If a single word is wider than `maxPx`, hard-break it across as
  *     many lines as needed, each ending with `…` to flag the cut.
  *
  * Returns `[]` for empty input — callers can branch on `length === 0`
  * to drop the description block entirely.
  */
-export function wrap(text: string, width: number): string[] {
+export function wrap(text: string, maxPx: number): string[] {
   if (!text) return [];
-  if (width <= 0) return [];
-  // Degenerate single-column wraps are not supported: the hard-break
-  // branch would do `slice(0, 0)` -> "" and `slice(0)` -> the same
-  // string, looping forever. Callers always pass DESC_TEXT_WIDTH = 54,
-  // so a safe-return-empty here is the right semantics — throwing
-  // would be more disruptive (it'd surface as a render crash).
-  if (width <= 1) return [];
+  if (maxPx <= 0) return [];
+  const fits = (s: string): boolean => textWidth(s) <= maxPx;
+  // Degenerate: if not even a continuation ellipsis fits, bail rather
+  // than spin the hard-break loop forever.
+  if (!fits(ELLIPSIS)) return [];
   const words = text.split(/\s+/).filter((w) => w.length > 0);
   const lines: string[] = [];
   let current = "";
   for (const word of words) {
-    // Hard-break an oversize word into width-1 + "…" chunks. The
+    // Hard-break an oversize word into prefix + "…" chunks. The
     // continuation marker uses our canonical ELLIPSIS so the user can
     // tell it was a forced cut rather than a natural word boundary.
-    if (word.length > width) {
+    if (!fits(word)) {
       if (current.length > 0) {
         lines.push(current);
         current = "";
       }
       let remaining = word;
-      while (remaining.length > width) {
-        lines.push(remaining.slice(0, width - 1) + ELLIPSIS);
-        remaining = remaining.slice(width - 1);
+      while (!fits(remaining)) {
+        let k = remaining.length - 1;
+        while (k > 0 && !fits(remaining.slice(0, k) + ELLIPSIS)) k--;
+        if (k <= 0) break;
+        lines.push(remaining.slice(0, k) + ELLIPSIS);
+        remaining = remaining.slice(k);
       }
       if (remaining.length > 0) current = remaining;
       continue;
     }
     if (current.length === 0) {
       current = word;
-    } else if (current.length + 1 + word.length <= width) {
+    } else if (fits(current + " " + word)) {
       current = current + " " + word;
     } else {
       lines.push(current);
@@ -259,11 +262,10 @@ export function capDescription(lines: readonly string[]): string[] {
   // separator first so we emit "word…" rather than "word,…".
   if (!last.endsWith(ELLIPSIS)) {
     const trimmed = trimTrailingSeparators(last);
-    if (trimmed.length < DESC_TEXT_WIDTH) {
-      out[MAX_DESC_LINES - 1] = trimmed + ELLIPSIS;
-    } else {
-      out[MAX_DESC_LINES - 1] = trimmed.slice(0, DESC_TEXT_WIDTH - 1) + ELLIPSIS;
-    }
+    out[MAX_DESC_LINES - 1] =
+      textWidth(trimmed + ELLIPSIS) <= DESC_TEXT_WIDTH_PX
+        ? trimmed + ELLIPSIS
+        : truncate(trimmed, DESC_TEXT_WIDTH_PX);
   }
   return out;
 }
@@ -287,7 +289,7 @@ export function renderGlyphRow(lines: readonly LineCode[]): string {
   if (safe.length === 0) return "--";
   if (safe.length <= MAX_VERBATIM_LINES) {
     const verbatim = safe.join(" ");
-    if (verbatim.length <= HEADER_TEXT_WIDTH) return verbatim;
+    if (textWidth(verbatim) <= GLYPH_ROW_WIDTH_PX) return verbatim;
   }
   // Either we hit the verbatim cap OR the joined names overflow the
   // body cell. Collapse with `+N`, taking as many full names as fit.
@@ -295,9 +297,9 @@ export function renderGlyphRow(lines: readonly LineCode[]): string {
     const head = safe.slice(0, take).join(" ");
     const extra = safe.length - take;
     const candidate = extra > 0 ? `${head} +${extra}` : head;
-    if (candidate.length <= HEADER_TEXT_WIDTH) return candidate;
+    if (textWidth(candidate) <= GLYPH_ROW_WIDTH_PX) return candidate;
   }
-  return truncate(safe[0]!, HEADER_TEXT_WIDTH);
+  return truncate(safe[0]!, GLYPH_ROW_WIDTH_PX);
 }
 
 /**
@@ -330,7 +332,7 @@ export function formatIncidentBlock(incident: RailIncident): string[] {
   // 2-col gutter and we prepend the 2-col inset here, no rendered line
   // exceeds SAFE_TEXT_WIDTH real chars — the point past which the LVGL
   // container re-wraps and dumps orphan words at column 0.
-  const wrapped = capDescription(wrap(desc, DESC_TEXT_WIDTH));
+  const wrapped = capDescription(wrap(desc, DESC_TEXT_WIDTH_PX));
   return [glyphRow, ...wrapped.map((l) => DESC_INSET + l)];
 }
 
@@ -405,7 +407,7 @@ export function stalenessMarker(
 export function renderHeader(snapshot: IncidentsSnapshot): string {
   const count = snapshot.incidents.length;
   const left = count > 0 ? `ALERTS (${count})` : "ALERTS";
-  return truncate(left, 50);
+  return truncate(left, HEADER_CONTENT_WIDTH_PX);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,31 +501,31 @@ export function makeIncidentsScreen(
         snapshot.fetchedAt === 0 &&
         snapshot.fetchError !== null
       ) {
-        body.push(truncate("Couldn't reach WMATA. Will retry shortly.", LINE_WIDTH));
+        body.push(truncate("Couldn't reach WMATA. Will retry shortly.", SECTION_INNER_WIDTH_PX));
         body.push("");
-        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
         return { header, body, clockMarker };
       }
 
       if (snapshot.incidents.length === 0) {
         // All-clear copy: a positive statement reads better than
-        // "No active alerts on your lines.". The wider 60-col grid
-        // lets the whole sentence sit on one line.
-        body.push(truncate("All your lines running normally.", LINE_WIDTH));
+        // "No active alerts on your lines." — the full-width body lets
+        // the whole sentence sit on one line.
+        body.push(truncate("All your lines running normally.", SECTION_INNER_WIDTH_PX));
         body.push("");
-        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        body.push(truncate("(double-tap to return)", SECTION_INNER_WIDTH_PX));
         return { header, body, clockMarker };
       }
 
       // Body: flatten the pre-formatted blocks and scroll within the
-      // USABLE_ROWS budget. Edge markers (▴/▾) consume from that
-      // budget; `scrollWindowWithMarkers` resolves the circularity
-      // (markers shrink the window which can then need fewer markers)
-      // with a tiny fixed-point so we don't reinvent it per-screen.
+      // body's row budget. Edge markers (▴/▾) consume from that budget;
+      // `scrollWindowWithMarkers` resolves the circularity (markers
+      // shrink the window which can then need fewer markers) with a tiny
+      // fixed-point so we don't reinvent it per-screen.
       const flat = flattenBlocks(snapshot.preformatted);
       const offset = clamp(nav.highlightedIndex, Math.max(0, flat.length - 1));
-      const decorated = scrollWindowWithMarkers(flat, offset, USABLE_ROWS);
-      for (const r of decorated) body.push(truncate(r, LINE_WIDTH));
+      const decorated = scrollWindowWithMarkers(flat, offset, TWO_BODY_MAX_LINES);
+      for (const r of decorated) body.push(truncate(r, SECTION_INNER_WIDTH_PX));
       return { header, body, clockMarker };
     },
     reduce(snapshot, nav, event: ScreenEvent): ReduceResult<IncidentsSnapshot> {

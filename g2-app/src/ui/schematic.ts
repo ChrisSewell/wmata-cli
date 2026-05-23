@@ -3,7 +3,22 @@
 // view-side schematic is fully unit-testable.
 
 import type { StandardRoute } from "../wmata";
-import { LINE_WIDTH } from "./render";
+import { textWidth } from "./render";
+import { SECTION_INNER_WIDTH_PX } from "./geometry";
+
+// The schematic is a monospace-style ASCII diagram (one char per station
+// cell). The firmware font is proportional, so we conservatively size the
+// column count by the WIDEST glyph the diagram can contain — guaranteeing
+// the row never overflows the body width regardless of which cells land on
+// markers.
+const SCHEMATIC_GLYPH_MAX_PX = Math.max(
+  textWidth("-"),
+  textWidth("*"),
+  textWidth("@"),
+  textWidth(" "),
+  textWidth("W"),
+);
+const SCHEMATIC_COLS = Math.floor(SECTION_INNER_WIDTH_PX / SCHEMATIC_GLYPH_MAX_PX);
 
 /**
  * Build the ordered list of revenue station codes for a given line,
@@ -126,7 +141,7 @@ export const SCHEMATIC_GLYPH_TRAIN = "@";
 /**
  * Render a 1-row ASCII line schematic showing the user's station
  * (`*`) and (optionally) the pinned train's nearest station (`@`).
- * Returns exactly `LINE_WIDTH` columns.
+ * Returns a fixed-width row of `SCHEMATIC_COLS` cells.
  *
  * Glyphs deliberately stay in 7-bit ASCII — the G2 panel's font set
  * isn't documented to include `·` / `★` / `⦿`, and an `*` reads as
@@ -150,9 +165,9 @@ export function renderLineSchematic(
   trainIdx: number,
 ): string {
   const prefix = (lineCode.length > 0 ? lineCode : "--").slice(0, 2) + " ";
-  const budget = LINE_WIDTH - prefix.length;
+  const budget = SCHEMATIC_COLS - prefix.length;
   if (budget <= 0 || lineStations.length === 0) {
-    return (prefix + " ".repeat(LINE_WIDTH)).slice(0, LINE_WIDTH);
+    return (prefix + " ".repeat(SCHEMATIC_COLS)).slice(0, SCHEMATIC_COLS);
   }
   const cells: string[] = [];
   // Map each cell index → set of station indices it covers, then

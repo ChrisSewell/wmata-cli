@@ -11,7 +11,8 @@
 //     it, fetcher result with fetchError !== null also bumps it.
 
 import { describe, expect, it } from "vitest";
-import { LINE_WIDTH, SAFE_TEXT_WIDTH } from "../ui/render";
+import { textWidth } from "../ui/render";
+import { SECTION_INNER_WIDTH_PX } from "../ui/geometry";
 import type { ElevatorIncident } from "../wmata";
 import {
   flattenSections, initialNav, type ViewContext } from "./router";
@@ -43,7 +44,7 @@ const CTX: ViewContext = { nowMs: NOW };
 
 function expectFits(lines: string[]): void {
   for (const line of lines) {
-    expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
   }
 }
 
@@ -111,13 +112,16 @@ describe("stationNameOnly", () => {
 });
 
 describe("wrap", () => {
-  it("packs words greedily into the width", () => {
-    expect(wrap("one two three four", 11)).toEqual(["one two", "three four"]);
+  it("packs words greedily into the pixel budget", () => {
+    // At a 90px budget "one two" (≈70px) fits but "one two three"
+    // (≈120px) does not, so the wrap breaks before "three".
+    expect(wrap("one two three four", 90)).toEqual(["one two", "three four"]);
   });
   it("returns an empty array for empty input", () => {
-    expect(wrap("", 22)).toEqual([]);
+    expect(wrap("", 150)).toEqual([]);
   });
-  it("returns an empty array when width <= 1", () => {
+  it("returns an empty array at a degenerate 1px budget", () => {
+    // Not even the continuation ellipsis fits at 1px, so the helper bails.
     expect(wrap("anything", 1)).toEqual([]);
   });
 });
@@ -138,16 +142,17 @@ describe("capDescription", () => {
 
 describe("renderUnitHeader", () => {
   // The unit header must fit within the body-row text budget since the
-  // caller prepends an indent prefix before rendering. `LINE_WIDTH - 2`
-  // is a loose upper bound (the impl actually caps at the tighter
-  // SAFE_TEXT_WIDTH-derived STATION_TEXT_WIDTH = 56); asserting the
-  // looser bound keeps this test agnostic to the exact inner budget.
-  const BODY_TEXT_WIDTH = LINE_WIDTH - 2;
+  // caller prepends an indent prefix before rendering. The section inner
+  // pixel width is a loose upper bound (the impl actually caps at the
+  // tighter station-text budget = body inner width minus the 2-space
+  // gutter); asserting the looser bound keeps this test agnostic to the
+  // exact inner budget.
+  const BODY_TEXT_BUDGET_PX = SECTION_INNER_WIDTH_PX;
 
   it("renders an ELEVATOR row as `E <station>`", () => {
     const out = renderUnitHeader(incident({ StationName: "Foggy Bottom-GWU" }));
     expect(out.startsWith("E ")).toBe(true);
-    expect(out.length).toBeLessThanOrEqual(BODY_TEXT_WIDTH);
+    expect(textWidth(out)).toBeLessThanOrEqual(BODY_TEXT_BUDGET_PX);
   });
 
   it("renders an ESCALATOR row as `S <station>`", () => {
@@ -165,7 +170,7 @@ describe("renderUnitHeader", () => {
       }),
     );
     expect(out).toContain("U Street");
-    expect(out.length).toBeLessThanOrEqual(BODY_TEXT_WIDTH);
+    expect(textWidth(out)).toBeLessThanOrEqual(BODY_TEXT_BUDGET_PX);
   });
 });
 
@@ -549,11 +554,11 @@ describe("formatStationGroup", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Overflow invariant: no rendered body line exceeds SAFE_TEXT_WIDTH
+// Overflow invariant: no rendered body line exceeds the section inner width
 // ---------------------------------------------------------------------------
 
-describe("elevator view: SAFE_TEXT_WIDTH overflow invariant", () => {
-  it("keeps every rendered body line at or below SAFE_TEXT_WIDTH real chars", () => {
+describe("elevator view: section-inner-width overflow invariant", () => {
+  it("keeps every rendered body line at or below the section inner pixel width", () => {
     const incs = [
       incident({
         UnitType: "ELEVATOR",
@@ -573,14 +578,14 @@ describe("elevator view: SAFE_TEXT_WIDTH overflow invariant", () => {
       }),
     ];
     const screen = makeElevatorScreen(noopFetcher, makeSnap(incs));
-    // The header row (index 0) is space-padded to LINE_WIDTH for the
-    // right-aligned clock; trailing spaces never overflow, so we only
-    // assert the real-text body rows here.
+    // The header row (index 0) carries the bare title; the host renders
+    // the clock in its own container. Only the real-text body rows must
+    // respect the section inner pixel width.
     let nav = initialNav();
     for (let step = 0; step < 30; step++) {
       const lines = flattenSections(screen.view(screen.init(), nav, CTX));
       for (const line of lines.slice(1)) {
-        expect(line.length).toBeLessThanOrEqual(SAFE_TEXT_WIDTH);
+        expect(textWidth(line)).toBeLessThanOrEqual(SECTION_INNER_WIDTH_PX);
       }
       nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
     }

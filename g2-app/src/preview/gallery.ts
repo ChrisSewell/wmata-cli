@@ -17,7 +17,12 @@ import {
   type Screen,
   type ViewContext,
 } from '../screens/router';
-import { LINE_WIDTH, USABLE_ROWS } from '../ui/render';
+// The gallery renders flat rows in a MONOSPACE <pre> — a desktop
+// stand-in for the device, NOT the proportional firmware font — so it
+// works in character space. These constants mirror the device's rough
+// row budget so the preview panels stay uniform.
+const GALLERY_COLS = 72;
+const GALLERY_ROWS = 8;
 
 import { makeHomeScreen } from '../screens/home';
 import { makePredictionsScreen } from '../screens/predictions';
@@ -430,20 +435,20 @@ function renderCard(card: ScreenCard<unknown>): HTMLElement {
   // carries the actual rendered text in monospace.
   const panel = el('div', { class: 'wmata-preview__panel' });
   const pre = el('pre', { class: 'wmata-preview__pre' });
-  // Pad each line to LINE_WIDTH so trailing-space differences are
-  // visible (the device pads on the wire; this matches).
-  const padded = lines.map((l) => l.padEnd(LINE_WIDTH, ' '));
-  // Cap at USABLE_ROWS so the gallery's panels are uniform — any
-  // overflow gets clipped, matching the real device's row budget.
-  pre.textContent = padded.slice(0, USABLE_ROWS + 1).join('\n');
+  // Pad each line to the gallery column width so trailing-space
+  // differences are visible in the monospace preview.
+  const padded = lines.map((l) => l.padEnd(GALLERY_COLS, ' '));
+  // Cap the row count so the gallery's panels are uniform — any
+  // overflow gets clipped, matching the device's row budget.
+  pre.textContent = padded.slice(0, GALLERY_ROWS).join('\n');
   panel.appendChild(pre);
   wrapper.appendChild(panel);
 
   // Footer line metadata: row count + max width assertion. Surfaces
   // any drift past the 24-col contract directly in the gallery.
-  const overflow = padded.some((l) => l.length > LINE_WIDTH);
+  const overflow = padded.some((l) => l.length > GALLERY_COLS);
   const meta = el('p', { class: 'wmata-preview__meta' }, [
-    `${String(lines.length)} rows · ${overflow ? '⚠ OVERFLOW' : 'fits LINE_WIDTH'}`,
+    `${String(lines.length)} rows · ${overflow ? '⚠ OVERFLOW' : `fits ${String(GALLERY_COLS)} cols`}`,
   ]);
   wrapper.appendChild(meta);
 
@@ -456,9 +461,9 @@ export function mountGallery(root: HTMLElement): void {
     el('header', { class: 'wmata-preview__header' }, [
       el('h1', { class: 'wmata-preview__h1' }, ['WMATA G2 — Screens Gallery']),
       el('p', { class: 'wmata-preview__sub' }, [
-        `Every screen state, rendered through its real \`view()\` function. 24×${String(
-          USABLE_ROWS + 1,
-        )} text grid on the device; this page captures every interesting fixture without the SDK simulator.`,
+        `Every screen state, rendered through its real \`view()\` function. Monospace stand-in (${String(
+          GALLERY_ROWS,
+        )} rows) for the device's pixel-measured layout; this page captures every interesting fixture without the SDK simulator.`,
       ]),
     ]),
   );
