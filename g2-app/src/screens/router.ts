@@ -103,6 +103,79 @@ export interface ReduceResult<Snapshot = unknown> {
 }
 
 /**
+ * Page-layout mode. The host commits to a fixed container count when
+ * `createStartUpPageContainer` is called, so screens declare their
+ * layout statically via `Screen<S>.layout`.
+ *
+ *   "two-section":   [Header] [Body]                 (default)
+ *   "three-section": [Header] [Body] [Footer]
+ *
+ * Three-section is for screens whose data has a clear footer concept
+ * (e.g. Predictions surfacing the active service alert below the
+ * trains list). The footer container is always mounted even if the
+ * screen returns empty footer content for a given render — the border
+ * stays for visual consistency.
+ */
+export type ScreenLayoutMode = "two-section" | "three-section";
+
+/**
+ * What a screen's `view()` returns: a header section (top), a body
+ * section (middle / bottom), and optionally a footer section. The
+ * host mounts each as its own G2 text container with native borders
+ * for visual hierarchy. The body is the event capturer
+ * (isEventCapture=1) — all touchpad gestures route through it.
+ *
+ * Width per section: see `LINE_WIDTH` in `../ui/render`. Row budgets
+ * depend on the screen's `layout` mode (see container heights in
+ * `glasses-host.ts`).
+ *
+ * `footer` is present when the screen's `layout` is `"three-section"`
+ * (and otherwise should be left undefined — the host ignores it for
+ * two-section pages). Empty arrays render an empty bordered container.
+ */
+export interface ScreenSections {
+  header: string[];
+  body: string[];
+  footer?: string[];
+  /**
+   * Optional 1-2 char staleness/error marker (e.g. `*`, `**`, `?`) the
+   * host renders immediately after the wall clock in its dedicated
+   * top-right clock container. Screens NO LONGER embed the clock (or
+   * this marker) in their `header` strings — the host owns clock
+   * rendering for consistent placement across every screen. Screens
+   * with no degraded-data concept simply omit this.
+   */
+  clockMarker?: string;
+  /**
+   * Optional two-column body for TRUE pixel-aligned value columns.
+   *
+   * The G2 font is variable-width, so a value "column" faked with
+   * space-padding in a single container never lines up (a wider left
+   * cell pushes the value right). To get a genuinely aligned value
+   * column (the departure-board ETA, the alert/outage count, the
+   * cars+ETA cell) the host renders the body as TWO side-by-side
+   * containers at fixed x-positions: a wide LEFT column (the primary
+   * content — station name, line list, destination) and a narrow RIGHT
+   * column (the value). Because each container starts at a fixed pixel
+   * x, every left line and every right line begins at the same x —
+   * pixel-aligned regardless of glyph widths.
+   *
+   * `left[i]` and `right[i]` are the SAME visual row; `right[i]` is ""
+   * for rows with no value (synthetic labels, blank separators, empty
+   * states). When present the host renders these INSTEAD of `body`;
+   * `flattenSections` reconstructs a flat row list (for tests / the
+   * monospace gallery) by zipping the two columns.
+   */
+  bodyColumns?: { left: string[]; right: string[] };
+}
+
+/** Char width of the left column in the flat (`flattenSections`)
+ *  reconstruction of a two-column body. The DEVICE uses pixel
+ *  geometry (see glasses-host.ts); this is only the monospace
+ *  stand-in for tests and the gallery. */
+export const FLAT_LEFT_COLS = 52;
+
+/**
  * Per-render context supplied by the host. Currently just the wall
  * clock, but the interface is open for future additions (e.g. a
  * "battery low" signal, a debug-mode flag).
@@ -145,6 +218,13 @@ export interface ViewContext {
 export interface Screen<Snapshot> {
   /** Stable identifier for logging / debugging. */
   readonly name: NavIntent["to"];
+  /**
+   * Static page-layout declaration. The host mounts 2 or 3 bordered
+   * containers based on this value; switching at runtime would
+   * require re-creating the page (and re-routing the event capturer).
+   * Optional — defaults to `"two-section"`.
+   */
+  readonly layout?: ScreenLayoutMode;
   /** Build the initial snapshot. Pure: no SDK, no I/O. */
   init(): Snapshot;
   /**
@@ -179,14 +259,21 @@ export interface Screen<Snapshot> {
     bridge: import("@evenrealities/even_hub_sdk").EvenAppBridge,
   ) => Promise<void>;
   /**
-   * Render the screen into ≤ TOTAL_ROWS lines, each ≤ LINE_WIDTH cols.
+   * Render the screen into header + body sections. Each section is an
+   * array of lines (each ≤ LINE_WIDTH cols). The host renders the
+   * header in the top container, the body in the bottom container,
+   * both with native borders.
    *
    * `ctx.nowMs` is freshly stamped by the host on EVERY render —
    * including clock-only re-renders that don't touch the snapshot.
    * Read the wall clock from `ctx.nowMs`, never from the snapshot.
    * Screens with no time-sensitive UI can ignore `ctx`.
    */
-  view(snapshot: Snapshot, nav: NavState, ctx: ViewContext): string[];
+  view(
+    snapshot: Snapshot,
+    nav: NavState,
+    ctx: ViewContext,
+  ): ScreenSections;
   /**
    * Pure reducer over (snapshot, nav, event).
    *
@@ -232,4 +319,47 @@ export interface Router {
 /** Fresh navigation state (highlight at the top). */
 export function initialNav(): NavState {
   return { highlightedIndex: 0 };
+}
+
+/**
+ * Flatten the section structure into a single `string[]`, header
+ * lines first, then body, then footer. Useful for tests and the
+ * preview gallery, which historically operated on a flat array —
+ * the section split is a render-time concern (one container per
+ * section), not a data-model concern.
+ */
+export function flattenSections(sections: ScreenSections): string[] {
+  const bodyLines = sections.bodyColumns
+    ? zipColumns(sections.bodyColumns.left, sections.bodyColumns.right)
+    : sections.body;
+  return [
+    ...sections.header,
+    ...bodyLines,
+    ...(sections.footer ?? []),
+  ];
+}
+
+/**
+ * Reconstruct flat "left + value" rows from a two-column body. Each
+ * left cell is padded to `FLAT_LEFT_COLS` so the value lands in a
+ * consistent column in the monospace stand-in. The device does NOT use
+ * this — it positions the two real containers by pixel (glasses-host).
+ */
+export function zipColumns(left: string[], right: string[]): string[] {
+  const n = Math.max(left.length, right.length);
+  const out: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const l = left[i] ?? "";
+    const r = right[i] ?? "";
+    if (r.length === 0) {
+      out.push(l);
+      continue;
+    }
+    const padded =
+      l.length >= FLAT_LEFT_COLS
+        ? l.slice(0, FLAT_LEFT_COLS)
+        : l + " ".repeat(FLAT_LEFT_COLS - l.length);
+    out.push(padded + r);
+  }
+  return out;
 }

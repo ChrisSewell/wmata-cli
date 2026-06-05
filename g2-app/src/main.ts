@@ -24,7 +24,7 @@ import { recordOpen } from "./storage/history";
 import { loadSettings } from "./storage/settings";
 import { mountSettingsScreen } from "./screens/settings";
 import { mountGlassesScreen } from "./screens/glasses-host";
-import { makeHomeScreen } from "./screens/home";
+import { makeHomeScreen, soonestEta } from "./screens/home";
 import {
   computeUserLines,
   makeIncidentsScreen,
@@ -37,8 +37,15 @@ import {
 import {
   makeInitialJourneySnapshot,
   makeJourneyScreen,
+  type JourneyNextTrain,
 } from "./screens/journey";
-import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions";
+import {
+  bucketLastTrainsByLine,
+  makePredictionsScreen,
+  resolvePinnedPosition,
+  type LastTrainByLine,
+  type PredictionsSnapshot,
+} from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
 import {
@@ -53,6 +60,7 @@ import { parseLinesAffected } from "./wmata/incidents-cache";
 import {
   buildRailPredictionsUrl,
   type LineCode,
+  type PathStep,
   type PredictionsResponse,
   type RailIncident,
   type Station,
@@ -111,6 +119,62 @@ function computeAffectedLines(
 }
 
 /**
+ * Fetch the soonest next-train ETA for every favorite station in ONE
+ * batched WMATA predictions call and return a `stationCode → Min token`
+ * map. The token is the raw `Min` of the soonest upcoming train at that
+ * station across all of its lines (`"4"` / `"ARR"` / `"BRD"`), or
+ * `null` when the station has no upcoming train. Drives the Home
+ * screen's live departure board.
+ *
+ * Batching: WMATA's `GetPrediction` endpoint accepts a comma-joined
+ * list of station codes (`.../GetPrediction/A01,B01,B03`) and returns a
+ * single `Trains[]` array spanning them all — so N favorites cost ONE
+ * request, not N, keeping us comfortably under the 10 req/s ceiling.
+ * The returned trains carry `LocationCode`, which we group by to find
+ * each station's soonest departure.
+ *
+ * Best-effort: any failure (network, decode) throws, and the caller
+ * (`refreshFavoriteEtas`) lets the tick swallow it so the rows linger
+ * at their last values rather than blanking. An empty favorites list
+ * short-circuits to `{}` without a network call.
+ */
+async function buildFavoriteEtaMap(
+  session: Session,
+  codes: readonly string[],
+): Promise<Record<string, string | null>> {
+  if (codes.length === 0) return {};
+  // One request for all favorites. The comma-join is the documented
+  // multi-station form of GetPrediction.
+  const url = buildRailPredictionsUrl(codes.join(","));
+  const data = await session.client.get<PredictionsResponse>(url);
+  const trains = data.Trains ?? [];
+
+  // Bucket each train's `Min` token by the station it departs from
+  // (`LocationCode`). We only collect tokens for codes the user
+  // actually favorites — the multi-station response can include
+  // platform siblings (e.g. Gallery Place B01/F01) we didn't ask for.
+  const wanted = new Set<string>(codes);
+  const minsByCode = new Map<string, string[]>();
+  for (const t of trains) {
+    const code = t.LocationCode;
+    if (!code || !wanted.has(code)) continue;
+    const bucket = minsByCode.get(code);
+    if (bucket) bucket.push(t.Min);
+    else minsByCode.set(code, [t.Min]);
+  }
+
+  // Build the map for every requested code so a station with no trains
+  // in the response gets an explicit `null` (rendered as a blank,
+  // aligned cell — distinct from the absent-key "loading" state before
+  // the first successful fetch).
+  const out: Record<string, string | null> = {};
+  for (const code of wanted) {
+    out[code] = soonestEta(minsByCode.get(code) ?? []);
+  }
+  return out;
+}
+
+/**
  * Best-effort geolocation lookup. Returns `null` on any failure
  * (permission denied, timeout, runtime without `navigator.geolocation`,
  * any thrown error). The boot path treats null as "geofence didn't
@@ -159,22 +223,54 @@ const WEEKDAY_KEYS = [
 ] as const;
 
 /**
- * Read the latest scheduled departure time from `code`'s
- * `LastTrains[]` for today's day-of-week. Returns `null` on any
- * failure (cache miss, unknown station, network blip). The session
- * cache makes calls after the first one essentially free.
+ * Read tonight's last-train summary for `code`, bucketed by line.
+ * Each entry is the latest PM departure on a line that this station
+ * serves. Returns `null` on any failure (cache miss, unknown
+ * station, network blip).
+ *
+ * Per-line resolution (WP-J): for each `LastTrains[]` entry, the
+ * destination station's primary line (`LineCode1`, falling through
+ * to `LineCode2`/3/4 for multi-line termini) tells us which line
+ * the train is running on. We bucket by that line and pick the
+ * latest PM time per bucket.
  */
 async function readLastTrainToday(
   session: Session,
   code: string,
-): Promise<string | null> {
+): Promise<LastTrainByLine[] | null> {
   try {
     const times = await session.getStationTimes(code);
     if (!times) return null;
     const today = WEEKDAY_KEYS[new Date().getDay()];
     const day = times[today];
     if (!day) return null;
-    return pickLastTrainTime(day.LastTrains ?? []);
+    const lastTrains = day.LastTrains ?? [];
+    if (lastTrains.length === 0) return [];
+    // Build a `destinationStation → line` map by resolving each
+    // unique destination through the stations cache. We only
+    // resolve uniques (a busy station has lots of duplicates in
+    // LastTrains[]) to minimise the lookup load.
+    const uniqueDests = new Set<string>(
+      lastTrains.map((t) => t.DestinationStation).filter((s) => s.length > 0),
+    );
+    const destToLine = new Map<string, string>();
+    for (const dest of uniqueDests) {
+      const station = await session.resolveStationCode(dest);
+      if (!station) continue;
+      // For multi-line termini, prefer LineCode1 by convention. A
+      // future WP could be smarter (cross-reference with the
+      // station's served-lines), but the heuristic is correct for
+      // every WMATA terminus today — all terminus stations are
+      // single-line.
+      const line =
+        station.LineCode1 ??
+        station.LineCode2 ??
+        station.LineCode3 ??
+        station.LineCode4 ??
+        null;
+      if (line) destToLine.set(dest, line);
+    }
+    return bucketLastTrainsByLine(lastTrains, destToLine);
   } catch {
     return null;
   }
@@ -212,6 +308,11 @@ async function bootGlasses(): Promise<void> {
         affectedLines: computeAffectedLines(cached, userLines),
         accessOutageCount: cachedAccess,
         quietHours: evaluation.quietHours,
+        // Seed empty = "loading": no per-favorite ETA is known until
+        // the first `refreshFavoriteEtas` tick lands. An empty map
+        // renders the rows without an ETA cell content (blank, aligned)
+        // so the first paint doesn't blink an ETA in then out.
+        favoriteEtas: {},
       };
     },
     {
@@ -231,6 +332,16 @@ async function bootGlasses(): Promise<void> {
           Date.now(),
         );
         return evaluation.quietHours;
+      },
+      refreshFavoriteEtas: async (): Promise<
+        Record<string, string | null>
+      > => {
+        // Re-read favorites each tick so a phone-side edit is picked up
+        // without remounting. One batched predictions call covers them
+        // all. Any throw here propagates to the tick's allSettled, which
+        // preserves the prior ETA map (rows linger, never blank).
+        const codes = loadSettings().favorites.map((f) => f.code);
+        return buildFavoriteEtaMap(session, codes);
       },
       tickIntervalMs: 60_000,
     },
@@ -298,7 +409,9 @@ async function bootGlasses(): Promise<void> {
             );
           }
 
-          const fetcher = async () => {
+          const fetcher = async (
+            snapshot: PredictionsSnapshot,
+          ) => {
             const url = buildRailPredictionsUrl(intent.stationCode);
             // Fire predictions + cache-refresh in sequence (not parallel)
             // to keep the request rate under WMATA's 10 req/s ceiling
@@ -316,10 +429,28 @@ async function bootGlasses(): Promise<void> {
               session,
               intent.stationCode,
             );
+            // WP-I live-position lookup. Only burns a fetch when
+            // the user has a pin active — otherwise null. The two
+            // calls run in parallel (StandardRoutes is cached after
+            // the first hit so it's free thereafter).
+            let pinnedPosition = null;
+            if (snapshot.pinned !== null) {
+              const [positions, routes] = await Promise.all([
+                session.getTrainPositions(),
+                session.getStandardRoutes(),
+              ]);
+              pinnedPosition = resolvePinnedPosition(
+                snapshot.pinned,
+                intent.stationCode,
+                positions,
+                routes,
+              );
+            }
             return {
               trains: data.Trains ?? [],
               incidentHeadline: readFirstIncidentHeadline(session),
               lastTrainToday,
+              pinnedPosition,
             };
           };
 
@@ -345,6 +476,15 @@ async function bootGlasses(): Promise<void> {
             // they navigate back to Predictions. This avoids stale
             // pins surviving across station changes.
             pinned: null,
+            // WP-I: resolved once the user pins a train AND the
+            // first TrainPositions tick lands. `null` hides the
+            // schematic + "stops away" rows.
+            pinnedPosition: null,
+            // WP-M opt-in cursor: hidden until the user scrolls.
+            cursorVisible: false,
+            // WP-M pin-gone latch: set by the tick when a pinned
+            // train rolls off; cleared on the next miss.
+            pinnedGone: false,
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);
@@ -451,20 +591,80 @@ async function bootGlasses(): Promise<void> {
           const plan = loadSettings().journeyPlan;
           const fetcher = async () => {
             if (plan.origin.length === 0 || plan.destination.length === 0) {
-              return { path: null, originName: "", destinationName: "" };
+              return {
+                legs: null,
+                originName: "",
+                destinationName: "",
+                transferName: "",
+                nextTrain: null,
+              };
             }
-            // Resolve names + path in parallel — both come from cached
-            // session calls so this is essentially free after the
-            // first round trip.
-            const [origStation, destStation, path] = await Promise.all([
-              session.resolveStationCode(plan.origin),
-              session.resolveStationCode(plan.destination),
-              session.getPath(plan.origin, plan.destination),
-            ]);
+            const hasTransfer =
+              typeof plan.transfer === "string" && plan.transfer.length > 0;
+            const [origStation, destStation, transferStation] =
+              await Promise.all([
+                session.resolveStationCode(plan.origin),
+                session.resolveStationCode(plan.destination),
+                hasTransfer
+                  ? session.resolveStationCode(plan.transfer!)
+                  : Promise.resolve(null),
+              ]);
+
+            // Path composition.
+            let legs: PathStep[][] | null = null;
+            if (hasTransfer) {
+              const [leg1, leg2] = await Promise.all([
+                session.getPath(plan.origin, plan.transfer!),
+                session.getPath(plan.transfer!, plan.destination),
+              ]);
+              if (leg1 === null || leg2 === null) {
+                legs = null;
+              } else if (leg1.length === 0 || leg2.length === 0) {
+                // One leg is itself cross-line — the user picked a
+                // bad transfer station.
+                legs = [];
+              } else {
+                legs = [leg1, leg2];
+              }
+            } else {
+              const path = await session.getPath(plan.origin, plan.destination);
+              if (path === null) legs = null;
+              else if (path.length === 0) legs = [];
+              else legs = [path];
+            }
+
+            // Live next-train at origin (WP-K). Pull the predictions
+            // for the origin station and pick the first train whose
+            // line matches the origin leg. Best-effort: any failure
+            // here resolves to null.
+            let nextTrain: JourneyNextTrain | null = null;
+            try {
+              const data = await session.client.get<PredictionsResponse>(
+                buildRailPredictionsUrl(plan.origin),
+              );
+              const trains = data.Trains ?? [];
+              const originLine =
+                legs && legs.length > 0 ? legs[0]![0]?.LineCode : null;
+              const match = originLine
+                ? trains.find((t) => t.Line === originLine)
+                : trains[0];
+              if (match) {
+                nextTrain = {
+                  line: match.Line,
+                  min: match.Min,
+                  destination: match.Destination || match.DestinationName,
+                };
+              }
+            } catch {
+              nextTrain = null;
+            }
+
             return {
-              path,
+              legs,
               originName: origStation?.Name ?? plan.origin,
               destinationName: destStation?.Name ?? plan.destination,
+              transferName: transferStation?.Name ?? plan.transfer ?? "",
+              nextTrain,
             };
           };
           const initial = makeInitialJourneySnapshot(plan);

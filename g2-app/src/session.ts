@@ -32,6 +32,8 @@ import {
   WmataError,
   INCIDENTS_ELEVATOR,
   INCIDENTS_RAIL,
+  STANDARD_ROUTES_URL,
+  TRAIN_POSITIONS_URL,
   buildPathUrl,
   buildStationTimesUrl,
   getStations as fetchStations,
@@ -42,9 +44,13 @@ import {
   type PathResponse,
   type PathStep,
   type RailIncident,
+  type StandardRoute,
+  type StandardRoutesResponse,
   type Station,
   type StationTimes,
   type StationTimesResponse,
+  type TrainPosition,
+  type TrainPositionsResponse,
 } from "./wmata";
 import { parseLinesAffected } from "./wmata/incidents-cache";
 
@@ -369,6 +375,36 @@ class PathCache {
 }
 
 // ---------------------------------------------------------------------------
+// StandardRoutesCache (internal)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazy cache of WMATA's `StandardRoutes` table — the network's
+ * static circuit-ordering data. Per the WMATA docs this changes
+ * "infrequently" (in practice, only on schedule pick days), so a
+ * single fetch per glasses session is plenty. Returns `null` on
+ * fetch failure (not cached — a transient blip retries on the
+ * next call).
+ */
+class StandardRoutesCache {
+  private routes: StandardRoute[] | null = null;
+
+  constructor(private readonly client: WmataClient) {}
+
+  async get(): Promise<StandardRoute[] | null> {
+    if (this.routes !== null) return this.routes;
+    try {
+      const data =
+        await this.client.get<StandardRoutesResponse>(STANDARD_ROUTES_URL);
+      this.routes = data.StandardRoutes ?? [];
+      return this.routes;
+    } catch {
+      return null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -386,6 +422,7 @@ export class Session {
   private readonly elevatorIncidentsCache: ElevatorIncidentsCache;
   private readonly stationTimesCache: StationTimesCache;
   private readonly pathCache: PathCache;
+  private readonly standardRoutesCache: StandardRoutesCache;
 
   /**
    * Build a Session from an API key (production path) or from a
@@ -405,6 +442,7 @@ export class Session {
     this.elevatorIncidentsCache = new ElevatorIncidentsCache(this.client);
     this.stationTimesCache = new StationTimesCache(this.client);
     this.pathCache = new PathCache(this.client);
+    this.standardRoutesCache = new StandardRoutesCache(this.client);
   }
 
   // -- Stations -------------------------------------------------------------
@@ -478,5 +516,30 @@ export class Session {
    */
   getPath(from: string, to: string): Promise<PathStep[] | null> {
     return this.pathCache.get(from, to);
+  }
+
+  // -- TrainPositions + StandardRoutes (WP-I) ------------------------------
+
+  /**
+   * Lazy-load the WMATA StandardRoutes table. Cached for the
+   * lifetime of the session; returns `null` on fetch failure.
+   */
+  getStandardRoutes(): Promise<StandardRoute[] | null> {
+    return this.standardRoutesCache.get();
+  }
+
+  /**
+   * Fetch live train positions. **Not cached** — the data changes
+   * every few seconds, so each caller pays a fresh network round
+   * trip. Returns `null` on fetch failure rather than throwing.
+   */
+  async getTrainPositions(): Promise<TrainPosition[] | null> {
+    try {
+      const data =
+        await this.client.get<TrainPositionsResponse>(TRAIN_POSITIONS_URL);
+      return data.TrainPositions ?? [];
+    } catch {
+      return null;
+    }
   }
 }

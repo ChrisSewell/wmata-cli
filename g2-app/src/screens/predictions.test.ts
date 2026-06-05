@@ -18,9 +18,14 @@
 //     freeze the on-glasses clock.
 
 import { describe, expect, it, vi } from "vitest";
-import { LINE_WIDTH } from "../ui/render";
+import { padRight, LINE_WIDTH } from "../ui/render";
 import type { Train } from "../wmata";
-import { initialNav, type ViewContext } from "./router";
+import {
+  FLAT_LEFT_COLS,
+  flattenSections,
+  initialNav,
+  type ViewContext,
+} from "./router";
 import { mountGlassesScreen } from "./glasses-host";
 import {
   StartUpPageCreateResult,
@@ -34,15 +39,19 @@ import {
   MAX_VISIBLE_TRAINS,
   STALE_THRESHOLD_MS,
   TICK_INTERVAL_MS,
+  bucketLastTrainsByLine,
   findPinnedTrainIndex,
   formatClock,
   isStale,
   makePredictionsScreen,
   pickLastTrainTime,
+  pinnedDistancePhrase,
   renderFooter,
+  renderFooterQuiet,
   renderHeader,
   renderLastTrainRow,
   renderPinRow,
+  renderPinnedSummary,
   renderTrainRow,
   shouldShowLastTrain,
   sortTrainsForDisplay,
@@ -98,13 +107,19 @@ function snap(over: Partial<PredictionsSnapshot>): PredictionsSnapshot {
     incidentHeadline: null,
     lastTrainToday: null,
     pinned: null,
+    pinnedPosition: null,
+    // WP-M default — cursor visible to keep the v1.2 tests
+    // (cursor-on-row-0 expectations) passing. The first-mount
+    // boot path in main.ts initialises this to false.
+    cursorVisible: true,
+    pinnedGone: false,
     ...over,
   };
 }
 
 /** A noop fetcher — handy for screens that we never tick in a test. */
 const noopFetcher = (): Promise<PredictionsFetchResult> =>
-  Promise.resolve({ trains: [], incidentHeadline: null, lastTrainToday: null });
+  Promise.resolve({ trains: [], incidentHeadline: null, lastTrainToday: null, pinnedPosition: null });
 
 // ---------------------------------------------------------------------------
 // formatClock
@@ -163,96 +178,99 @@ describe("isStale", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderHeader", () => {
-  it("renders a short station name + clock at exactly LINE_WIDTH cols", () => {
-    const out = renderHeader(snap({ stationName: "Metro Center" }), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("Metro Center");
-    expect(out).toContain("2:32p");
+  // The header is now the station TITLE ONLY — the host renders the wall
+  // clock + staleness marker in its own dedicated top-right container, so
+  // neither appears in the header string anymore. (The marker is asserted
+  // via `view(...).clockMarker` in the dedicated describe block below.)
+  it("renders a short station name verbatim (title only, no clock)", () => {
+    const out = renderHeader(snap({ stationName: "Metro Center" }));
+    expect(out).toBe("Metro Center");
   });
 
-  it("abbreviates a long station name to fit the 17-col name budget", () => {
+  it("keeps a long station name within the 50-col title budget", () => {
+    // At a 50-col budget this 48-char name fits verbatim (the hand-tuned
+    // abbreviation only kicks in once the canonical name overflows the
+    // budget); either way the title must never exceed 50 cols so it can't
+    // collide with the host's top-right clock container.
     const out = renderHeader(
       snap({ stationName: "U Street/African-Amer Civil War Memorial/Cardozo" }),
-      NOW,
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("U Street");
-    expect(out).toContain("2:32p");
+    expect(out.length).toBeLessThanOrEqual(50);
+    expect(out.startsWith("U Street")).toBe(true);
   });
 
-  it("appends '*' when the snapshot is stale (old fetchedAt, no error)", () => {
+  it("abbreviates an over-budget station name down to ≤ 50 cols", () => {
+    // A synthetic 60-char name forces the truncation path: the result is
+    // clamped to 50 cols with the canonical ellipsis.
+    const longName = "Very Long Station Name That Exceeds The Fifty Column Budget!!";
+    const out = renderHeader(snap({ stationName: longName }));
+    expect(out.length).toBeLessThanOrEqual(50);
+    expect(out.endsWith("…")).toBe(true);
+  });
+
+  it("does not embed the clock or a stale marker even when stale", () => {
     const out = renderHeader(
       snap({ fetchedAt: NOW - (STALE_THRESHOLD_MS + 1_000) }),
-      NOW,
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("2:32p*")).toBe(true);
+    expect(out).toBe("Metro Center");
+    expect(out).not.toContain(":");
+    expect(out).not.toContain("*");
   });
 
-  // ----- 3-state stale-marker escalation -----
-  //
-  // The marker now reflects the *number of consecutive fetch failures*
-  // since the last success, not just a binary stale/error flag. We pin
-  // each branch verbatim so a future regression has to update the
-  // expected glyphs intentionally.
-
-  it("appends '*' after one consecutive fetch failure", () => {
-    const out = renderHeader(
-      snap({ consecutiveFetchFailures: 1, fetchError: "Slow network" }),
-      NOW,
-    );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("2:32p*")).toBe(true);
-  });
-
-  it("appends '**' after two consecutive fetch failures", () => {
-    const out = renderHeader(
-      snap({ consecutiveFetchFailures: 2, fetchError: "Slow network" }),
-      NOW,
-    );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("2:32p**")).toBe(true);
-  });
-
-  it("appends '?' after three or more consecutive fetch failures", () => {
+  it("does not embed a marker even after consecutive fetch failures", () => {
     const out = renderHeader(
       snap({ consecutiveFetchFailures: 3, fetchError: "Slow network" }),
-      NOW,
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("2:32p?")).toBe(true);
+    expect(out).toBe("Metro Center");
+    expect(out).not.toContain("?");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// view().clockMarker — staleness escalation now rides the host clock cell
+// ---------------------------------------------------------------------------
+//
+// The 3-state marker (`*` → `**` → `?`) moved out of the header string and
+// into `ScreenSections.clockMarker`, which the host appends after its own
+// wall clock. We pin each branch verbatim so a regression has to update
+// the expected glyphs intentionally.
+
+describe("predictions view: clockMarker staleness escalation", () => {
+  const markerFor = (over: Partial<PredictionsSnapshot>): string | undefined => {
+    const screen = makePredictionsScreen(noopFetcher, snap(over));
+    return screen.view(screen.init(), initialNav(), CTX).clockMarker;
+  };
+
+  it("is empty for fresh data with no failures", () => {
+    expect(markerFor({ fetchedAt: NOW })).toBe("");
   });
 
-  it("appends '?' when no successful fetch ever AND there's an error", () => {
-    // fetchedAt=0 with an active error means we've never had data at
-    // all. This is the strongest degraded state, marker = '?'.
-    const out = renderHeader(
-      snap({ fetchedAt: 0, fetchError: "Network down" }),
-      NOW,
+  it("is '*' when the snapshot is stale (old fetchedAt, no error)", () => {
+    expect(markerFor({ fetchedAt: NOW - (STALE_THRESHOLD_MS + 1_000) })).toBe(
+      "*",
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("2:32p?")).toBe(true);
   });
 
-  it("steals 2 cols from the name budget when the marker is '**'", () => {
-    // "Metro Center" (12 chars) → with **, the name budget is 17-2=15,
-    // so the name still fits verbatim. The total line length stays at
-    // exactly LINE_WIDTH.
-    const out = renderHeader(
-      snap({ consecutiveFetchFailures: 2, fetchError: "x" }),
-      NOW,
-    );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("Metro Center");
+  it("is '*' after one consecutive fetch failure", () => {
+    expect(
+      markerFor({ consecutiveFetchFailures: 1, fetchError: "Slow network" }),
+    ).toBe("*");
   });
 
-  it("renders '--:--' placeholder when ctx.nowMs is zero", () => {
-    // The wall clock is now sourced from `ctx.nowMs` (passed via the
-    // 2nd arg here), not from the snapshot. A zero clock should still
-    // produce the canonical placeholder.
-    const out = renderHeader(snap({ fetchedAt: 0 }), 0);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("--:--");
+  it("is '**' after two consecutive fetch failures", () => {
+    expect(
+      markerFor({ consecutiveFetchFailures: 2, fetchError: "Slow network" }),
+    ).toBe("**");
+  });
+
+  it("is '?' after three or more consecutive fetch failures", () => {
+    expect(
+      markerFor({ consecutiveFetchFailures: 3, fetchError: "Slow network" }),
+    ).toBe("?");
+  });
+
+  it("is '?' when no successful fetch ever AND there's an error", () => {
+    expect(markerFor({ fetchedAt: 0, fetchError: "Network down" })).toBe("?");
   });
 });
 
@@ -261,64 +279,79 @@ describe("renderHeader", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderTrainRow", () => {
-  it("fits a typical row in exactly LINE_WIDTH cols", () => {
+  // `renderTrainRow` now returns the two pixel-aligned columns of a body
+  // row: `left` (inset + line glyph cell + Title-Case destination,
+  // left-aligned, NOT padded) and `right` (the cars+ETA value, ≤ ~10
+  // chars). The host overlays `right` at a fixed pixel x, so the
+  // destination's variable glyph width no longer floats the ETA.
+  it("splits a typical row into a left dest cell and a right cars+ETA value", () => {
     const out = renderTrainRow(
       train({ Line: "RD", Destination: "Shady Grove", Car: "6", Min: "5" }),
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("RD");
-    // "Shady Grove" (11 chars) fits the 11-col dest cell verbatim; the
-    // abbreviation map's "Shady Grv" only kicks in below 11 cols.
-    expect(out).toContain("Shady Grove");
-    expect(out).toContain("6c");
-    expect(out).toContain("5 min");
+    // Left: inset + "RED   " glyph cell + the (un-padded) destination.
+    expect(out.left).toBe("  RED    Shady Grove");
+    // Right: "6c" + " " + right-aligned "5 min" → "6c  5 min" (9 chars).
+    expect(out.right).toBe("6c  5 min");
+    expect(out.right.length).toBeLessThanOrEqual(10);
   });
 
-  it("renders the ARR sentinel distinguishably", () => {
+  it("renders the ARR sentinel distinguishably in the right value", () => {
     const out = renderTrainRow(train({ Min: "ARR" }));
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("ARR");
+    expect(out.right).toContain("ARR");
+    expect(out.right).toBe("6c    ARR");
   });
 
-  it("renders the BRD sentinel distinguishably", () => {
+  it("renders the BRD sentinel distinguishably in the right value", () => {
     const out = renderTrainRow(train({ Min: "BRD" }));
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("BRD");
+    expect(out.right).toContain("BRD");
   });
 
   it("renders the '---' sentinel as the em-dash, never blank", () => {
     const out = renderTrainRow(train({ Min: "---" }));
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("—");
+    expect(out.right).toContain("—");
   });
 
   it("renders the empty-string sentinel as the em-dash, never blank", () => {
     const out = renderTrainRow(train({ Min: "" }));
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("—");
+    expect(out.right).toContain("—");
   });
 
-  it("fits 8-car trains with double-digit ETAs", () => {
+  it("fits 8-car trains with double-digit ETAs in the right value", () => {
     const out = renderTrainRow(
       train({ Car: "8", Min: "12", Destination: "Glenmont" }),
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("8c");
-    expect(out).toContain("12 min");
+    expect(out.right).toContain("8c");
+    expect(out.right).toContain("12 min");
+    expect(out.right.length).toBeLessThanOrEqual(10);
   });
 
-  it("collapses an unknown line code to the '--' glyph", () => {
+  it("collapses an unknown line code to the '--' glyph in the left cell", () => {
     const out = renderTrainRow(train({ Line: "No" }));
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("--")).toBe(true);
+    // 2-char body inset + "--" line glyph.
+    expect(out.left.startsWith("  --")).toBe(true);
   });
 
   it("renders a blank cars cell as two spaces, not a stray 'c'", () => {
     const out = renderTrainRow(train({ Car: "" }));
-    expect(out.length).toBe(LINE_WIDTH);
-    // The cars cell sits between dest and ETA — the literal 'c' should
-    // not appear once Car is blank.
-    expect(out).not.toContain(" c ");
+    // With Car blank the right value is just the right-aligned ETA — the
+    // literal 'c' should not appear; two leading spaces stand in for the
+    // empty cars cell.
+    expect(out.right).not.toContain("c");
+    expect(out.right.startsWith("  ")).toBe(true);
+  });
+
+  it("keeps the left cell within the ~50-char body container budget", () => {
+    // Even the longest destination must leave the left column short of
+    // the value overlay at x≈466 (~50 monospace chars).
+    const out = renderTrainRow(
+      train({
+        Line: "GR",
+        Destination: "Mt Vernon Sq 7th St-Convention Center",
+        Car: "8",
+        Min: "12",
+      }),
+    );
+    expect(out.left.length).toBeLessThanOrEqual(50);
   });
 });
 
@@ -343,9 +376,8 @@ describe("renderTrainRow: Destination / DestinationName fallback", () => {
     const out = renderTrainRow(
       train({ Destination: "", DestinationName: "Vienna" }),
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    // The dest cell should show "Vienna", not be blank.
-    expect(out).toContain("Vienna");
+    // The dest cell (left column) should show "Vienna", not be blank.
+    expect(out.left).toContain("Vienna");
   });
 
   it("prefers Destination over DestinationName when both are non-empty", () => {
@@ -356,10 +388,9 @@ describe("renderTrainRow: Destination / DestinationName fallback", () => {
     const out = renderTrainRow(
       train({ Destination: "VN", DestinationName: "Vienna" }),
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("VN");
+    expect(out.left).toContain("VN");
     // "Vienna" must NOT appear (it would imply DestinationName won).
-    expect(out).not.toContain("Vienna");
+    expect(out.left).not.toContain("Vienna");
   });
 });
 
@@ -407,9 +438,9 @@ describe("sortTrainsForDisplay", () => {
 describe("predictions view: empty state", () => {
   it("renders header + 'No trains predicted.' + a (double-tap to exit) cue", () => {
     const screen = makePredictionsScreen(noopFetcher, snap({ trains: [] }));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    expect(lines[0]).toBe(renderHeader(screen.init(), CTX.nowMs));
+    expect(lines[0]).toBe(renderHeader(screen.init()));
     expect(lines.some((l) => l.includes("No trains predicted"))).toBe(true);
     expect(lines.some((l) => l.includes("double-tap to exit"))).toBe(true);
   });
@@ -417,7 +448,7 @@ describe("predictions view: empty state", () => {
   it("renders a 'Loading…' cue when fetchedAt=0 and no fetchError", () => {
     const initial = snap({ trains: [], fetchedAt: 0, fetchError: null });
     const screen = makePredictionsScreen(noopFetcher, initial);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.some((l) => l.includes("Loading"))).toBe(true);
   });
@@ -435,17 +466,23 @@ describe("predictions view: empty state", () => {
       fetchError: null,
     });
     const screen = makePredictionsScreen(noopFetcher, initial);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    // Header: "Metro Center" + spaces + " 2:32p" + "*" (stale because
-    // never fetched). With the marker present the name cell shrinks
-    // from 17 to 16 cols, so total = 16 + 1 + 7 = 24.
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
+    // Header is now the bare station title — the host renders the clock
+    // (and the staleness marker) in its own top-right container, so the
+    // flattened view output no longer contains the clock. The footer is
+    // never an empty box: with no visible trains there are no served
+    // lines to summarise, so it falls back to the quiet navigation hint
+    // (2-char inset).
     expect(lines).toEqual([
-      "Metro Center      2:32p*",
+      "Metro Center",
       "Loading…",
       "",
       "(double-tap to exit)",
+      "  Double-tap for stations",
     ]);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
+    // Never-fetched → strongest staleness marker rides `clockMarker`.
+    expect(sections.clockMarker).toBe("*");
   });
 });
 
@@ -454,29 +491,34 @@ describe("predictions view: empty state", () => {
 // ---------------------------------------------------------------------------
 
 describe("predictions view: 1, 3, 5 trains", () => {
-  it("renders one train + header in 2 lines, every line fits", () => {
+  // Each fixture now also renders a quiet footer line (served-lines
+  // summary) since the footer container is never left empty — so the
+  // flattened line count is header + N trains + 1 footer line.
+  it("renders one train + header + quiet footer in 3 lines, every line fits", () => {
     const screen = makePredictionsScreen(
       noopFetcher,
       snap({ trains: [train({ Min: "5" })] }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines.length).toBe(2);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    expect(lines.length).toBe(3);
+    expect(lines[lines.length - 1]).toBe("  Serving RED");
     expectFits(lines);
   });
 
-  it("renders three trains + header in 4 lines, every line fits", () => {
+  it("renders three trains + header + quiet footer in 5 lines, every line fits", () => {
     const trains: Train[] = [
       train({ Line: "RD", Destination: "Shady Grove", Min: "ARR" }),
       train({ Line: "RD", Destination: "Glenmont", Min: "3" }),
       train({ Line: "OR", Destination: "Vienna/Fairfax-GMU", Min: "5" }),
     ];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines.length).toBe(4);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    expect(lines.length).toBe(5);
+    expect(lines[lines.length - 1]).toBe("  Serving RED, ORANGE");
     expectFits(lines);
   });
 
-  it("renders five trains + header in 6 lines, every line fits", () => {
+  it("renders five trains + header + quiet footer in 7 lines, every line fits", () => {
     const trains: Train[] = [
       train({ Line: "RD", Destination: "Shady Grove", Min: "ARR" }),
       train({ Line: "RD", Destination: "Glenmont", Min: "3" }),
@@ -485,8 +527,9 @@ describe("predictions view: 1, 3, 5 trains", () => {
       train({ Line: "BL", Destination: "Franconia-Springfield", Min: "9" }),
     ];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines.length).toBe(6);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    expect(lines.length).toBe(7);
+    expect(lines[lines.length - 1]).toBe("  Serving RED, ORANGE, SILVER, BLUE");
     expectFits(lines);
   });
 });
@@ -508,13 +551,16 @@ describe("predictions view: 8+ trains caps at MAX_VISIBLE_TRAINS", () => {
       train({ Destination: "T-7", Min: "7" }),
     ];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    // header + MAX_VISIBLE_TRAINS body rows = 6
-    expect(lines.length).toBe(1 + MAX_VISIBLE_TRAINS);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    // header + MAX_VISIBLE_TRAINS body rows + 1 quiet footer line = 7
+    expect(lines.length).toBe(1 + MAX_VISIBLE_TRAINS + 1);
     expectFits(lines);
-    // The first body row should be the BRD train; the last should be T-5.
+    // The first body row should be the BRD train; the last *body* row
+    // (before the footer) should be T-5.
     expect(lines[1]).toContain("T-BRD");
     expect(lines[5]).toContain("T-5");
+    // The quiet footer summarises the (single) served line.
+    expect(lines[lines.length - 1]).toBe("  Serving RED");
     // The 12-minute / 9-minute / 7-minute trains should NOT have made it
     // into the visible window.
     for (const l of lines) {
@@ -570,16 +616,53 @@ describe("predictions view: adversarial fixtures", () => {
         trains,
       }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    // Header carries the abbreviated station; every body row carries an
-    // abbreviated destination — none of the raw long names should bleed
-    // through verbatim.
-    expect(lines[0]).not.toContain("African-Amer");
-    for (const l of lines.slice(1)) {
-      expect(l).not.toContain("Town Center");
-      expect(l).not.toContain("National Airport");
-    }
+    // The left destination cell is bounded by DEST_WIDTH=41 — wide
+    // enough that EVERY destination in the fixture renders in full:
+    // "Ronald Reagan Washington National Airport" (41) and "Mt Vernon Sq
+    // 7th St-Convention Center" (37) both fit without a hand-tuned
+    // abbreviation. The test's surviving job is to verify the rows still
+    // fit within LINE_WIDTH (handled by `expectFits`) and that the
+    // rendered text contains the original tokens somewhere on the screen.
+    const allBody = lines.slice(1).join(" ");
+    expect(allBody).toContain("Largo Town Center");
+    expect(allBody).toContain("National Airport");
+    expect(allBody).toContain("Vienna/Fairfax-GMU");
+    expect(allBody).toContain("Wiehle-Reston East");
+  });
+
+  it("keeps every LEFT body cell ≤ 50 chars and every RIGHT value ≤ 10", () => {
+    // The two-column contract: LEFT lives in the full-width body
+    // container (the value overlay starts at x≈466 ≈ col 50) and RIGHT
+    // is the ~110px (~11-char) value overlay. Pin both bounds against an
+    // adversarial render (longest destinations, a pinned summary, a
+    // late-night last-train row) so neither column can silently overflow.
+    const EVENING_CTX: ViewContext = {
+      nowMs: new Date(2026, 4, 18, 22, 30, 0).getTime(),
+    };
+    const trains: Train[] = [
+      train({ Line: "RD", Destination: "Glenmont", Car: "8", Min: "ARR" }),
+      train({ Line: "GR", Destination: "Ronald Reagan Washington National Airport", Car: "8", Min: "12" }),
+      train({ Line: "OR", Destination: "Vienna/Fairfax-GMU", Car: "6", Min: "99" }),
+      train({ Line: "SV", Destination: "Wiehle-Reston East", Car: "8", Min: "BRD" }),
+      train({ Line: "BL", Destination: "Mt Vernon Sq 7th St-Convention Center", Car: "6", Min: "---" }),
+    ];
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        stationName: "U Street/African-Amer Civil War Memorial/Cardozo",
+        trains,
+        pinned: { line: "RD", destination: "Glenmont" },
+        pinnedPosition: { label: "* RD 3 stops away", schematic: "RD -*--@-" },
+        lastTrainToday: [{ line: "RD", time: "11:47p" }],
+      }),
+    );
+    const cols = screen.view(screen.init(), { highlightedIndex: 0 }, EVENING_CTX)
+      .bodyColumns!;
+    expect(cols.left.length).toBe(cols.right.length); // lockstep rows
+    for (const l of cols.left) expect(l.length).toBeLessThanOrEqual(50);
+    for (const r of cols.right) expect(r.length).toBeLessThanOrEqual(10);
   });
 });
 
@@ -588,34 +671,64 @@ describe("predictions view: adversarial fixtures", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderFooter", () => {
-  it("renders an incident headline with the '!' prefix", () => {
+  it("renders an incident headline with a 2-char inset on the first line", () => {
+    // No leading "! " glyph — the bordered footer container is the
+    // visual signal that this section is an alert. Each line is
+    // 2-char inset to match the prefix-width contract. A trailing
+    // period on the (complete) first sentence is stripped so the line
+    // doesn't end on dangling punctuation.
     const out = renderFooter(
       snap({ incidentHeadline: "Single-tracking on RD between A01 and A02." }),
     );
-    expect(out).not.toBeNull();
-    expect(out!.startsWith("! ")).toBe(true);
-    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(out[0]!.startsWith("  ")).toBe(true);
+    expect(out[0]!).toContain("Single-tracking");
+    for (const line of out) expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
   });
 
-  it("returns null when no incident AND no fetch error", () => {
-    expect(renderFooter(snap({}))).toBeNull();
+  it("strips a dangling trailing comma from the final wrapped line", () => {
+    // A truncated first-sentence list fragment ("…Foggy Bottom,") must
+    // not leave a comma orphaned at the end of the footer block.
+    const out = renderFooter(
+      snap({ incidentHeadline: "Delays near Metro Center, Gallery Pl," }),
+    );
+    expect(out[out.length - 1]!.endsWith(",")).toBe(false);
   });
 
-  it("returns null when a fetchError exists but we still have prior data (fetchedAt > 0)", () => {
-    // Stale `?` marker on the clock is sufficient; the footer is
-    // reserved for genuine incidents in that case.
-    expect(
-      renderFooter(snap({ fetchError: "Network down", fetchedAt: NOW - 1000 })),
-    ).toBeNull();
+  it("returns a QUIET served-lines line when no incident AND no fetch error", () => {
+    // The footer container always exists; rather than render an empty
+    // box we surface a quiet served-lines summary derived from the
+    // visible trains (full line names).
+    const out = renderFooter(
+      snap({ trains: [train({ Line: "RD" }), train({ Line: "OR" })] }),
+    );
+    expect(out).toEqual(["  Serving RED, ORANGE"]);
+  });
+
+  it("falls back to a quiet hint when there are no trains to summarise", () => {
+    const out = renderFooter(snap({ trains: [] }));
+    expect(out).toEqual(["  Double-tap for stations"]);
+  });
+
+  it("shows the quiet line (not the error) when a fetchError exists but we still have prior data", () => {
+    // Stale `?` marker on the clock is sufficient for the have-data
+    // case; the footer surfaces the quiet served-lines summary, not the
+    // network error.
+    const out = renderFooter(
+      snap({
+        trains: [train({ Line: "RD" })],
+        fetchError: "Network down",
+        fetchedAt: NOW - 1000,
+      }),
+    );
+    expect(out).toEqual(["  Serving RED"]);
   });
 
   it("surfaces a fetch error in the footer only when we have NO data (fetchedAt=0)", () => {
     const out = renderFooter(
       snap({ fetchError: "Network down", fetchedAt: 0 }),
     );
-    expect(out).not.toBeNull();
-    expect(out!.startsWith("? ")).toBe(true);
-    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(out[0]!.startsWith("? ")).toBe(true);
+    for (const line of out) expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
   });
 });
 
@@ -626,17 +739,17 @@ describe("predictions view: footer presence", () => {
       noopFetcher,
       snap({ trains, incidentHeadline: "Single-tracking RD" }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     // header + 1 train + footer = 3
     expect(lines.length).toBe(3);
-    expect(lines[2]!.startsWith("! ")).toBe(true);
     expect(lines[2]).toContain("Single-tracking RD");
   });
 
-  it("truncates a long incident headline to fit LINE_WIDTH (24 cols)", () => {
-    // 30+ char description that doesn't fit verbatim — the footer must
-    // truncate (with the canonical ellipsis) rather than overflow.
+  it("wraps a long incident headline across multiple footer lines", () => {
+    // 50+ char description that doesn't fit on one line — the footer
+    // wraps across up to FOOTER_MAX_LINES rows (instead of truncating
+    // to one) so the user can actually read the alert.
     const longHeadline =
       "Single-tracking on RD between Foggy Bottom and Rosslyn";
     const trains: Train[] = [train({ Min: "ARR" })];
@@ -644,38 +757,42 @@ describe("predictions view: footer presence", () => {
       noopFetcher,
       snap({ trains, incidentHeadline: longHeadline }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    expect(lines.length).toBe(3);
-    expect(lines[2]!.startsWith("! ")).toBe(true);
-    // The footer line is exactly LINE_WIDTH cols when the headline
-    // overflows, and must terminate with the canonical ellipsis so the
-    // user sees the truncation.
-    expect(lines[2]!.length).toBe(LINE_WIDTH);
-    expect(lines[2]!.endsWith("…")).toBe(true);
+    // header + 1 train + 1-3 footer lines.
+    expect(lines.length).toBeGreaterThanOrEqual(3);
+    expect(lines[2]!.startsWith("  ")).toBe(true);
+    // The full word-set should appear somewhere across the wrapped
+    // footer lines (no information lost when it fits).
+    const footerText = lines.slice(2).join(" ");
+    expect(footerText).toContain("Single-tracking");
+    expect(footerText).toContain("Rosslyn");
   });
 
-  it("hides the footer when incidentHeadline is null (no alert)", () => {
+  it("fills the footer with a quiet served-lines line when incidentHeadline is null", () => {
     // Mirrors what main.ts seeds when the shared incidents cache has no
-    // entries for this station's lines. The footer row is omitted —
-    // not rendered as a blank line — so the body keeps its full budget.
+    // entries for this station's lines. Rather than leave the bordered
+    // footer empty (reads as broken), it carries a quiet served-lines
+    // summary. No "! " alert prefix appears.
     const trains: Train[] = [train({ Min: "ARR" })];
     const screen = makePredictionsScreen(
       noopFetcher,
       snap({ trains, incidentHeadline: null }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    expect(lines.length).toBe(2); // header + 1 train, no footer
+    expect(lines.length).toBe(3); // header + 1 train + quiet footer
+    expect(lines[lines.length - 1]).toBe("  Serving RED");
     for (const l of lines) expect(l.startsWith("! ")).toBe(false);
   });
 
-  it("omits the footer row entirely when there is nothing to surface", () => {
+  it("never leaves the footer empty: a quiet line shows when there's nothing to surface", () => {
     const trains: Train[] = [train({ Min: "ARR" })];
     const screen = makePredictionsScreen(noopFetcher, snap({ trains }));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    expect(lines.length).toBe(2); // header + 1 train, no footer
+    expect(lines.length).toBe(3); // header + 1 train + quiet footer
+    expect(lines[lines.length - 1]).toBe("  Serving RED");
   });
 });
 
@@ -722,6 +839,7 @@ describe("predictions tick", () => {
         trains: fixture,
         incidentHeadline: "Single-tracking RD",
         lastTrainToday: null,
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(
       fetcher,
@@ -765,6 +883,7 @@ describe("predictions tick", () => {
             trains: [],
             incidentHeadline: null,
             lastTrainToday: null,
+        pinnedPosition: null,
           });
     const screen = makePredictionsScreen(
       fetcher,
@@ -791,11 +910,12 @@ describe("predictions tick", () => {
       Promise.resolve({
         trains: [],
         incidentHeadline: null,
-        lastTrainToday: "23:47",
+        lastTrainToday: [{ line: "RD", time: "11:47p" }],
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(fetcher, snap({}));
     const next = await screen.tick(screen.init());
-    expect(next.lastTrainToday).toBe("23:47");
+    expect(next.lastTrainToday).toEqual([{ line: "RD", time: "11:47p" }]);
   });
 
   it("preserves prior lastTrainToday when the fetcher reports null", async () => {
@@ -808,13 +928,14 @@ describe("predictions tick", () => {
         trains: [],
         incidentHeadline: null,
         lastTrainToday: null,
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(
       fetcher,
-      snap({ lastTrainToday: "23:47" }),
+      snap({ lastTrainToday: [{ line: "RD", time: "11:47p" }] }),
     );
     const next = await screen.tick(screen.init());
-    expect(next.lastTrainToday).toBe("23:47");
+    expect(next.lastTrainToday).toEqual([{ line: "RD", time: "11:47p" }]);
   });
 });
 
@@ -858,10 +979,10 @@ describe("pickLastTrainTime", () => {
     expect(
       pickLastTrainTime([
         { Time: "21:30" },
-        { Time: "23:47" },
+        { Time: "11:47p" },
         { Time: "22:15" },
       ]),
-    ).toBe("23:47");
+    ).toBe("11:47p");
   });
 
   it("ignores AM times (they signify the next day per WMATA docs)", () => {
@@ -870,10 +991,10 @@ describe("pickLastTrainTime", () => {
     // tomorrow morning.
     expect(
       pickLastTrainTime([
-        { Time: "23:47" },
+        { Time: "11:47p" },
         { Time: "01:30" },
       ]),
-    ).toBe("23:47");
+    ).toBe("11:47p");
   });
 
   it("returns null when every entry is AM", () => {
@@ -899,22 +1020,63 @@ describe("renderLastTrainRow", () => {
 
   it("returns null before the late-night window", () => {
     expect(
-      renderLastTrainRow(snap({ lastTrainToday: "23:47" }), MORNING),
+      renderLastTrainRow(
+        snap({ lastTrainToday: [{ line: "RD", time: "11:47p" }] }),
+        MORNING,
+      ),
     ).toBeNull();
   });
 
-  it("returns null when lastTrainToday is missing", () => {
-    expect(renderLastTrainRow(snap({ lastTrainToday: null }), EVENING)).toBeNull();
-    expect(renderLastTrainRow(snap({ lastTrainToday: "" }), EVENING)).toBeNull();
+  it("returns null when lastTrainToday is missing or empty", () => {
+    expect(
+      renderLastTrainRow(snap({ lastTrainToday: null }), EVENING),
+    ).toBeNull();
+    expect(
+      renderLastTrainRow(snap({ lastTrainToday: [] }), EVENING),
+    ).toBeNull();
   });
 
-  it("renders `Last train: <12-hour>` when both conditions are met", () => {
+  it("renders single-line form when one bucket is present", () => {
     const out = renderLastTrainRow(
-      snap({ lastTrainToday: "23:47" }),
+      snap({ lastTrainToday: [{ line: "RD", time: "11:47p" }] }),
       EVENING,
     );
-    expect(out).toBe("Last train: 11:47p");
+    expect(out).toBe("Last RED 11:47p");
     expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+  });
+
+  it("renders two-line form ascending by time (earliest-out first)", () => {
+    // OR 22:50 leaves before RD 23:47 — surface OR first so the
+    // user knows the line they have to leave fastest for.
+    const out = renderLastTrainRow(
+      snap({
+        lastTrainToday: [
+          { line: "OR", time: "22:50" },
+          { line: "RD", time: "11:47p" },
+        ],
+      }),
+      EVENING,
+    );
+    expect(out).toBe("Last ORANGE 10:50p  RED 11:47p");
+    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+  });
+
+  it("drops cell #2 for 3+ lines and surfaces overflow count", () => {
+    // 4 lines won't fit in two-cell form ("Last X HH:MM  X HH:MM +N" = 26
+    // chars). The render falls back to single-cell + overflow.
+    const out = renderLastTrainRow(
+      snap({
+        lastTrainToday: [
+          { line: "BL", time: "22:30" },
+          { line: "OR", time: "22:50" },
+          { line: "RD", time: "11:47p" },
+          { line: "SV", time: "23:55" },
+        ],
+      }),
+      EVENING,
+    );
+    expect(out!.length).toBeLessThanOrEqual(LINE_WIDTH);
+    expect(out).toBe("Last BLUE 10:30p +3");
   });
 });
 
@@ -927,12 +1089,16 @@ describe("predictions view: late-night last-train row", () => {
       noopFetcher,
       snap({
         trains: [train({ Line: "RD", Min: "5" })],
-        lastTrainToday: "23:47",
+        lastTrainToday: [{ line: "RD", time: "11:47p" }],
       }),
     );
-    const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), EVENING_CTX));
     expectFits(lines);
-    expect(lines[lines.length - 1]).toBe("Last train: 11:47p");
+    // The last-train row is the final BODY row; the quiet footer line
+    // (served-lines summary) follows it in the flattened output.
+    expect(lines).toContain("Last RED 11:47p");
+    expect(lines[lines.length - 2]).toBe("Last RED 11:47p");
+    expect(lines[lines.length - 1]).toBe("  Serving RED");
   });
 
   it("does NOT append the row before LAST_TRAIN_HOUR", () => {
@@ -941,12 +1107,13 @@ describe("predictions view: late-night last-train row", () => {
       noopFetcher,
       snap({
         trains: [train({ Line: "RD", Min: "5" })],
-        lastTrainToday: "23:47",
+        lastTrainToday: [{ line: "RD", time: "11:47p" }],
       }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.some((l) => l.includes("Last train"))).toBe(false);
+    expect(lines.some((l) => l.includes("Last RD"))).toBe(false);
   });
 
   it("does NOT append the row when lastTrainToday is null (data not loaded yet)", () => {
@@ -955,9 +1122,10 @@ describe("predictions view: late-night last-train row", () => {
       snap({
         trains: [train({ Line: "RD", Min: "5" })],
         lastTrainToday: null,
+        pinnedPosition: null,
       }),
     );
-    const lines = screen.view(screen.init(), initialNav(), EVENING_CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), EVENING_CTX));
     expect(lines.some((l) => l.includes("Last train"))).toBe(false);
   });
 });
@@ -967,20 +1135,29 @@ describe("predictions view: late-night last-train row", () => {
 // ---------------------------------------------------------------------------
 
 describe("predictions: stale check uses ctx.nowMs (not the snapshot)", () => {
-  it("recomputes the stale marker as ctx.nowMs advances and a tick later refreshes fetchedAt", async () => {
+  it("recomputes the clockMarker as ctx.nowMs advances and a tick later refreshes fetchedAt", async () => {
     const T = NOW;
+    // The staleness marker now rides `view(...).clockMarker` (the host
+    // appends it after its own clock), driven by `ctx.nowMs` — not the
+    // header string. We assert the marker through `view`.
+    const markerAt = (
+      s: PredictionsSnapshot,
+      nowMs: number,
+    ): string | undefined => {
+      const screen = makePredictionsScreen(noopFetcher, s);
+      return screen.view(screen.init(), initialNav(), { nowMs }).clockMarker;
+    };
+
     // 1) Snapshot fetched 70s ago — stale relative to T (threshold 60s).
     const s1: PredictionsSnapshot = snap({ fetchedAt: T - 70_000 });
     expect(isStale(s1, T)).toBe(true);
-    const h1 = renderHeader(s1, T);
-    expect(h1.endsWith("*")).toBe(true);
+    expect(markerAt(s1, T)).toBe("*");
 
     // 2) Same snapshot, 5s of wall-clock later (still no fetch). The
     //    host has only run the 1Hz clock tick — the snapshot.fetchedAt
     //    hasn't moved, so the marker MUST still be present.
     expect(isStale(s1, T + 5_000)).toBe(true);
-    const h2 = renderHeader(s1, T + 5_000);
-    expect(h2.endsWith("*")).toBe(true);
+    expect(markerAt(s1, T + 5_000)).toBe("*");
 
     // 3) A fetch tick finally lands and refreshes fetchedAt to T+5s.
     //    From that moment the snapshot is fresh again, so the marker
@@ -990,6 +1167,7 @@ describe("predictions: stale check uses ctx.nowMs (not the snapshot)", () => {
         trains: [],
         incidentHeadline: null,
         lastTrainToday: null,
+        pinnedPosition: null,
       });
     const screen = makePredictionsScreen(fetcher, s1);
     // Pin Date.now() so the tick stamps fetchedAt deterministically.
@@ -998,9 +1176,7 @@ describe("predictions: stale check uses ctx.nowMs (not the snapshot)", () => {
       const s2 = await screen.tick(s1);
       expect(s2.fetchedAt).toBe(T + 5_000);
       expect(isStale(s2, T + 5_000)).toBe(false);
-      const h3 = renderHeader(s2, T + 5_000);
-      expect(h3.endsWith("*")).toBe(false);
-      expect(h3.endsWith("?")).toBe(false);
+      expect(markerAt(s2, T + 5_000)).toBe("");
     } finally {
       dateNow.mockRestore();
     }
@@ -1102,10 +1278,11 @@ describe("predictions: clock decoupled from fetch (hung-fetch regression)", () =
       // every one because the rendered minute changes each step.
       expect(upgrades.length).toBeGreaterThanOrEqual(5);
 
-      // Each rendered first line is the header; pull the clock substring
-      // out and check they're strictly increasing in minutes. Header
-      // shape: "<name padded> h:mma*"  (the snapshot is stale because
-      // `fetchedAt === 0`, so the `*` marker is present.)
+      // The clock now lives in the host's own container, so each 1Hz
+      // tick re-pushes just the clock cell ("<h:mma>*", with the `*`
+      // staleness marker since `fetchedAt === 0`). The last upgrade per
+      // tick is that clock string — pull the HH:MM substring out and
+      // check the rendered minutes advance.
       const minutes = renderedClocks
         .map((line) => line.match(/(\d{1,2}):(\d{2})/))
         .filter((m): m is RegExpMatchArray => m !== null)
@@ -1136,35 +1313,42 @@ describe("predictions view snapshot: 3 trains at Metro Center", () => {
       noopFetcher,
       snap({ stationName: "Metro Center", trains }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
 
     expectFits(lines);
-    // Exact-pin against the canonical render. Cells (24 cols total):
-    //   header:    name(17) + " " + clock(6)
-    //   body row:  glyph(2) + " " + dest(11) + " " + cars(2) + " " + eta(6)
+    // Exact-pin against the canonical render. The body is now TWO
+    // columns; `flattenSections` reconstructs a flat row as
+    //   padRight(left, FLAT_LEFT_COLS) + right
+    // (the device positions the two real containers by pixel). The LEFT
+    // cell is `inset(2) + glyph(6) + " " + destination` (left-aligned,
+    // un-padded); the RIGHT value is `cars + " " + right-aligned ETA`.
     //
-    // The first train carries the `>` cursor in place of its second
-    // glyph char (v1.2 pin-a-train default cursor — TAP affordance).
+    // The first train carries the `>` cursor in place of its last glyph
+    // char (v1.2 pin-a-train default cursor — TAP affordance).
+    // RD → "RED" → padRight("RED",6).slice(0,5)+">" = "RED  >"
+    // The footer is never empty: with no incident it carries the quiet
+    // served-lines summary (distinct full line names in ETA order).
     expect(lines).toEqual([
-      "Metro Center       2:32p",
-      "R> Shady Grove 6c    ARR",
-      "RD Glenmont    8c  3 min",
-      "OR Vienna      6c  5 min",
+      "Metro Center",
+      padRight("  RED  > Shady Grove", FLAT_LEFT_COLS) + "6c    ARR",
+      padRight("  RED    Glenmont", FLAT_LEFT_COLS) + "8c  3 min",
+      padRight("  ORANGE Vienna/Fairfax-GMU", FLAT_LEFT_COLS) + "6c  5 min",
+      "  Serving RED, ORANGE",
     ]);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
-    expect(lines[1]!.length).toBe(LINE_WIDTH);
-    expect(lines[2]!.length).toBe(LINE_WIDTH);
-    expect(lines[3]!.length).toBe(LINE_WIDTH);
+    // Each zipped body row = FLAT_LEFT_COLS (left) + the right value.
+    expect(lines[1]!.length).toBe(FLAT_LEFT_COLS + "6c    ARR".length);
+    expect(lines[2]!.length).toBe(FLAT_LEFT_COLS + "8c  3 min".length);
+    expect(lines[3]!.length).toBe(FLAT_LEFT_COLS + "6c  5 min".length);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Snapshot pin: 3 trains + a non-null incidentHeadline → 5-line render
-// with the truncated `! …` footer row at the tail.
+// Snapshot pin: 3 trains + a non-null incidentHeadline → 6-line render
+// with the wrapped `!`-prefixed footer block at the tail.
 // ---------------------------------------------------------------------------
 
 describe("predictions view snapshot: 3 trains + incident footer", () => {
-  it("matches the exact line array including the truncated footer", () => {
+  it("matches the exact line array including the wrapped footer block", () => {
     const trains: Train[] = [
       train({ Line: "RD", Destination: "Shady Grove", Car: "6", Min: "ARR" }),
       train({ Line: "RD", Destination: "Glenmont", Car: "8", Min: "3" }),
@@ -1175,24 +1359,25 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
       snap({
         stationName: "Metro Center",
         trains,
-        // Long enough to force truncation: "! " (2) + 22 chars of the
-        // input + "…" (1) = 24. With the headline below, the rendered
-        // footer fills exactly to LINE_WIDTH and ends with `…`.
+        // 42-char headline fits on one line at width=54 (LINE_WIDTH-2
+        // for the "! " prefix). No wrap needed at the new column
+        // budget.
         incidentHeadline: "Single-tracking on RD between Foggy Bottom",
       }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
+    // Two-column body rows zip to padRight(left, FLAT_LEFT_COLS) + right
+    // (see the canonical 3-train snapshot above). The incident footer is
+    // the 3rd section, unchanged.
     expect(lines).toEqual([
-      "Metro Center       2:32p",
-      "R> Shady Grove 6c    ARR",
-      "RD Glenmont    8c  3 min",
-      "OR Vienna      6c  5 min",
-      "! Single-tracking on RD…",
+      "Metro Center",
+      padRight("  RED  > Shady Grove", FLAT_LEFT_COLS) + "6c    ARR",
+      padRight("  RED    Glenmont", FLAT_LEFT_COLS) + "8c  3 min",
+      padRight("  ORANGE Vienna/Fairfax-GMU", FLAT_LEFT_COLS) + "6c  5 min",
+      "  Single-tracking on RD between Foggy Bottom",
     ]);
-    expect(lines[4]!.length).toBe(LINE_WIDTH);
-    expect(lines[4]!.startsWith("! ")).toBe(true);
-    expect(lines[4]!.endsWith("…")).toBe(true);
+    expect(lines[4]!.startsWith("  ")).toBe(true);
   });
 });
 
@@ -1201,22 +1386,25 @@ describe("predictions view snapshot: 3 trains + incident footer", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderTrainRow: cursor + pin markers", () => {
+  // The marker glyph rides the LEFT cell exactly as before — only the
+  // row's shape changed (now {left,right}).
   it("renders the full line glyph when no marker is supplied", () => {
     const out = renderTrainRow(train({ Line: "RD" }));
-    expect(out.startsWith("RD")).toBe(true);
-    expect(out.length).toBe(LINE_WIDTH);
+    // The left cell is prefixed with a 2-char body inset for visual
+    // nesting. RD → "RED" → padRight("RED",6) = "RED   "
+    expect(out.left.startsWith("  RED   ")).toBe(true);
   });
 
-  it("replaces the second glyph char with `*` for a pinned train", () => {
+  it("replaces the last glyph char with `*` for a pinned train", () => {
     const out = renderTrainRow(train({ Line: "RD" }), "*");
-    expect(out.startsWith("R*")).toBe(true);
-    expect(out.length).toBe(LINE_WIDTH);
+    // RD → "RED" → padRight("RED",6).slice(0,5)+`*` = "RED  *"
+    expect(out.left.startsWith("  RED  *")).toBe(true);
   });
 
-  it("replaces the second glyph char with `>` for the cursor target", () => {
+  it("replaces the last glyph char with `>` for the cursor target", () => {
     const out = renderTrainRow(train({ Line: "OR" }), ">");
-    expect(out.startsWith("O>")).toBe(true);
-    expect(out.length).toBe(LINE_WIDTH);
+    // OR → "ORANGE" → padRight("ORANGE",6).slice(0,5)+`>` = "ORANG>"
+    expect(out.left.startsWith("  ORANG>")).toBe(true);
   });
 });
 
@@ -1261,7 +1449,7 @@ describe("renderPinRow", () => {
     expect(out).toBeNull();
   });
 
-  it("renders `* <line> <dest> <eta>` at exactly LINE_WIDTH", () => {
+  it("splits `* <line> <dest>` into the left cell and the ETA into the right", () => {
     const visible = [
       train({ Line: "RD", Destination: "Glenmont", Min: "3" }),
     ];
@@ -1270,11 +1458,228 @@ describe("renderPinRow", () => {
       visible,
     );
     expect(out).not.toBeNull();
-    expect(out!.length).toBe(LINE_WIDTH);
-    expect(out!).toContain("RD");
-    expect(out!).toContain("Glenmont");
-    expect(out!).toContain("3 min");
-    expect(out!.startsWith("* ")).toBe(true);
+    // Left: "* " marker (doubles as the body inset) + line glyph cell +
+    // the (un-padded) destination. Right: the right-aligned ETA value.
+    expect(out!.left).toContain("RED");
+    expect(out!.left).toContain("Glenmont");
+    expect(out!.left.startsWith("* ")).toBe(true);
+    expect(out!.right).toContain("3 min");
+    expect(out!.right.length).toBeLessThanOrEqual(10);
+  });
+
+  it("puts the `(gone)` tag in the left cell with no right value", () => {
+    // The one-tick gone latch: the pinned train rolled off but the pin
+    // hasn't been cleared yet. "(gone)" is prose (no ETA value).
+    const visible = [train({ Line: "RD", Destination: "Shady Grove", Min: "3" })];
+    const out = renderPinRow(
+      snap({
+        pinned: { line: "RD", destination: "Glenmont" },
+        pinnedGone: true,
+      }),
+      visible,
+    );
+    expect(out).not.toBeNull();
+    expect(out!.left).toContain("(gone)");
+    expect(out!.left.startsWith("* ")).toBe(true);
+    expect(out!.right).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pinnedDistancePhrase — extract the position phrase from a label
+// ---------------------------------------------------------------------------
+
+describe("pinnedDistancePhrase", () => {
+  it("extracts and tightens the 'N stops away' phrase", () => {
+    expect(pinnedDistancePhrase("* RD 3 stops away", "RD")).toBe("3 stops");
+  });
+
+  it("keeps singular '1 stop' tidy", () => {
+    expect(pinnedDistancePhrase("* RD 1 stop away", "RD")).toBe("1 stop");
+  });
+
+  it("maps 'at this station' to the compact 'at station'", () => {
+    expect(pinnedDistancePhrase("* OR at this station", "OR")).toBe("at station");
+  });
+
+  it("passes 'approaching' through", () => {
+    expect(pinnedDistancePhrase("* SV approaching", "SV")).toBe("approaching");
+  });
+
+  it("returns null for the fallback `* <line> <destination>` form", () => {
+    // When the train can't be located, resolvePinnedPosition emits the
+    // bare destination as the label — there's no position phrase.
+    expect(pinnedDistancePhrase("* RD Glenmont", "RD")).toBeNull();
+  });
+
+  it("returns null for empty / malformed labels", () => {
+    expect(pinnedDistancePhrase("", "RD")).toBeNull();
+    expect(pinnedDistancePhrase("* RD ", "RD")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderPinnedSummary — the COMPACT merged pinned line (clip fix)
+// ---------------------------------------------------------------------------
+
+describe("renderPinnedSummary", () => {
+  it("returns null when nothing is pinned", () => {
+    expect(renderPinnedSummary(snap({}), [])).toBeNull();
+  });
+
+  it("returns null when the pinned train isn't visible", () => {
+    const visible = [train({ Line: "RD", Destination: "Glenmont", Min: "3" })];
+    expect(
+      renderPinnedSummary(
+        snap({ pinned: { line: "BL", destination: "Largo" } }),
+        visible,
+      ),
+    ).toBeNull();
+  });
+
+  it("merges line + dest + distance into the left cell, ETA into the right", () => {
+    const visible = [train({ Line: "RD", Destination: "Glenmont", Min: "3" })];
+    const out = renderPinnedSummary(
+      snap({
+        pinned: { line: "RD", destination: "Glenmont" },
+        pinnedPosition: { label: "* RD 3 stops away", schematic: "RD -*--@-" },
+      }),
+      visible,
+    )!;
+    expect(out).not.toBeNull();
+    // Left: full line name (consistency rule), the destination, and the
+    // compact distance phrase in parens — no separate "N stops away" row,
+    // no ASCII schematic row. Right: the ETA value.
+    expect(out.left).toBe("* RED Glenmont (3 stops)");
+    expect(out.right).toBe("3 min");
+    // Uses the FULL line name, never the "RD" abbreviation.
+    expect(out.left).not.toContain("RD");
+  });
+
+  it("drops the parenthetical when there's no resolvable position phrase", () => {
+    const visible = [train({ Line: "OR", Destination: "Vienna", Min: "5" })];
+    const out = renderPinnedSummary(
+      snap({
+        pinned: { line: "OR", destination: "Vienna" },
+        // Fallback label (train not locatable) → no phrase.
+        pinnedPosition: { label: "* OR Vienna", schematic: "OR -*-" },
+      }),
+      visible,
+    )!;
+    expect(out.left).toBe("* ORANGE Vienna");
+    expect(out.left).not.toContain("(");
+    expect(out.right).toBe("5 min");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderFooterQuiet — the gentle non-empty footer fallback
+// ---------------------------------------------------------------------------
+
+describe("renderFooterQuiet", () => {
+  it("summarises distinct served lines (full names, ETA order, 2-char inset)", () => {
+    const out = renderFooterQuiet([
+      train({ Line: "RD" }),
+      train({ Line: "RD" }), // dup collapses
+      train({ Line: "OR" }),
+    ]);
+    expect(out).toBe("  Serving RED, ORANGE");
+  });
+
+  it("falls back to a quiet hint when no revenue lines are present", () => {
+    expect(renderFooterQuiet([])).toBe("  Double-tap for stations");
+    // Unknown line codes ("--") don't count as served lines.
+    expect(renderFooterQuiet([train({ Line: "ZZ" })])).toBe(
+      "  Double-tap for stations",
+    );
+  });
+
+  it("stays within SAFE-text bounds even with all six lines", () => {
+    const out = renderFooterQuiet([
+      train({ Line: "RD" }),
+      train({ Line: "OR" }),
+      train({ Line: "BL" }),
+      train({ Line: "SV" }),
+      train({ Line: "GR" }),
+      train({ Line: "YL" }),
+    ]);
+    expect(out.length).toBeLessThanOrEqual(LINE_WIDTH);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// view: dense pinned + live-position state FITS the body (clip regression)
+// ---------------------------------------------------------------------------
+
+describe("predictions view: pinned + live position is compact (no clip)", () => {
+  function trains3(): Train[] {
+    return [
+      train({ Line: "RD", Destination: "Shady Grove", Car: "6", Min: "ARR" }),
+      train({ Line: "RD", Destination: "Glenmont", Car: "8", Min: "3" }),
+      train({ Line: "OR", Destination: "Vienna", Car: "6", Min: "5" }),
+    ];
+  }
+
+  it("renders the merged summary + 3 trains within the 5-row body (+footer)", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        stationName: "Metro Center",
+        trains: trains3(),
+        pinned: { line: "RD", destination: "Glenmont" },
+        pinnedPosition: {
+          label: "* RD 3 stops away",
+          schematic: "RD -*--@--------------",
+        },
+      }),
+    );
+    const sections = screen.view(screen.init(), { highlightedIndex: 1 }, CTX);
+    // The two-column body is the source of truth now (`body` is []). The
+    // BODY must fit the 5-row container: 1 merged pinned summary + 3
+    // train rows = 4 rows (≤ 5). The old layout pushed a summary row, a
+    // "N stops away" row, a schematic row AND 3 train rows = 6 → clip.
+    const left = sections.bodyColumns!.left;
+    const right = sections.bodyColumns!.right;
+    expect(left.length).toBe(4);
+    expect(right.length).toBe(4); // left/right stay in lockstep
+    expect(left.length).toBeLessThanOrEqual(5);
+    // First body row is the merged compact summary (left + ETA value).
+    expect(left[0]!).toBe("* RED Glenmont (3 stops)");
+    expect(right[0]!).toBe("3 min");
+    // The crude ASCII schematic row is gone from the dense view.
+    expect(left.some((l) => l.includes("-*--@"))).toBe(false);
+    expect(left.some((l) => l.includes("@"))).toBe(false);
+    // Every line still fits the column budget.
+    expectFits(flattenSections(sections));
+    // The pinned train's own body row still carries the `*` marker.
+    expect(
+      left.some((l) => l.startsWith("  RED  *") && l.includes("Glenmont")),
+    ).toBe(true);
+  });
+
+  it("uses full line names everywhere (no 'RD'/'OR' abbreviations on screen)", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: trains3(),
+        pinned: { line: "RD", destination: "Glenmont" },
+        pinnedPosition: {
+          label: "* RD 3 stops away",
+          schematic: "RD -*--@--------------",
+        },
+      }),
+    );
+    const lines = flattenSections(
+      screen.view(screen.init(), { highlightedIndex: 1 }, CTX),
+    );
+    const blob = lines.join("\n");
+    // The body must never surface the 2-letter line codes — full names
+    // only (the abbreviations only live in the internal label/schematic
+    // data, which we no longer render in this dense view).
+    expect(blob).not.toContain("RD ");
+    expect(blob).not.toContain("OR ");
+    expect(blob).toContain("RED");
+    expect(blob).toContain("ORANGE");
   });
 });
 
@@ -1289,13 +1694,14 @@ describe("predictions view: pin + cursor rendering", () => {
 
   it("marks the cursor target with `>` and no pin when nothing pinned", () => {
     const screen = makePredictionsScreen(noopFetcher, snap({ trains: trains() }));
-    const lines = screen.view(
+    const lines = flattenSections(screen.view(
       screen.init(),
       { highlightedIndex: 1 },
       CTX,
-    );
+    ));
     // header at 0; trains start at index 1 with no pin row.
-    const cursorRow = lines.find((l) => l.startsWith("R>"));
+    // RD + ">" marker → "RED  >" so row starts "  RED  >"
+    const cursorRow = lines.find((l) => l.startsWith("  RED  >"));
     expect(cursorRow).toBeDefined();
     expect(cursorRow).toContain("Glenmont");
   });
@@ -1308,16 +1714,17 @@ describe("predictions view: pin + cursor rendering", () => {
         pinned: { line: "OR", destination: "Vienna" },
       }),
     );
-    const lines = screen.view(
+    const lines = flattenSections(screen.view(
       screen.init(),
       { highlightedIndex: 0 },
       CTX,
-    );
+    ));
     // Pin row appears under the header (line index 1).
     expect(lines[1]).toMatch(/^\* /);
     expect(lines[1]).toContain("Vienna");
-    // The OR/Vienna row in the body carries `O*` marker.
-    expect(lines.some((l) => l.startsWith("O*") && l.includes("Vienna"))).toBe(
+    // The OR/Vienna row in the body carries `ORANG*` marker.
+    // OR → "ORANGE" → padRight("ORANGE",6).slice(0,5)+"*" = "ORANG*"
+    expect(lines.some((l) => l.startsWith("  ORANG*") && l.includes("Vienna"))).toBe(
       true,
     );
   });
@@ -1372,6 +1779,10 @@ describe("predictions reduce: pin + cursor", () => {
     expect(r.snapshot?.pinned).toEqual({
       line: "RD",
       destination: "Glenmont",
+      // WP-I extends the pin shape with the destination code (used
+      // to match `/TrainPositions/TrainPositions` entries). Test
+      // fixtures use `DestinationCode: null` so it's null here.
+      destinationCode: null,
     });
   });
 
@@ -1409,5 +1820,178 @@ describe("predictions reduce: pin + cursor", () => {
       { type: "SCROLL_DOWN" },
     );
     expect(r.nav.highlightedIndex).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bucketLastTrainsByLine (WP-J)
+// ---------------------------------------------------------------------------
+
+describe("bucketLastTrainsByLine", () => {
+  it("buckets entries by destination → line and picks the latest PM time", () => {
+    const lastTrains = [
+      { Time: "23:30", DestinationStation: "GLN" }, // RD
+      { Time: "11:47p", DestinationStation: "SHA" }, // RD (later — wins for RD)
+      { Time: "00:12", DestinationStation: "VIE" }, // OR — AM, skipped
+      { Time: "22:50", DestinationStation: "VIE" }, // OR (latest PM)
+    ];
+    const destToLine = new Map<string, string>([
+      ["GLN", "RD"],
+      ["SHA", "RD"],
+      ["VIE", "OR"],
+    ]);
+    const out = bucketLastTrainsByLine(lastTrains, destToLine);
+    expect(out).toEqual([
+      { line: "OR", time: "22:50" }, // earliest-departing first
+      { line: "RD", time: "11:47p" },
+    ]);
+  });
+
+  it("returns [] when no entry maps to a known line", () => {
+    const out = bucketLastTrainsByLine(
+      [{ Time: "23:30", DestinationStation: "GLN" }],
+      new Map(),
+    );
+    expect(out).toEqual([]);
+  });
+
+  it("skips AM-time entries (next-day per WMATA docs)", () => {
+    const out = bucketLastTrainsByLine(
+      [
+        { Time: "00:30", DestinationStation: "GLN" }, // AM, skipped
+        { Time: "11:47p", DestinationStation: "GLN" },
+      ],
+      new Map<string, string>([["GLN", "RD"]]),
+    );
+    expect(out).toEqual([{ line: "RD", time: "11:47p" }]);
+  });
+
+  it("skips malformed time entries", () => {
+    const out = bucketLastTrainsByLine(
+      [
+        { Time: "", DestinationStation: "GLN" },
+        { Time: "bad", DestinationStation: "GLN" },
+        { Time: "11:47p", DestinationStation: "GLN" },
+      ],
+      new Map<string, string>([["GLN", "RD"]]),
+    );
+    expect(out).toEqual([{ line: "RD", time: "11:47p" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-M opt-in cursor
+// ---------------------------------------------------------------------------
+
+describe("predictions: opt-in cursor (WP-M)", () => {
+  function trains3(): Train[] {
+    return [
+      train({ Line: "RD", Destination: "Shady Grove", Min: "5" }),
+      train({ Line: "RD", Destination: "Glenmont", Min: "8" }),
+      train({ Line: "OR", Destination: "Vienna", Min: "10" }),
+    ];
+  }
+
+  it("hides the `>` cursor when cursorVisible is false", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: false }),
+    );
+    const lines = flattenSections(screen.view(screen.init(), { highlightedIndex: 0 }, CTX));
+    // None of the train rows should carry the ">" marker glyph.
+    // RD + ">" → "RED  >" so the row starts "  RED  >"
+    expect(lines.some((l) => l.startsWith("  RED  >"))).toBe(false);
+  });
+
+  it("shows the cursor again once cursorVisible is true", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: true }),
+    );
+    const lines = flattenSections(screen.view(screen.init(), { highlightedIndex: 0 }, CTX));
+    // RD + ">" → "RED  >" so the row starts "  RED  >"
+    expect(lines.some((l) => l.startsWith("  RED  >"))).toBe(true);
+  });
+
+  it("a first SCROLL flips cursorVisible to true via the reducer", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: false }),
+    );
+    const r = screen.reduce(
+      snap({ trains: trains3(), cursorVisible: false }),
+      { highlightedIndex: 0 },
+      { type: "SCROLL_DOWN" },
+    );
+    expect(r.snapshot?.cursorVisible).toBe(true);
+  });
+
+  it("a TAP also flips cursorVisible (the user has engaged)", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: trains3(), cursorVisible: false }),
+    );
+    const r = screen.reduce(
+      snap({ trains: trains3(), cursorVisible: false }),
+      { highlightedIndex: 0 },
+      { type: "TAP" },
+    );
+    expect(r.snapshot?.cursorVisible).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-M "pinned-train gone" state machine
+// ---------------------------------------------------------------------------
+
+describe("predictions: pinned-train gone (WP-M)", () => {
+  function trainsWithGlenmont(): Train[] {
+    return [train({ Line: "RD", Destination: "Glenmont", Min: "5" })];
+  }
+  function trainsWithoutGlenmont(): Train[] {
+    return [train({ Line: "RD", Destination: "Shady Grove", Min: "5" })];
+  }
+
+  it("renders `(gone)` when the pinned train rolled off + pinnedGone is set", () => {
+    const screen = makePredictionsScreen(
+      noopFetcher,
+      snap({
+        trains: trainsWithoutGlenmont(),
+        pinned: { line: "RD", destination: "Glenmont" },
+        pinnedGone: true,
+      }),
+    );
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    expect(lines.some((l) => l.includes("(gone)"))).toBe(true);
+  });
+
+  it("the first tick after a roll-off sets pinnedGone (one-tick latch)", async () => {
+    // First tick: trains has the pinned train → no gone.
+    // Second tick: trains drops the pinned train → pinnedGone latched.
+    let mode: "have" | "gone" = "have";
+    const fetcher = (): Promise<PredictionsFetchResult> =>
+      Promise.resolve({
+        trains: mode === "have" ? trainsWithGlenmont() : trainsWithoutGlenmont(),
+        incidentHeadline: null,
+        lastTrainToday: null,
+        pinnedPosition: null,
+      });
+    const screen = makePredictionsScreen(
+      fetcher,
+      snap({ pinned: { line: "RD", destination: "Glenmont" } }),
+    );
+    let s = screen.init();
+    s = await screen.tick(s);
+    expect(s.pinnedGone).toBe(false);
+    expect(s.pinned).not.toBeNull();
+    // Roll off.
+    mode = "gone";
+    s = await screen.tick(s);
+    expect(s.pinnedGone).toBe(true);
+    expect(s.pinned).not.toBeNull(); // not yet cleared
+    // Second consecutive miss → auto-clear.
+    s = await screen.tick(s);
+    expect(s.pinnedGone).toBe(false);
+    expect(s.pinned).toBeNull();
   });
 });

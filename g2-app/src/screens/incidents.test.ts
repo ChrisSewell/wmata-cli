@@ -16,9 +16,10 @@
 //     instead of the empty-state copy.
 
 import { describe, expect, it } from "vitest";
-import { LINE_WIDTH } from "../ui/render";
+import { LINE_WIDTH, SAFE_TEXT_WIDTH } from "../ui/render";
 import type { RailIncident } from "../wmata";
-import { initialNav, type ViewContext } from "./router";
+import {
+  flattenSections, initialNav, type ViewContext } from "./router";
 import {
   MAX_DESC_LINES,
   STALE_THRESHOLD_MS,
@@ -32,6 +33,8 @@ import {
   makeInitialIncidentsSnapshot,
   renderGlyphRow,
   renderHeader,
+  stalenessMarker,
+  trimTrailingSeparators,
   wrap,
   type IncidentsFetchResult,
   type IncidentsSnapshot,
@@ -164,20 +167,20 @@ describe("capDescription", () => {
 
 describe("renderGlyphRow", () => {
   it("renders 1-4 codes verbatim with the `! ` warning prefix", () => {
-    expect(renderGlyphRow(["RD"])).toBe("! RD");
-    expect(renderGlyphRow(["RD", "BL"])).toBe("! RD BL");
-    expect(renderGlyphRow(["RD", "BL", "OR"])).toBe("! RD BL OR");
-    expect(renderGlyphRow(["RD", "BL", "OR", "SV"])).toBe("! RD BL OR SV");
+    expect(renderGlyphRow(["RD"])).toBe("RED");
+    expect(renderGlyphRow(["RD", "BL"])).toBe("RED BLUE");
+    expect(renderGlyphRow(["RD", "BL", "OR"])).toBe("RED BLUE ORANGE");
+    expect(renderGlyphRow(["RD", "BL", "OR", "SV"])).toBe("RED BLUE ORANGE SILVER");
   });
 
   it("collapses 5+ codes to `+N`", () => {
     expect(renderGlyphRow(["RD", "BL", "YL", "OR", "GR"])).toBe(
-      "! RD BL YL OR +1",
+      "RED BLUE YELLOW ORANGE +1",
     );
   });
 
   it("renders `! --` when no codes are present", () => {
-    expect(renderGlyphRow([])).toBe("! --");
+    expect(renderGlyphRow([])).toBe("--");
   });
 });
 
@@ -190,15 +193,16 @@ describe("formatIncidentBlock", () => {
     const block = formatIncidentBlock(
       incident({ LinesAffected: "BL;", Description: "Hello world." }),
     );
-    expect(block[0]).toBe("! BL");
-    expect(block.slice(1).join(" ")).toContain("Hello world.");
+    expect(block[0]).toBe("BLUE");
+    // Trailing period is stripped from the final fragment line.
+    expect(block.slice(1).join(" ")).toContain("Hello world");
   });
 
   it("drops the description block when Description is empty", () => {
     const block = formatIncidentBlock(
       incident({ LinesAffected: "BL;", Description: "" }),
     );
-    expect(block).toEqual(["! BL"]);
+    expect(block).toEqual(["BLUE"]);
   });
 
   it("drops the description block when Description is whitespace-only", () => {
@@ -207,7 +211,7 @@ describe("formatIncidentBlock", () => {
     const block = formatIncidentBlock(
       incident({ LinesAffected: "BL;", Description: "   \t  " }),
     );
-    expect(block).toEqual(["! BL"]);
+    expect(block).toEqual(["BLUE"]);
   });
 
   it("does not crash when Description is null (defensive)", () => {
@@ -219,7 +223,7 @@ describe("formatIncidentBlock", () => {
       ...inc,
       Description: null,
     } as unknown as RailIncident;
-    expect(formatIncidentBlock(corrupted)).toEqual(["! BL"]);
+    expect(formatIncidentBlock(corrupted)).toEqual(["BLUE"]);
   });
 
   it("does not crash when Description is undefined (defensive)", () => {
@@ -228,14 +232,14 @@ describe("formatIncidentBlock", () => {
       ...inc,
       Description: undefined,
     } as unknown as RailIncident;
-    expect(formatIncidentBlock(corrupted)).toEqual(["! BL"]);
+    expect(formatIncidentBlock(corrupted)).toEqual(["BLUE"]);
   });
 
   it("silently drops unknown line codes from the glyph row", () => {
     const block = formatIncidentBlock(
       incident({ LinesAffected: "BL;XX;SV;", Description: "" }),
     );
-    expect(block).toEqual(["! BL SV"]);
+    expect(block).toEqual(["BLUE SILVER"]);
   });
 });
 
@@ -264,49 +268,81 @@ describe("isStale", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderHeader", () => {
-  it("renders `ALERTS (n)` + clock at exactly LINE_WIDTH cols", () => {
-    const out = renderHeader(makeSnap([incident()]), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("ALERTS (1)")).toBe(true);
-    expect(out.endsWith("2:32p")).toBe(true);
+  // The header is now the section TITLE ONLY — the host renders the wall
+  // clock + staleness marker in its own dedicated top-right container, so
+  // neither appears in the header string. The marker is asserted via
+  // `view(...).clockMarker` in the dedicated block below.
+  it("renders `ALERTS (n)` as the title only (no clock)", () => {
+    const out = renderHeader(makeSnap([incident()]));
+    expect(out).toBe("ALERTS (1)");
+    expect(out).not.toContain(":");
   });
 
   it("renders `ALERTS` (no count) when there are 0 incidents", () => {
-    const out = renderHeader(makeSnap([]), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("ALERTS ")).toBe(true);
+    const out = renderHeader(makeSnap([]));
+    expect(out).toBe("ALERTS");
     expect(out).not.toContain("(0)");
   });
 
-  it("appends `*` when the snapshot is older than STALE_THRESHOLD_MS", () => {
+  it("does not embed a stale marker even when older than STALE_THRESHOLD_MS", () => {
     const out = renderHeader(
       makeSnap([incident()], { fetchedAt: NOW - (STALE_THRESHOLD_MS + 5_000) }),
-      NOW,
     );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.endsWith("2:32p*")).toBe(true);
+    expect(out).toBe("ALERTS (1)");
+    expect(out).not.toContain("*");
   });
 
-  it("fits at n=99 (two-digit count) in 24 cols with a clock", () => {
-    // ALERTS (99) is 11 cols; clock " 2:32p" is 6; spacing fills the rest.
-    const incs = Array.from({ length: 99 }, (_, i) =>
-      incident({ IncidentID: `${i}` }),
-    );
-    const out = renderHeader(makeSnap(incs), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("ALERTS (99)")).toBe(true);
-    expect(out.endsWith("2:32p")).toBe(true);
-  });
-
-  it("fits at n=999 (three-digit count) in 24 cols with a clock", () => {
-    // ALERTS (999) is 12 cols; clock " 2:32p" is 6; spacing fills the rest.
+  it("keeps the title within the 50-col budget at n=999 (three-digit count)", () => {
     const incs = Array.from({ length: 999 }, (_, i) =>
       incident({ IncidentID: `${i}` }),
     );
-    const out = renderHeader(makeSnap(incs), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("ALERTS (999)")).toBe(true);
-    expect(out.endsWith("2:32p")).toBe(true);
+    const out = renderHeader(makeSnap(incs));
+    expect(out).toBe("ALERTS (999)");
+    expect(out.length).toBeLessThanOrEqual(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// view().clockMarker — staleness escalation now rides the host clock cell
+// ---------------------------------------------------------------------------
+
+describe("incidents view: clockMarker staleness escalation", () => {
+  const markerFor = (
+    incidents: RailIncident[],
+    over: Partial<IncidentsSnapshot>,
+    nowMs = NOW,
+  ): string | undefined => {
+    const screen = makeIncidentsScreen(noopFetcher, makeSnap(incidents, over));
+    return screen.view(screen.init(), initialNav(), { nowMs }).clockMarker;
+  };
+
+  it("is empty for fresh data with no failures", () => {
+    expect(markerFor([incident()], { fetchedAt: NOW })).toBe("");
+  });
+
+  it("is '*' when the snapshot is older than STALE_THRESHOLD_MS", () => {
+    expect(
+      markerFor([incident()], { fetchedAt: NOW - (STALE_THRESHOLD_MS + 5_000) }),
+    ).toBe("*");
+  });
+
+  it("is '*' / '**' / '?' as consecutive fetch failures escalate", () => {
+    expect(
+      markerFor([incident()], { consecutiveFetchFailures: 1, fetchError: "x" }),
+    ).toBe("*");
+    expect(
+      markerFor([incident()], { consecutiveFetchFailures: 2, fetchError: "x" }),
+    ).toBe("**");
+    expect(
+      markerFor([incident()], { consecutiveFetchFailures: 3, fetchError: "x" }),
+    ).toBe("?");
+  });
+
+  // Sanity: the view marker matches the standalone `stalenessMarker`.
+  it("matches the standalone stalenessMarker helper", () => {
+    const over = { consecutiveFetchFailures: 2, fetchError: "x" };
+    const snap = makeSnap([incident()], over);
+    expect(markerFor([incident()], over)).toBe(stalenessMarker(snap, NOW));
   });
 });
 
@@ -315,19 +351,22 @@ describe("renderHeader", () => {
 // ---------------------------------------------------------------------------
 
 describe("incidents view: empty state", () => {
-  it("pins EXACTLY 5 lines for the friendly empty-state copy", () => {
+  it("pins EXACTLY 4 lines for the friendly empty-state copy", () => {
     const screen = makeIncidentsScreen(noopFetcher, makeSnap([]));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
     expectFits(lines);
+    // Header is now the bare title — the host renders the clock in its
+    // own container, so the flattened view output has no clock.
     expect(lines).toEqual([
-      "ALERTS             2:32p",
-      "No active alerts on",
-      "your lines.",
+      "ALERTS",
+      "All your lines running normally.",
       "",
       "(double-tap to return)",
     ]);
-    expect(lines.length).toBe(5);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
+    expect(lines.length).toBe(4);
+    // Fresh data → no staleness marker on the host clock cell.
+    expect(sections.clockMarker).toBe("");
   });
 });
 
@@ -341,13 +380,16 @@ describe("incidents view: 1 incident, short description", () => {
       incident({ LinesAffected: "BL;", Description: "Train OK." }),
     ];
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(incs));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.length).toBe(3); // header + glyph row + 1-line description
     expect(lines.some((l) => l === "▴")).toBe(false);
     expect(lines.some((l) => l === "▾")).toBe(false);
-    expect(lines[1]).toBe("  ! BL");
-    expect(lines[2]).toBe("  Train OK.");
+    expect(lines[1]).toBe("  BLUE");
+    // Description has a 2-char inner inset (so the section gutter
+    // plus the inset is 4 chars). The trailing period is stripped so
+    // the fragment doesn't read as a clipped sentence.
+    expect(lines[2]).toBe("    Train OK");
   });
 });
 
@@ -358,14 +400,17 @@ describe("incidents view: 1 incident, short description", () => {
 describe("incidents view: 1 incident, very long description", () => {
   it("wraps to ≤ MAX_DESC_LINES lines and ends the last line with `…` when cut", () => {
     // Description deliberately long enough to overflow the
-    // MAX_DESC_LINES cap (~120+ chars worth of words).
+    // MAX_DESC_LINES cap at the current SAFE_TEXT_WIDTH=58, desc wrap
+    // width=54 (SAFE_TEXT_WIDTH minus the 2-col gutter and 2-col inset).
     const long =
       "Single tracking between Foggy Bottom and Rosslyn due to a disabled train. " +
       "Expect significant delays on Orange, Blue, and Silver Line trains for the next two hours. " +
-      "Shuttle buses are available at Court House, Clarendon, and Ballston for affected riders.";
+      "Shuttle buses are available at Court House, Clarendon, and Ballston for affected riders. " +
+      "Customers travelling toward Largo Town Center should consider rerouting via Yellow Line. " +
+      "Additional service disruptions may affect the Blue Line at Pentagon City and Crystal City.";
     const incs = [incident({ Description: long })];
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(incs));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     // The visible body lines that look like description (not the glyph
     // row, not the header, not edge markers) cap at MAX_DESC_LINES.
@@ -402,7 +447,7 @@ const FIVE_INCIDENTS: RailIncident[] = [
 describe("incidents view: 5 incidents — scrolling required", () => {
   it("initial render: `▾` is present, `▴` is not", () => {
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(FIVE_INCIDENTS));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     // Header + 7 body rows (= USABLE_ROWS budget).
     expect(lines.length).toBe(1 + 7);
@@ -417,7 +462,7 @@ describe("incidents view: 5 incidents — scrolling required", () => {
     for (let i = 0; i < 10; i++) {
       nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
     }
-    const lines = screen.view(screen.init(), nav, CTX);
+    const lines = flattenSections(screen.view(screen.init(), nav, CTX));
     expectFits(lines);
     expect(lines.some((l) => l === "▴")).toBe(true);
   });
@@ -452,7 +497,7 @@ describe("incidents view: 5 incidents — scrolling required", () => {
     for (let i = 0; i < 5; i++) {
       nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
     }
-    const lines = screen.view(screen.init(), nav, CTX);
+    const lines = flattenSections(screen.view(screen.init(), nav, CTX));
     expectFits(lines);
     expect(lines.some((l) => l === "▴")).toBe(true);
     expect(lines.some((l) => l === "▾")).toBe(true);
@@ -475,15 +520,16 @@ describe("incidents view: unknown LineCodes drop silently", () => {
       }),
     ];
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(incs));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    // The glyph row should NOT contain XX or QQ.
-    const glyphRow = lines.find((l) => l.includes("!"));
+    // The glyph row (the body row that starts with `BLUE`) should not
+    // contain the unknown codes XX or QQ.
+    const glyphRow = lines.find((l) => l.trimStart().startsWith("BLUE"));
     expect(glyphRow).toBeDefined();
     expect(glyphRow).not.toContain("XX");
     expect(glyphRow).not.toContain("QQ");
-    expect(glyphRow).toContain("BL");
-    expect(glyphRow).toContain("SV");
+    expect(glyphRow).toContain("BLUE");
+    expect(glyphRow).toContain("SILVER");
   });
 });
 
@@ -492,13 +538,15 @@ describe("incidents view: unknown LineCodes drop silently", () => {
 // ---------------------------------------------------------------------------
 
 describe("incidents view: stale marker uses ctx.nowMs", () => {
-  it("renders `*` after the clock when fetchedAt is 130s in the past", () => {
+  it("surfaces `*` via clockMarker when fetchedAt is 130s in the past", () => {
     const T = NOW;
     const snap = makeSnap([incident()], { fetchedAt: T - 130_000 });
     const screen = makeIncidentsScreen(noopFetcher, snap);
-    const lines = screen.view(screen.init(), initialNav(), { nowMs: T });
-    expectFits(lines);
-    expect(lines[0]!.endsWith("2:32p*")).toBe(true);
+    // The marker now rides the host clock cell (`clockMarker`), driven by
+    // `ctx.nowMs`, not the header string.
+    const sections = screen.view(screen.init(), initialNav(), { nowMs: T });
+    expectFits(flattenSections(sections));
+    expect(sections.clockMarker).toBe("*");
   });
 });
 
@@ -513,33 +561,33 @@ describe("incidents view: first-load fetch error", () => {
       fetchError: "Could not connect.",
     });
     const screen = makeIncidentsScreen(noopFetcher, snap);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.some((l) => l.includes("Couldn't reach WMATA"))).toBe(true);
     expect(lines.some((l) => l.includes("No active alerts"))).toBe(false);
   });
 
-  it("pins the EXACT 5-line first-load error body", () => {
+  it("pins the EXACT 4-line first-load error body", () => {
     // Symmetric with the empty-state pin: lock the lines verbatim so a
     // future copy change has to update this test on purpose. The
-    // clock carries a trailing `?` because fetchedAt=0 with an active
+    // `clockMarker` carries a `?` because fetchedAt=0 with an active
     // error is the strongest degraded state — see `stalenessMarker`.
     const snap = makeSnap([], {
       fetchedAt: 0,
       fetchError: "Could not connect.",
     });
     const screen = makeIncidentsScreen(noopFetcher, snap);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
     expectFits(lines);
     expect(lines).toEqual([
-      "ALERTS            2:32p?",
-      "Couldn't reach WMATA.",
-      "Will retry shortly.",
+      "ALERTS",
+      "Couldn't reach WMATA. Will retry shortly.",
       "",
       "(double-tap to return)",
     ]);
-    expect(lines.length).toBe(5);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
+    expect(lines.length).toBe(4);
+    expect(sections.clockMarker).toBe("?");
   });
 });
 
@@ -549,37 +597,28 @@ describe("incidents view: first-load fetch error", () => {
 
 describe("incidents view: stale-marker escalation", () => {
   // One incident in the snapshot so we exercise the "data exists, just
-  // degrading" branches (the no-data + error case is locked above).
+  // degrading" branches (the no-data + error case is locked above). The
+  // marker rides `view(...).clockMarker` now, not the header string.
   const oneIncident = (): RailIncident => incident();
-
-  it("shows '*' after one consecutive failure", () => {
+  const markerFor = (failures: number): string | undefined => {
     const snap = makeSnap([oneIncident()], {
-      consecutiveFetchFailures: 1,
+      consecutiveFetchFailures: failures,
       fetchError: "transient",
     });
     const screen = makeIncidentsScreen(noopFetcher, snap);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines[0]!.endsWith("2:32p*")).toBe(true);
+    return screen.view(screen.init(), initialNav(), CTX).clockMarker;
+  };
+
+  it("shows '*' after one consecutive failure", () => {
+    expect(markerFor(1)).toBe("*");
   });
 
   it("shows '**' after two consecutive failures", () => {
-    const snap = makeSnap([oneIncident()], {
-      consecutiveFetchFailures: 2,
-      fetchError: "transient",
-    });
-    const screen = makeIncidentsScreen(noopFetcher, snap);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines[0]!.endsWith("2:32p**")).toBe(true);
+    expect(markerFor(2)).toBe("**");
   });
 
   it("shows '?' after three or more consecutive failures", () => {
-    const snap = makeSnap([oneIncident()], {
-      consecutiveFetchFailures: 3,
-      fetchError: "transient",
-    });
-    const screen = makeIncidentsScreen(noopFetcher, snap);
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines[0]!.endsWith("2:32p?")).toBe(true);
+    expect(markerFor(3)).toBe("?");
   });
 });
 
@@ -623,22 +662,20 @@ describe("incidents view snapshot: 1 incident with a multi-line desc", () => {
       }),
     ];
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(incs));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const sections = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(sections);
     expectFits(lines);
-    // The wrapper packs greedily into 22-col lines. We compute the
-    // expected block via the same helpers used by the impl so the pin
-    // stays in lock-step with the wrap rules — but we ALSO assert the
-    // exact rendered lines explicitly so a future change to the wrap
-    // rules surfaces as a test failure.
+    // The wrapper packs greedily into 22-col lines. We assert the exact
+    // rendered lines explicitly so a future change to the wrap rules
+    // surfaces as a test failure. The header is now the bare title — the
+    // host renders the clock in its own container.
     expect(lines).toEqual([
-      "ALERTS (1)         2:32p",
-      "  ! BL OR SV",
-      "  Single-tracking",
-      "  between Foggy Bottom",
-      "  and Rosslyn due to a",
-      "  disabled train.",
+      "ALERTS (1)",
+      "  BLUE ORANGE SILVER",
+      "    Single-tracking between Foggy Bottom and Rosslyn due",
+      "    to a disabled train",
     ]);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
+    expect(sections.clockMarker).toBe("");
   });
 });
 
@@ -660,7 +697,7 @@ describe("incidents tick", () => {
     expect(next.incidents).toEqual(incs);
     expect(next.fetchError).toBeNull();
     expect(next.preformatted.length).toBe(1);
-    expect(next.preformatted[0]![0]).toBe("! RD");
+    expect(next.preformatted[0]![0]).toBe("RED");
   });
 
   it("never throws: a rejected fetcher stores the error on the snapshot", async () => {
@@ -754,9 +791,9 @@ describe("makeInitialIncidentsSnapshot", () => {
       fetchError: null,
     });
     expect(snap.preformatted.length).toBe(2);
-    expect(snap.preformatted[0]![0]).toBe("! RD");
+    expect(snap.preformatted[0]![0]).toBe("RED");
     // Second incident has no description -> single-row block.
-    expect(snap.preformatted[1]).toEqual(["! BL"]);
+    expect(snap.preformatted[1]).toEqual(["BLUE"]);
   });
 });
 
@@ -768,13 +805,13 @@ describe("flattenBlocks", () => {
   it("indents each row with 2 spaces and inserts a blank-string separator between incidents", () => {
     const blocks = [
       ["! RD", "Inc one."],
-      ["! BL", "Inc two."],
+      ["BL", "Inc two."],
     ];
     expect(flattenBlocks(blocks)).toEqual([
       "  ! RD",
       "  Inc one.",
       "",
-      "  ! BL",
+      "  BL",
       "  Inc two.",
     ]);
   });
@@ -782,5 +819,71 @@ describe("flattenBlocks", () => {
   it("emits no trailing separator on the last block", () => {
     const blocks = [["! RD"]];
     expect(flattenBlocks(blocks)).toEqual(["  ! RD"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// trimTrailingSeparators
+// ---------------------------------------------------------------------------
+
+describe("trimTrailingSeparators", () => {
+  it("strips a dangling comma / semicolon / period", () => {
+    expect(trimTrailingSeparators("disabled train,")).toBe("disabled train");
+    expect(trimTrailingSeparators("Train OK.")).toBe("Train OK");
+    expect(trimTrailingSeparators("a; b;")).toBe("a; b");
+  });
+  it("leaves interior separators untouched", () => {
+    expect(trimTrailingSeparators("plat, west side")).toBe("plat, west side");
+  });
+  it("strips trailing separators together with trailing whitespace", () => {
+    expect(trimTrailingSeparators("foo , ")).toBe("foo");
+  });
+  it("returns the input unchanged when there's no trailing separator", () => {
+    expect(trimTrailingSeparators("Rosslyn")).toBe("Rosslyn");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overflow invariant: no rendered body line exceeds SAFE_TEXT_WIDTH
+// ---------------------------------------------------------------------------
+
+describe("incidents view: SAFE_TEXT_WIDTH overflow invariant", () => {
+  it("keeps every rendered body line at or below SAFE_TEXT_WIDTH real chars", () => {
+    // Worst-case fixtures: a 4-line affected-lines header plus prose
+    // long enough to exercise the greedy wrap. This is the regression
+    // guard for the orphan-word overflow ("to a" / "crews" at col 0).
+    const incs = [
+      incident({
+        IncidentID: "1",
+        LinesAffected: "RD;",
+        Description:
+          "Trains single-tracking between Tenleytown and Bethesda due to a disabled train.",
+      }),
+      incident({
+        IncidentID: "2",
+        LinesAffected: "BL; OR; SV;",
+        Description:
+          "Trains experiencing delays approaching Foggy Bottom while crews clear an earlier mechanical problem near Rosslyn.",
+      }),
+      incident({
+        IncidentID: "3",
+        LinesAffected: "RD; BL; YL; OR;",
+        Description: "Residual delays in both directions.",
+      }),
+    ];
+    const screen = makeIncidentsScreen(noopFetcher, makeSnap(incs));
+    // Walk the full scroll range so every body row is rendered at least
+    // once across the windows. The header row (index 0) is excluded:
+    // it is intentionally space-padded to LINE_WIDTH for right-aligned
+    // clock placement, and trailing spaces are the narrowest glyph (they
+    // never overflow). Only real-text body rows must respect the cap.
+    let nav = initialNav();
+    for (let step = 0; step < 30; step++) {
+      const lines = flattenSections(screen.view(screen.init(), nav, CTX));
+      for (const line of lines.slice(1)) {
+        expect(line.length).toBeLessThanOrEqual(SAFE_TEXT_WIDTH);
+      }
+      nav = screen.reduce(screen.init(), nav, { type: "SCROLL_DOWN" }).nav;
+    }
   });
 });

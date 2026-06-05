@@ -5,44 +5,41 @@
 // 20-second cadence; stale or errored data degrades visibly (a `*` after
 // the clock, an optional footer note) rather than blanking the HUD.
 //
-// Layout (24 cols × up to 7 usable rows):
+// Layout (TRUE two-column body — see `ScreenSections.bodyColumns`):
 //
-//   col:   0         1         2
-//   col:   0123456789012345678901234
-//          Metro Center      14:32
-//          RD Shady Grv   6c    ARR
-//          RD Glenmont    8c   3 min
-//          OR Vienna      6c   5 min
-//          SV Wiehle      8c   7 min
-//          BL Franc-Spr   6c   9 min
-//          ! Single-tracking RD
+//          Metro Center                              14:32
+//          RED    Shady Grv                       6c    ARR
+//          RED    Glenmont                        8c   3 min
+//          ORANGE Vienna                          6c   5 min
+//          SILVER Wiehle                          8c   7 min
+//          BLUE   Franc-Spr                       6c   9 min
+//          Single-tracking RD
 //
 // Empty state (0 trains):
 //
-//          Metro Center      14:32
+//          Metro Center                              14:32
 //          No trains predicted.
 //          (double-tap to exit)
 //
-// Body row column budget (no list-selection prefix here):
-//   - 2 cols   line glyph (`lineGlyph(line)`)
-//   - 1 col    space
-//   - 11 cols  abbreviated destination
-//   - 1 col    space
-//   - 2 cols   cars (`{n}c`)
-//   - 1 col    space
-//   - 6 cols   ETA, right-aligned (fits "12 min" exactly)
-//   - total = 24 cols
+// Body two-column model (`bodyColumns = { left, right }`):
+//   - LEFT  : the 2-char body inset + the 6-wide line-name glyph cell
+//             (with cursor/pin marker behaviour) + the Title-Case
+//             destination, LEFT-ALIGNED and NOT padded to a fixed cell.
+//             Because the G2 font is variable-width, padding a value
+//             column with spaces never aligns; instead the host renders
+//             LEFT in the full-width body container.
+//   - RIGHT : the cars+ETA value, e.g. "6c   ARR" / "8c  3 min" — a
+//             short (≤ ~10-char) string the host overlays in a
+//             borderless container at a FIXED pixel x (≈466). Every
+//             right line therefore starts at the same x: a genuinely
+//             pixel-aligned value column regardless of the destination's
+//             glyph width. Rows with no value (last-train prose, the
+//             empty/loading cues, blank separators) carry right = "".
 //
-// Why a 6-col ETA cell (not 5 with a trimmed "12m"): keeping the canonical
-// `formatEta` output ("12 min") matches the rest of the app and the user's
-// mental model of WMATA timetables. The cost is shrinking the destination
-// from 12 to 11 cols, which is still wide enough for every entry in
-// `STATION_ABBREVIATIONS` (longest map value is "Tenleytown" at 10 chars).
-//
-// Header row (24 cols):
-//   - 17 cols  abbreviated station name
+// Header row (40 cols):
+//   - 34 cols  station name (fits "Foggy Bottom-GWU" in full)
 //   - 1 col    space
-//   - 6 cols   12-hour wall clock (+ optional `*` stale marker that
+//   - 5 cols   "HH:MM" wall clock (+ optional `*` stale marker that
 //              consumes one column from the name budget when present).
 //
 // PURITY: This module has no SDK imports and does no I/O of its own. The
@@ -53,34 +50,84 @@
 // (a fetch tick AND an independent 1Hz clock tick) and is the only
 // file that touches `Date.now()`.
 
-import type { Train } from "../wmata";
-import { LINE_WIDTH, padLeft, padRight, truncate } from "../ui/render";
-import { abbreviateStation, formatEta, lineGlyph } from "../ui/format";
+import type { StandardRoute, Train } from "../wmata";
+import {
+  ELLIPSIS,
+  LINE_WIDTH,
+  SAFE_TEXT_WIDTH,
+  padLeft,
+  padRight,
+  truncate,
+  wrapText,
+} from "../ui/render";
+import {
+  abbreviateStation,
+  formatEta,
+  lineGlyph,
+  lineName,
+  toTitleCase,
+} from "../ui/format";
+import {
+  buildLineStations,
+  findNearestStationToCircuit,
+  renderLineSchematic,
+  stationsBetween,
+} from "../ui/schematic";
 import type {
   ReduceResult,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
+
+// The canonical HUD clock formatter now lives in `../ui/format` (the host
+// renders it in its own dedicated top-right container). Re-export it here
+// so existing `import { formatClock } from "./predictions"` call sites
+// (notably the test suite) keep resolving.
+export { formatClock } from "../ui/format";
 
 // ---------------------------------------------------------------------------
 // Column budget constants
 // ---------------------------------------------------------------------------
 
-/** Width of the line-glyph cell on a body row. */
-const GLYPH_WIDTH = 2;
-/** Width of the destination cell on a body row. */
-const DEST_WIDTH = 11;
+/** Width of the line-name cell on a body row. Sized for the widest
+ *  spelled-out WMATA line name ("YELLOW" / "ORANGE" / "SILVER" = 6). */
+const GLYPH_WIDTH = 6;
+/** Upper bound (in chars) for a destination on a LEFT body cell. The
+ *  destination is left-aligned and NOT padded in the two-column body —
+ *  this only bounds `abbreviateStation` so an over-long name can't push
+ *  the left column past its safe width. The value column is a separate,
+ *  pixel-aligned overlay (`RIGHT`), so the destination no longer needs a
+ *  fixed-width cell to align the ETA.
+ *
+ *  Sized at 41 so the left cell — inset(2) + glyph(6) + " "(1) + dest —
+ *  tops out at 50 chars (the value overlay sits at x≈466 ≈ col 50). 41
+ *  is also wide enough to render even the longest real WMATA
+ *  destinations in full ("Ronald Reagan Washington National Airport" =
+ *  41, "Mt Vernon Sq 7th St-Convention Center" = 37) without falling
+ *  back to a hand-tuned abbreviation. */
+const DEST_WIDTH = 41;
 /** Width of the cars cell ("6c" / "8c"). */
 const CARS_WIDTH = 2;
 /** Width of the ETA cell — sized to fit "12 min". */
 const ETA_WIDTH = 6;
-/** Width of the station-name cell in the header. */
-const HEADER_NAME_WIDTH = 17;
-// Clock cell is fixed at 6 cols (12-hour " h:mma" / "hh:mma") plus an
-// optional 1- or 2-col stale marker; no constant needed because we
-// never reference the width outside `renderHeader` where the cell
-// composition is open-coded for readability.
+
+/**
+ * One body row, split into its two pixel-aligned columns:
+ *   - `left`  goes in the full-width body container (line glyph cell +
+ *             destination / prose / cue).
+ *   - `right` is the value the host overlays at a FIXED x (the cars+ETA
+ *             cell, or a bare ETA). "" for rows with no value.
+ *
+ * `flattenSections` (router.ts) zips a row back to a flat string via
+ * `padRight(left, FLAT_LEFT_COLS) + right`, so the right string must
+ * stay short (≤ ~10 chars — the overlay is ~110px ≈ 11 chars).
+ */
+export interface BodyRow {
+  left: string;
+  right: string;
+}
 
 /** Maximum number of predictions rendered as body rows. */
 export const MAX_VISIBLE_TRAINS = 5;
@@ -113,32 +160,108 @@ export function shouldShowLastTrain(nowMs: number): boolean {
 }
 
 /**
- * Pick the latest "HH:mm" string from a list of `StationTrainTime`s.
- * Returns `null` for an empty list.
+ * Parse a WMATA time string into a normalised 24-hour "HH:MM" string
+ * suitable for lexicographic comparison.
  *
- * Comparison is lexicographic-on-"HH:mm" because the format is
- * zero-padded — `"08:32" < "23:47"` reads correctly as a string
- * comparison. WMATA's `LastTrains` array may include AM times that
- * actually mean "next day" (per docs), and those will sort EARLIEST
- * by this comparison; we accept that for the v1.2 ship and just
- * surface the latest PM time, which is the user-facing "last train".
+ * WMATA's LastTrains API mixes two formats in the same response:
+ *   "22:15"  — 24-hour, no suffix  (plain PM departure)
+ *   "11:47p" — 12-hour with "p" PM suffix  (= 23:47 in 24h)
+ *   "01:30"  — 24-hour, no suffix, h < 12  (next-day AM train, skip)
+ *
+ * Returns `null` for empty, malformed, or unparseable input.
+ */
+function normalizeTo24h(time: string): string | null {
+  if (typeof time !== "string" || time.length === 0) return null;
+  const isPm = time.endsWith("p");
+  const isAm = time.endsWith("a");
+  const base = isPm || isAm ? time.slice(0, -1) : time;
+  const colon = base.indexOf(":");
+  if (colon < 0) return null;
+  const hh = parseInt(base.slice(0, colon), 10);
+  const mm = parseInt(base.slice(colon + 1), 10);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  let h24: number;
+  if (isPm) {
+    // 12-hour PM: 12p stays 12; 1p..11p map to 13..23.
+    h24 = hh === 12 ? 12 : hh + 12;
+  } else if (isAm) {
+    // 12-hour AM: 12a = 0; 1a..11a = 1..11.
+    h24 = hh === 12 ? 0 : hh;
+  } else {
+    // 24-hour format.
+    h24 = hh;
+  }
+  return String(h24).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+}
+
+/**
+ * Pick the time string (in its original form) representing the latest
+ * PM departure from a list of `StationTrainTime`s. Returns `null` for
+ * an empty list or one where every entry is AM / malformed.
+ *
+ * Handles both WMATA 24-hour ("22:15") and 12-hour-suffixed ("11:47p")
+ * formats. AM entries (next-day per WMATA docs) are skipped — the
+ * user-facing "last train" is the latest PM departure.
  */
 export function pickLastTrainTime(
   times: ReadonlyArray<{ Time: string }>,
 ): string | null {
   let best: string | null = null;
+  let bestNorm: string | null = null;
   for (const t of times) {
-    if (typeof t.Time !== "string" || t.Time.length === 0) continue;
-    // Skip AM times — they're "next day" per the WMATA docs, not
-    // "later today". A late-evening user wants the latest PM
-    // departure, not tomorrow morning's first AM run that happens
-    // to spill into the LastTrains array.
-    const hh = parseInt(t.Time.slice(0, 2), 10);
-    if (!Number.isFinite(hh)) continue;
-    if (hh < 12) continue;
-    if (best === null || t.Time > best) best = t.Time;
+    const norm = normalizeTo24h(t.Time);
+    if (norm === null) continue;
+    const hh = parseInt(norm.slice(0, 2), 10);
+    if (hh < 12) continue; // AM = next-day train, skip
+    if (bestNorm === null || norm > bestNorm) {
+      best = t.Time;
+      bestNorm = norm;
+    }
   }
   return best;
+}
+
+/**
+ * Bucket a list of `LastTrains[]` entries by their destination's
+ * primary line, then pick the latest PM time per bucket. The
+ * `destToLine` map resolves `LastTrains[].DestinationStation` (a
+ * station code) to the served-line that destination belongs to —
+ * usually `LineCode1`, walked-through-1..4 for multi-line termini.
+ *
+ * Returns one entry per line that has at least one PM departure
+ * for this station, sorted by 24-hour time ascending so the
+ * earliest-out line surfaces first in the render.
+ *
+ * Handles both WMATA 24-hour ("22:15") and 12-hour-suffixed ("11:47p")
+ * formats. The stored `time` field preserves the original string.
+ *
+ * Used by `main.ts:readLastTrainToday` (WP-J).
+ */
+export function bucketLastTrainsByLine(
+  lastTrains: ReadonlyArray<{ Time: string; DestinationStation: string }>,
+  destToLine: ReadonlyMap<string, string>,
+): LastTrainByLine[] {
+  // Track both the original string and its normalised 24h form per line.
+  const byLine = new Map<string, { time: string; norm: string }>();
+  for (const t of lastTrains) {
+    const norm = normalizeTo24h(t.Time);
+    if (norm === null) continue;
+    const hh = parseInt(norm.slice(0, 2), 10);
+    if (hh < 12) continue; // AM = next-day train, skip
+    const line = destToLine.get(t.DestinationStation);
+    if (!line) continue;
+    const existing = byLine.get(line);
+    if (!existing || norm > existing.norm) byLine.set(line, { time: t.Time, norm });
+  }
+  const out: LastTrainByLine[] = [];
+  for (const [line, { time }] of byLine) out.push({ line, time });
+  // Sort by normalised 24h time ascending — earliest-departing first.
+  out.sort((a, b) => {
+    const na = normalizeTo24h(a.time) ?? "";
+    const nb = normalizeTo24h(b.time) ?? "";
+    return na.localeCompare(nb);
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,13 +273,42 @@ export interface PredictionsFetchResult {
   trains: Train[];
   incidentHeadline: string | null;
   /**
-   * "HH:mm" of today's last scheduled departure from this station,
-   * across all destinations served. `null` when the schedule fetch
-   * failed or the station isn't in the schedule data. Driven by the
-   * Session's lazy-cached `getStationTimes` so the wire fetch happens
-   * at most once per glasses session.
+   * Per-line last-train summary for tonight. Each entry is the
+   * latest PM departure on that line from this station. Empty
+   * array means "no schedule data tonight" (e.g. schedule fetch
+   * failed); `null` means "fetcher hasn't populated this yet".
+   *
+   * WP-J: this replaces v1.2's single-time form. Per-line gives
+   * commuters the right "which line is gone first" signal at a
+   * glance.
    */
-  lastTrainToday: string | null;
+  lastTrainToday: LastTrainByLine[] | null;
+  /**
+   * Resolved live-position data for the pinned train (WP-I). Only
+   * populated when:
+   *   1. The user has a pin (`snapshot.pinned !== null`)
+   *   2. TrainPositions has a matching train (same Line +
+   *      DestinationStationCode)
+   *   3. StandardRoutes has resolved (lazy session cache)
+   *
+   * Otherwise `null` — the schematic + "N stops away" affordance
+   * hides.
+   */
+  pinnedPosition: PinnedPosition | null;
+}
+
+/** Resolved position info for the pinned train. */
+export interface PinnedPosition {
+  /** Schematic row, exactly LINE_WIDTH cols. Renders below the pin. */
+  schematic: string;
+  /** "<N> stops away" / "at this station" / "approaching" label. */
+  label: string;
+}
+
+/** Per-line last-train time. `line` is a `LineCode`; `time` is "HH:mm". */
+export interface LastTrainByLine {
+  line: string;
+  time: string;
 }
 
 /** Data the Predictions screen renders against. */
@@ -187,13 +339,14 @@ export interface PredictionsSnapshot {
    */
   incidentHeadline: string | null;
   /**
-   * Last scheduled departure from this station today, `"HH:mm"`. Only
-   * rendered after the late-evening cutoff (see
-   * `shouldShowLastTrain`); rendered as a `"Last train: 23:47"` row
-   * appended to the body. `null` when the schedule lookup hasn't
-   * landed or the station isn't in the data.
+   * Per-line last-train summary for tonight. Only rendered after
+   * the late-evening cutoff (see `shouldShowLastTrain`). `null`
+   * means "schedule fetch hasn't landed yet"; an empty array means
+   * "loaded but no data for tonight"; a populated array surfaces
+   * one cell per line. Sourced from `main.ts:readLastTrainToday`,
+   * which buckets `LastTrains[]` by destination → line.
    */
-  lastTrainToday: string | null;
+  lastTrainToday: LastTrainByLine[] | null;
   /**
    * If non-null, the user has TAP-pinned a specific (line,
    * destination) pair to track. The screen renders a single-line
@@ -202,40 +355,47 @@ export interface PredictionsSnapshot {
    * "*" cursor in place of its line-glyph cell.
    *
    * WMATA predictions don't carry a stable `TrainId`, so a pin is
-   * identified by (Line + Destination). If multiple trains match
-   * (a busy commute window with two RD-Glenmont trains stacked),
-   * the FIRST match in the sorted list wins for cursor + summary
-   * display.
+   * identified by (Line + Destination). The optional
+   * `destinationCode` (from `Train.DestinationCode` at pin time)
+   * lets WP-I match against `/TrainPositions/TrainPositions` —
+   * which only carries the station code, not the short name.
    *
    * `null` = no pin. Reset on remount (the pin doesn't persist
    * across navigations — the user explicitly chose it for this
    * Predictions session).
    */
-  pinned: { line: string; destination: string } | null;
+  pinned: {
+    line: string;
+    destination: string;
+    destinationCode?: string | null;
+  } | null;
+  /**
+   * Live position of the pinned train, resolved via
+   * `/TrainPositions/TrainPositions` + `/StandardRoutes` (WP-I).
+   * `null` when no pin, no match, or StandardRoutes hasn't
+   * resolved yet.
+   */
+  pinnedPosition: PinnedPosition | null;
+  /**
+   * True iff the user has explicitly scrolled (or pinned) on this
+   * screen mount. The Predictions cursor is hidden by default
+   * (WP-M opt-in cursor) so the at-rest render stays glanceable;
+   * the first SCROLL or pin makes it visible.
+   */
+  cursorVisible: boolean;
+  /**
+   * True for one render after the pinned train rolled off the
+   * predictions list. Renders `* RD Glnmt (gone)` and clears the
+   * pin on the NEXT tick. Avoids silently dropping the pin —
+   * the user gets visual confirmation that their tracked train
+   * departed.
+   */
+  pinnedGone: boolean;
 }
 
 // ---------------------------------------------------------------------------
 // Pure helpers — exported for the test suite
 // ---------------------------------------------------------------------------
-
-/**
- * Format an epoch-ms timestamp as a 12-hour clock string. Output is
- * fixed-width 6 chars: hour (space-padded 1-12), ":", minutes
- * (zero-padded), and a single-letter "a"/"p" suffix — e.g. ` 9:05a`,
- * `12:32p`. We render via `Date` slot getters rather than
- * `toLocaleTimeString` so the output is identical across browsers /
- * Node / the on-glasses runtime regardless of locale settings.
- */
-export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
-  const d = new Date(epochMs);
-  const h24 = d.getHours();
-  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
-  const hh = String(h12).padStart(2, " ");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ap = h24 < 12 ? "a" : "p";
-  return `${hh}:${mm}${ap}`;
-}
 
 /**
  * True if either the last fetch errored OR the last successful fetch is
@@ -287,79 +447,82 @@ export function stalenessMarker(
 }
 
 /**
- * Render the header row: `<station name> <HH:MM>[stale-marker]`.
+ * Render the header row: the station TITLE ONLY, left-aligned.
  *
- * When the data is stale or the fetch is degrading we append a 1- or
- * 2-char marker after the clock as a glanceable "this is old" cue
- * (the panel is greyscale, so we can't actually dim). The marker
- * consumes its width from the station-name budget — long names lose
- * one or two characters of breathing room while degraded, which is
- * acceptable.
- *
- * `nowMs` is the host-supplied wall clock (`ViewContext.nowMs`). The
- * header re-renders every second via the host's clock tick so the
- * "HH:MM" string and stale marker stay live regardless of fetch state.
+ * The host now renders the wall clock (and the staleness marker — see
+ * `clockMarker` on `ScreenSections`) in its own dedicated top-right
+ * container, identically on every screen. So the header no longer embeds
+ * the clock or the marker; it's just the station name, truncated so it
+ * can't collide with the clock container (which starts at x≈486px ≈
+ * column 50). The staleness marker is surfaced via `view()`'s
+ * `clockMarker` field instead.
  */
-export function renderHeader(
-  snapshot: PredictionsSnapshot,
-  nowMs: number,
-): string {
-  const marker = stalenessMarker(snapshot, nowMs);
-  const clockStr = formatClock(nowMs);
-  const clockCell = clockStr + marker; // 5, 6, or 7 chars
-  // Steal one col from the name per marker char so the total never
-  // exceeds LINE_WIDTH. `**` shrinks the name budget by 2.
-  const nameBudget = Math.max(1, HEADER_NAME_WIDTH - marker.length);
-  const name = padRight(
-    abbreviateStation(snapshot.stationName, nameBudget),
-    nameBudget,
-  );
-  // name(nameBudget) + " "(1) + clockCell(6..8) = 24 by construction.
-  return name + " " + clockCell;
+export function renderHeader(snapshot: PredictionsSnapshot): string {
+  return truncate(abbreviateStation(toTitleCase(snapshot.stationName), 50), 50);
 }
 
 /**
- * Render a single body row.
+ * Render a single train body row as its two pixel-aligned columns.
  *
- * Width contract: returns a string of exactly `LINE_WIDTH` columns. The
- * destination cell is left-aligned (`padRight`), the cars and ETA cells
- * are right-aligned-or-padded so the visual rhythm of the column lines up
- * across rows.
+ *   left  = "  " + <glyph cell> + " " + <Title-Case destination>
+ *   right = <cars> + " " + <right-aligned ETA>     e.g. "6c   ARR"
  *
- * `marker` is an optional 1-char glyph that replaces the line code's
- * SECOND character (so the line is still readable as just the first
- * letter):
- *   - undefined / "" → no marker; full 2-char line glyph
+ * The destination is left-aligned and NOT padded to a fixed cell: the
+ * value column is the host's borderless RIGHT overlay at a fixed pixel x,
+ * so the ETA aligns regardless of how wide the destination's glyphs are.
+ * That removes the variable-width misalignment a space-padded cell had.
+ *
+ * `marker` is an optional 1-char glyph that replaces the line cell's
+ * LAST character (so the line is still readable from its first letters)
+ * — this stays in the LEFT cell exactly as before:
+ *   - undefined / "" → no marker; full line-name glyph cell
  *   - "*"            → pinned train (kept across ticks)
  *   - ">"            → cursor highlight (TAP target)
  *
- * Why steal the second glyph char and not pad somewhere else: the
- * existing 24-col layout has no slack. The first letter of the line
- * code is enough signal once the user knows they're on Red / Orange
- * / Blue — and the marker is more informative than the second
- * letter at the moment they need it (pinning / selecting a row).
+ * Why steal the last glyph char and not pad somewhere else: the marker
+ * is more informative than a trailing line-name letter at the moment the
+ * user needs it (pinning / selecting a row), and keeping it in the line
+ * cell preserves the v1.2 pin-a-train convention.
  */
 export function renderTrainRow(
   train: Train,
   marker: "" | "*" | ">" = "",
-): string {
-  const fullGlyph = lineGlyph(train.Line);
+): BodyRow {
+  // Spelled-out line name ("RED" / "BLUE" / "YELLOW" …); the 2-char
+  // `lineGlyph` fallback ("--") covers unknown / blank codes.
+  const code = lineGlyph(train.Line);
+  const fullName = code === "--" ? "--" : lineName(code);
+  // When a marker is present, replace the LAST char of the line cell
+  // with the marker glyph so the cursor still reads as part of the
+  // line column (matching the v1.2 pin-a-train convention) but the
+  // line name is otherwise readable in full.
+  const padded = padRight(fullName, GLYPH_WIDTH);
   const glyph =
     marker === ""
-      ? padRight(fullGlyph, GLYPH_WIDTH)
-      : fullGlyph.charAt(0) + marker;
-  const dest = padRight(
-    abbreviateStation(train.Destination || train.DestinationName, DEST_WIDTH),
-    DEST_WIDTH,
-  );
+      ? padded
+      : padded.slice(0, GLYPH_WIDTH - 1) + marker;
+  // `Destination` is WMATA's primary field; some rows have a tighter
+  // 8-char code in `Destination` plus a full name in `DestinationName`.
+  // Keep the existing `Destination || DestinationName` preference
+  // (verified by the dedicated fallback test suite) and title-case
+  // the result at render time so all-caps API strings ("SHADY GROVE")
+  // come out reading as "Shady Grove". Left-aligned, NOT padded — the
+  // ETA lives in the right overlay column.
+  const destSource = toTitleCase(train.Destination || train.DestinationName);
+  const dest = abbreviateStation(destSource, DEST_WIDTH);
   // Cars: "6c" / "8c". WMATA occasionally returns "" for non-revenue or
   // unknown consist length; render that as "  " (two spaces) so the
   // column doesn't collapse.
   const carsRaw = train.Car && train.Car.trim().length > 0 ? `${train.Car}c` : "";
   const cars = padLeft(carsRaw, CARS_WIDTH);
   const eta = padLeft(formatEta(train.Min), ETA_WIDTH);
-  // glyph(2) + " "(1) + dest(11) + " "(1) + cars(2) + " "(1) + eta(6) = 24
-  return glyph + " " + dest + " " + cars + " " + eta;
+  // LEFT: 2-char "  " indent so the row reads as content INSIDE the body
+  // container, not flush to the border. RIGHT: cars + a space + the
+  // right-aligned ETA — 2 + 1 + 6 = 9 chars, within the ~10-char overlay.
+  return {
+    left: "  " + glyph + " " + dest,
+    right: cars + " " + eta,
+  };
 }
 
 /**
@@ -382,69 +545,287 @@ export function findPinnedTrainIndex(
 
 /**
  * Build the optional "pin summary" row that sits between the header
- * and the train list. Returns `null` when no train is pinned, or
- * when the pinned train is no longer visible in the predictions
- * (e.g. it already departed). Width contract: ≤ LINE_WIDTH.
+ * and the train list, as its two pixel-aligned columns. Returns `null`
+ * when no train is pinned, or when the pinned train is no longer visible
+ * AND there's no "(gone)" latch to surface.
  *
- *   "* RD Glenmont   3 min"
+ *   left = "* RED Glenmont"      right = "3 min"
+ *   left = "* RED Glenmont (gone)" right = ""   (one-tick gone latch)
  *
- * Layout: marker(1) + " "(1) + line(2) + " "(1) + dest(11) + " "(1) +
- *         eta(6) = 23. Pad one trailing space to LINE_WIDTH.
+ * The pin marker "* " doubles as the 2-char body inset so the line cell
+ * aligns with the unmarked train rows below (`"  " + glyph + …`). The
+ * destination is left-aligned (NOT padded) — the ETA is the right
+ * overlay column.
  */
 export function renderPinRow(
   snapshot: PredictionsSnapshot,
   visibleTrains: readonly Train[],
-): string | null {
+): BodyRow | null {
   if (!snapshot.pinned) return null;
   const idx = findPinnedTrainIndex(visibleTrains, snapshot.pinned);
-  if (idx < 0) return null;
+  if (idx < 0) {
+    // Pinned train no longer in the visible list. Render a "(gone)"
+    // indicator for one tick before the auto-clear in `tick()`
+    // wipes the pin. Without this the row would silently disappear.
+    if (snapshot.pinnedGone) {
+      const code = lineGlyph(snapshot.pinned.line);
+      const fullName = code === "--" ? "--" : lineName(code);
+      const lineCell = padRight(fullName, GLYPH_WIDTH);
+      const dest = abbreviateStation(
+        toTitleCase(snapshot.pinned.destination),
+        DEST_WIDTH,
+      );
+      // The "(gone)" tag rides the LEFT cell (it's not a value); no
+      // right-column ETA for a departed train.
+      const left = truncate("* " + lineCell + " " + dest + " (gone)", SAFE_TEXT_WIDTH);
+      return { left, right: "" };
+    }
+    return null;
+  }
   const t = visibleTrains[idx]!;
-  const line = padRight(lineGlyph(t.Line), GLYPH_WIDTH);
-  const dest = padRight(
-    abbreviateStation(t.Destination || t.DestinationName, DEST_WIDTH),
+  const code = lineGlyph(t.Line);
+  const fullName = code === "--" ? "--" : lineName(code);
+  const line = padRight(fullName, GLYPH_WIDTH);
+  const dest = abbreviateStation(
+    toTitleCase(t.Destination || t.DestinationName),
     DEST_WIDTH,
   );
   const eta = padLeft(formatEta(t.Min), ETA_WIDTH);
-  // "*"(1) + " "(1) + line(2) + " "(1) + dest(11) + " "(1) + eta(6) = 23
-  const composed = "* " + line + " " + dest + " " + eta;
-  return padRight(composed, LINE_WIDTH);
+  // LEFT: "* "(2) + line glyph cell + " " + destination, clamped to the
+  // safe text width so the LVGL container can't hard-wrap. RIGHT: the
+  // right-aligned ETA in the value overlay.
+  const left = truncate("* " + line + " " + dest, SAFE_TEXT_WIDTH);
+  return { left, right: eta };
 }
 
 /**
- * Render the optional footer alert row. Returns `null` when there's no
- * incident headline AND no fetch error to surface; otherwise a single
- * truncated `"! <headline>"` (or `"? <error>"`) string.
+ * Pull the human-readable distance phrase out of a `PinnedPosition.label`.
+ *
+ * `resolvePinnedPosition` builds the label as `* <lineCode> <phrase>`,
+ * where `<phrase>` is one of:
+ *   - "at this station"  → returns "at station"   (tightened)
+ *   - "approaching"      → returns "approaching"
+ *   - "<N> stops away"   → returns "<N> stops"    (drops "away")
+ *   - "<destination>"    → fallback form when the train couldn't be
+ *                          located on the line → returns `null` (no real
+ *                          position info to surface in the compact line).
+ *
+ * Parsing strips the leading `* ` marker and the line-code token rather
+ * than re-deriving the phrase, so the label stays the single source of
+ * truth for the position wording. Returns `null` when there's nothing
+ * position-specific to show.
  */
-export function renderFooter(snapshot: PredictionsSnapshot): string | null {
-  if (snapshot.incidentHeadline && snapshot.incidentHeadline.trim().length > 0) {
-    return truncate("! " + snapshot.incidentHeadline.trim(), LINE_WIDTH);
+export function pinnedDistancePhrase(
+  label: string,
+  pinLine: string,
+): string | null {
+  if (typeof label !== "string" || label.length === 0) return null;
+  // Strip the `* ` marker, then the line-code token + its trailing space.
+  let rest = label.startsWith("* ") ? label.slice(2) : label;
+  const lineToken = pinLine + " ";
+  if (rest.startsWith(lineToken)) rest = rest.slice(lineToken.length);
+  rest = rest.trim();
+  if (rest.length === 0) return null;
+  if (rest === "at this station") return "at station";
+  if (rest === "approaching") return "approaching";
+  // "<N> stops away" → "<N> stops". Keep singular "1 stop" tidy too.
+  const stopsMatch = /^(\d+)\s+stops?\s+away$/.exec(rest);
+  if (stopsMatch) {
+    const n = stopsMatch[1]!;
+    return n === "1" ? "1 stop" : `${n} stops`;
   }
-  if (snapshot.fetchError !== null && snapshot.fetchedAt === 0) {
-    // Only surface fetch errors in the footer when we have NO data at all
-    // — otherwise the stale `?` marker on the clock is sufficient and the
-    // footer should stay reserved for genuine incidents.
-    return truncate("? " + snapshot.fetchError, LINE_WIDTH);
-  }
+  // Anything else is the fallback `* <line> <destination>` form (the
+  // train wasn't locatable) — no position phrase to surface.
   return null;
 }
 
 /**
- * Convert a WMATA "HH:mm" 24-hour string to a compact 12-hour display
- * string for the late-night last-train row. The snapshot keeps the raw
- * 24-hour wire format (matches the schedule API); only the rendered
- * row swaps to 12-hour for user-facing consistency with the header
- * clock. Returns the input untouched if it doesn't parse — defensive
- * for unexpected upstream shapes.
+ * Render the COMPACT pinned-summary row that merges the old two-row
+ * "pin summary" + "N stops away" block into ONE row, so the dense
+ * pinned-with-position state fits the body without clipping the train
+ * list. Returns its two pixel-aligned columns, or `null` when there's
+ * no pin / the pinned train isn't visible (the `(gone)` / no-pin cases
+ * stay on `renderPinRow`).
+ *
+ *   left = "* RED Glenmont (3 stops)"     right = "3 min"
+ *
+ * When no position phrase is available (train not yet locatable) the
+ * parenthetical is dropped:
+ *
+ *   left = "* RED Glenmont"               right = "5 min"
+ *
+ * The "* " marker doubles as the 2-char body inset so the line cell
+ * aligns with the train rows below. The left segment is clamped to
+ * `SAFE_TEXT_WIDTH` so the LVGL container can't hard-wrap it; the ETA is
+ * the host's right overlay column (pixel-aligned with the train ETAs).
  */
-export function formatLastTrainTime(hhmm: string): string {
-  const parts = hhmm.split(":");
-  if (parts.length !== 2) return hhmm;
-  const h24 = parseInt(parts[0]!, 10);
-  const mm = parts[1]!;
-  if (!Number.isFinite(h24) || mm.length !== 2) return hhmm;
-  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
+export function renderPinnedSummary(
+  snapshot: PredictionsSnapshot,
+  visibleTrains: readonly Train[],
+): BodyRow | null {
+  if (!snapshot.pinned) return null;
+  const idx = findPinnedTrainIndex(visibleTrains, snapshot.pinned);
+  if (idx < 0) return null;
+  const t = visibleTrains[idx]!;
+  const code = lineGlyph(t.Line);
+  const fullName = code === "--" ? "--" : lineName(code);
+  const dest = abbreviateStation(
+    toTitleCase(t.Destination || t.DestinationName),
+    DEST_WIDTH,
+  );
+  // Distance phrase from the resolved position (when present).
+  const phrase =
+    snapshot.pinnedPosition !== null
+      ? pinnedDistancePhrase(snapshot.pinnedPosition.label, t.Line)
+      : null;
+  // Left content: "* RED Glenmont (3 stops)". The "* " marker doubles
+  // as the 2-char body inset so the line code aligns with the train
+  // rows below ("  " + glyph + …).
+  const head = `* ${fullName} ${dest}`;
+  const left = phrase ? `${head} (${phrase})` : head;
+  // Clamp real text to the safe width so the LVGL container can't
+  // hard-wrap it. The ETA goes in the right overlay column.
+  return {
+    left: truncate(left, SAFE_TEXT_WIDTH),
+    right: formatEta(t.Min),
+  };
+}
+
+/**
+ * Maximum lines we'll spend on an incident footer. The footer
+ * container is ~88px (~3 text rows) in the rebalanced three-section
+ * geometry, so we cap the wrapped headline at 3 lines: enough to read
+ * the first sentence of a typical service alert at SAFE_TEXT_WIDTH,
+ * while the `wrapText` ellipsis path terminates anything longer
+ * cleanly rather than overflowing the bordered box.
+ */
+const FOOTER_MAX_LINES = 3;
+
+/**
+ * Build the QUIET fallback line shown in the footer when there's no
+ * incident and no surfaced fetch error — so the bordered footer
+ * container reads as intentional rather than a big empty box.
+ *
+ * Priority:
+ *   1. A distinct served-lines summary derived from the visible
+ *      trains, full line names per the screen's consistency rule:
+ *        "Serving RED, ORANGE"
+ *   2. When no trains are visible (so no lines to summarise), a subtle
+ *      navigation hint:
+ *        "Double-tap for stations"
+ *
+ * Always a single line, clamped to `SAFE_TEXT_WIDTH` and 2-char inset
+ * to match the incident footer's prefix rhythm.
+ */
+export function renderFooterQuiet(
+  visibleTrains: readonly Train[],
+): string {
+  // Distinct served lines, in first-seen (ETA) order, full names.
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const t of visibleTrains) {
+    const code = lineGlyph(t.Line);
+    if (code === "--") continue;
+    if (seen.has(code)) continue;
+    seen.add(code);
+    names.push(lineName(code));
+  }
+  if (names.length === 0) {
+    // No revenue lines to summarise — fall back to a gentle hint.
+    return "  " + truncate("Double-tap for stations", SAFE_TEXT_WIDTH - 2);
+  }
+  const body = "Serving " + names.join(", ");
+  return "  " + truncate(body, SAFE_TEXT_WIDTH - 2);
+}
+
+/**
+ * Render the footer rows.
+ *
+ * Precedence:
+ *   1. An active incident headline → word-wrapped prose (2-3 lines).
+ *   2. A fetch error with NO data at all → the "? " network-problem
+ *      line (the stale clock marker covers the have-data case).
+ *   3. Otherwise → a single QUIET fallback line (served lines / hint)
+ *      so the bordered footer never reads as an empty broken box.
+ *
+ * Never returns `null` for the three-section layout: the footer
+ * container always exists, so we always give it gentle content. The
+ * incident text is wrapped at `SAFE_TEXT_WIDTH` (via `wrapWithPrefix`)
+ * so long alerts can't trip the container's hard-wrap.
+ *
+ * `visibleTrains` feeds the quiet fallback's served-lines summary;
+ * when omitted it's derived from `snapshot.trains` (sorted + capped),
+ * which keeps single-argument callers (and the test suite) working.
+ */
+export function renderFooter(
+  snapshot: PredictionsSnapshot,
+  visibleTrains?: readonly Train[],
+): string[] {
+  if (snapshot.incidentHeadline && snapshot.incidentHeadline.trim().length > 0) {
+    // No leading "! " glyph — the bordered footer container is itself
+    // the visual "this is an alert" signal. The headline reads as
+    // plain wrapped prose inside its own framed section.
+    return wrapWithPrefix("  ", snapshot.incidentHeadline.trim());
+  }
+  if (snapshot.fetchError !== null && snapshot.fetchedAt === 0) {
+    // Only surface fetch errors in the footer when we have NO data at all
+    // — otherwise the stale `?` marker on the clock is sufficient and the
+    // footer should stay reserved for genuine incidents. The "? " prefix
+    // distinguishes a network problem from a service alert.
+    return wrapWithPrefix("? ", snapshot.fetchError);
+  }
+  const visible =
+    visibleTrains ??
+    sortTrainsForDisplay(snapshot.trains).slice(0, MAX_VISIBLE_TRAINS);
+  return [renderFooterQuiet(visible)];
+}
+
+/**
+ * Render `prefix + body` wrapped into 1..FOOTER_MAX_LINES rows. The
+ * prefix sits on the FIRST line only; continuation lines are
+ * indented by `prefix.length` spaces so the wrap reads as one
+ * coherent block visually:
+ *
+ *   ! This weekend, trains
+ *     will single-track
+ *     between A01 and …
+ */
+function wrapWithPrefix(prefix: string, body: string): string[] {
+  const indent = " ".repeat(prefix.length);
+  // Wrap real prose at SAFE_TEXT_WIDTH (NOT LINE_WIDTH) so a long alert
+  // can't push past the container's 576px hard-wrap point and dump an
+  // orphan word at column 0. The prefix/indent consumes from that
+  // budget so wrapped + inset still fits.
+  const innerWidth = SAFE_TEXT_WIDTH - prefix.length;
+  const wrapped = wrapText(body.trim(), innerWidth, FOOTER_MAX_LINES);
+  if (wrapped.length === 0) return [];
+  // Strip a single dangling comma/period from the final line when the
+  // wrap consumed the whole headline (no trailing ellipsis). A first
+  // sentence that was itself a truncated list fragment ("…Foggy
+  // Bottom,") would otherwise leave a comma orphaned at the line end.
+  const lastIdx = wrapped.length - 1;
+  const last = wrapped[lastIdx]!;
+  if (!last.endsWith(ELLIPSIS) && /[,.]$/.test(last)) {
+    wrapped[lastIdx] = last.slice(0, -1);
+  }
+  return wrapped.map((line, i) => (i === 0 ? prefix : indent) + line);
+}
+
+/**
+ * Convert a normalised 24-hour "HH:MM" string to the app's 12-hour
+ * label ("23:47" → "11:47p", "22:50" → "10:50p", "00:30" → "12:30a").
+ * Keeps the whole HUD on one clock convention (the header clock and
+ * ETAs are all 12-hour). Returns the input unchanged if it can't parse.
+ */
+function to12hLabel(hhmm24: string): string {
+  const colon = hhmm24.indexOf(":");
+  if (colon < 0) return hhmm24;
+  const h24 = parseInt(hhmm24.slice(0, colon), 10);
+  const mm = hhmm24.slice(colon + 1);
+  if (!Number.isFinite(h24) || mm.length === 0) return hhmm24;
+  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
   const ap = h24 < 12 ? "a" : "p";
-  return `${h12}:${mm}${ap}`;
+  return `${String(h12)}:${mm}${ap}`;
 }
 
 /**
@@ -452,16 +833,124 @@ export function formatLastTrainTime(hhmm: string): string {
  * the wall clock is before `LAST_TRAIN_HOUR` OR the schedule data
  * isn't available — in either case the row is hidden.
  *
- *   "Last train: 11:47p"  (always ≤ 24 cols)
+ * Line codes are spelled out (ORANGE, RED) and times use the app's
+ * 12-hour convention to stay consistent with the rest of the HUD:
+ *
+ *   1 line:    "Last RED 11:47p"
+ *   2 lines:   "Last ORANGE 10:50p  RED 11:47p"
+ *   3+ lines:  "Last ORANGE 10:50p +2"   (drops cell #2 for the
+ *              overflow count so the row stays short)
+ *
+ * Sorted by time ascending so the earliest-departing line is
+ * surfaced first (the line the user has to leave fastest for).
  */
 export function renderLastTrainRow(
   snapshot: PredictionsSnapshot,
   nowMs: number,
 ): string | null {
   if (!shouldShowLastTrain(nowMs)) return null;
-  const time = snapshot.lastTrainToday;
-  if (!time || time.length === 0) return null;
-  return truncate(`Last train: ${formatLastTrainTime(time)}`, LINE_WIDTH);
+  const lines = snapshot.lastTrainToday;
+  if (!lines || lines.length === 0) return null;
+  const sorted = [...lines].sort((a, b) => {
+    const na = normalizeTo24h(a.time) ?? "";
+    const nb = normalizeTo24h(b.time) ?? "";
+    return na.localeCompare(nb);
+  });
+  // Spell out the line code and render the time in the app's 12-hour
+  // convention (the stored value may be 24h "22:50" or 12h "11:47p").
+  const label = (e: LastTrainByLine) => {
+    const n = normalizeTo24h(e.time);
+    return `${lineName(e.line)} ${n ? to12hLabel(n) : e.time}`;
+  };
+  if (sorted.length === 1) {
+    return truncate(`Last ${label(sorted[0]!)}`, SAFE_TEXT_WIDTH);
+  }
+  if (sorted.length === 2) {
+    const cells = sorted.map(label).join("  ");
+    return truncate(`Last ${cells}`, SAFE_TEXT_WIDTH);
+  }
+  // 3+ — drop cell #2; the +N marker takes the slot.
+  const overflow = sorted.length - 1;
+  return truncate(
+    `Last ${label(sorted[0]!)} +${overflow}`,
+    SAFE_TEXT_WIDTH,
+  );
+}
+
+/**
+ * Resolve a pinned train's live position from TrainPositions +
+ * StandardRoutes. Returns `null` when:
+ *
+ *   - no pin
+ *   - the pin's `destinationCode` is missing (legacy pin from a
+ *     pre-WP-I session)
+ *   - no TrainPositions entry matches (the train hasn't entered
+ *     service yet, or just left the system)
+ *   - StandardRoutes hasn't resolved
+ *
+ * On a hit, returns a `PinnedPosition` carrying:
+ *   - `label` — one of "at this station", "approaching",
+ *     "N stops away" (the distance is in revenue-station hops on
+ *     the line)
+ *   - `schematic` — the 1-row line diagram with the user's
+ *     station and train's nearest station marked
+ *
+ * Exported for the test suite + the `main.ts` fetcher.
+ */
+export function resolvePinnedPosition(
+  pin: PredictionsSnapshot["pinned"],
+  userStationCode: string,
+  positions: readonly import("../wmata").TrainPosition[] | null,
+  routes: readonly StandardRoute[] | null,
+): PinnedPosition | null {
+  if (!pin) return null;
+  if (!positions || !routes) return null;
+  const destCode = pin.destinationCode ?? null;
+  if (typeof destCode !== "string" || destCode.length === 0) return null;
+  // Find the matching train. Multiple trains can share a (line,
+  // destination) on a busy commute — pick the one with the smallest
+  // SecondsAtLocation as a proxy for "most recently moved", which
+  // is the one most likely to be approaching the user.
+  const candidates = positions.filter(
+    (p) =>
+      p.LineCode === pin.line && p.DestinationStationCode === destCode,
+  );
+  if (candidates.length === 0) return null;
+  const match = candidates.reduce((best, p) =>
+    p.SecondsAtLocation < best.SecondsAtLocation ? p : best,
+  );
+
+  const lineStations = buildLineStations(routes, pin.line);
+  if (lineStations.length === 0) return null;
+  const userIdx = lineStations.indexOf(userStationCode);
+
+  const trainStation = findNearestStationToCircuit(
+    routes,
+    pin.line,
+    match.CircuitId,
+  );
+  const trainIdx = trainStation ? lineStations.indexOf(trainStation) : -1;
+
+  // Label: "at this station" / "approaching" / "N stops away".
+  let label = `* ${pin.line} ${pin.destination}`;
+  if (trainIdx >= 0 && userIdx >= 0) {
+    const stops = stationsBetween(lineStations, userStationCode, trainStation!);
+    if (stops !== null) {
+      if (stops === 0) label = `* ${pin.line} at this station`;
+      else if (stops === 1) label = `* ${pin.line} approaching`;
+      else label = `* ${pin.line} ${stops} stops away`;
+    }
+  }
+  const schematic = renderLineSchematic(
+    pin.line,
+    lineStations,
+    userIdx,
+    trainIdx,
+  );
+  return {
+    label: truncate(label, LINE_WIDTH),
+    schematic,
+  };
 }
 
 /**
@@ -494,7 +983,14 @@ export function sortTrainsForDisplay(trains: readonly Train[]): Train[] {
  * re-renders.
  */
 export function makePredictionsScreen(
-  fetcher: () => Promise<PredictionsFetchResult>,
+  /**
+   * Fetcher accepts the CURRENT snapshot so the implementation can
+   * read `pinned` and conditionally fetch TrainPositions (skipping
+   * the extra round-trip when nothing is pinned).
+   */
+  fetcher: (
+    snapshot: PredictionsSnapshot,
+  ) => Promise<PredictionsFetchResult>,
   initialSnapshot: PredictionsSnapshot,
 ): Screen<PredictionsSnapshot> & {
   tick: (snapshot: PredictionsSnapshot) => Promise<PredictionsSnapshot>;
@@ -502,36 +998,76 @@ export function makePredictionsScreen(
 } {
   return {
     name: "predictions",
+    // Predictions uses a 3-section layout: incidents render in their
+    // own bordered footer block below the trains list, so the alert
+    // is visually decoupled from the train predictions even when both
+    // are scrolling state.
+    layout: "three-section",
     init: () => initialSnapshot,
-    view(snapshot, nav, ctx: ViewContext): string[] {
-      const lines: string[] = [];
+    view(snapshot, nav, ctx: ViewContext): ScreenSections {
       // `ctx.nowMs` is freshly stamped by the host on EVERY render —
       // including the 1Hz clock-only re-renders that fire independently
-      // of any fetch tick. That's what keeps the HUD clock and the
-      // stale-marker advancing even when the network has stalled.
-      lines.push(renderHeader(snapshot, ctx.nowMs));
+      // of any fetch tick. The header is now just the station title; the
+      // wall clock + staleness marker live in the host's own top-right
+      // clock container (the marker is surfaced via `clockMarker` below).
+      const header: string[] = [renderHeader(snapshot)];
+      // TRUE two-column body: `bodyLeft[i]` / `bodyRight[i]` are the same
+      // visual row. The host renders LEFT in the full-width body
+      // container and overlays RIGHT (the value) at a fixed pixel x, so
+      // the value column is pixel-aligned regardless of the (variable-
+      // width) destination glyphs. `right` is "" for value-less rows
+      // (prose, cues, separators). A `push(row)` helper keeps the two
+      // arrays in lockstep.
+      const bodyLeft: string[] = [];
+      const bodyRight: string[] = [];
+      const pushRow = (row: BodyRow): void => {
+        bodyLeft.push(row.left);
+        bodyRight.push(row.right);
+      };
+      const footer: string[] = [];
 
       const sorted = sortTrainsForDisplay(snapshot.trains);
       const visible = sorted.slice(0, MAX_VISIBLE_TRAINS);
 
-      // Pin summary row sits directly under the header when an active
-      // pin matches a visible train. Renders nothing otherwise (e.g.
-      // before the user has pinned anything, or after the pinned
-      // train has rolled out of the predictions window).
-      const pinRow = renderPinRow(snapshot, visible);
-      if (pinRow !== null) lines.push(pinRow);
+      // Pinned-train header block. COMPACT by design so the dense
+      // "pinned + live position" state fits the 5-row body without
+      // clipping the train list:
+      //
+      //   - With a resolved live position, the old two-row block
+      //     (summary row + "N stops away" row + ASCII schematic) is
+      //     merged into ONE row: left "* RED Glenmont (3 stops)" +
+      //     right "3 min". The crude ASCII schematic ("RD -*--@---") is
+      //     intentionally dropped — it read poorly at one char per
+      //     station and cost a whole row.
+      //   - Without a position (or in the "(gone)" latch), we keep the
+      //     existing single-row pin summary via `renderPinRow`.
+      if (snapshot.pinned !== null && snapshot.pinnedPosition !== null) {
+        const summary = renderPinnedSummary(snapshot, visible);
+        if (summary !== null) {
+          pushRow(summary);
+        } else {
+          // Pinned train not in the visible list but a stale position
+          // lingers — fall back to the plain pin row (handles "(gone)").
+          const pinRow = renderPinRow(snapshot, visible);
+          if (pinRow !== null) pushRow(pinRow);
+        }
+      } else {
+        const pinRow = renderPinRow(snapshot, visible);
+        if (pinRow !== null) pushRow(pinRow);
+      }
 
       if (visible.length === 0) {
         // Empty state — distinct copy depending on whether we have data
         // at all. If there's no data yet AND we've never fetched, show a
-        // "Loading…" cue; otherwise show "No trains predicted".
+        // "Loading…" cue; otherwise show "No trains predicted". These are
+        // value-less prose rows: all content in the LEFT column.
         if (snapshot.fetchedAt === 0 && snapshot.fetchError === null) {
-          lines.push(truncate("Loading…", LINE_WIDTH));
+          pushRow({ left: truncate("Loading…", LINE_WIDTH), right: "" });
         } else {
-          lines.push(truncate("No trains predicted.", LINE_WIDTH));
+          pushRow({ left: truncate("No trains predicted.", LINE_WIDTH), right: "" });
         }
-        lines.push("");
-        lines.push(truncate("(double-tap to exit)", LINE_WIDTH));
+        pushRow({ left: "", right: "" });
+        pushRow({ left: truncate("(double-tap to exit)", LINE_WIDTH), right: "" });
       } else {
         // Cursor: `nav.highlightedIndex` is clamped to the visible
         // range. The pinned train (if any) is marked with "*"; the
@@ -539,30 +1075,55 @@ export function makePredictionsScreen(
         // is marked with ">". When both coincide on the same row,
         // the pin marker wins — the user has confirmed this is
         // their tracked train, no need to also surface the cursor.
+        //
+        // WP-M opt-in cursor: the ">" marker is suppressed until
+        // the user explicitly engages (first SCROLL or TAP), so
+        // the at-rest render stays glanceable.
         const pinnedIdx = findPinnedTrainIndex(visible, snapshot.pinned);
         const cursorIdx = Math.max(
           0,
           Math.min(nav.highlightedIndex, visible.length - 1),
         );
+        const showCursor = snapshot.cursorVisible;
         for (let i = 0; i < visible.length; i++) {
           const t = visible[i]!;
           const marker: "" | "*" | ">" =
-            i === pinnedIdx ? "*" : i === cursorIdx ? ">" : "";
-          lines.push(renderTrainRow(t, marker));
+            i === pinnedIdx
+              ? "*"
+              : showCursor && i === cursorIdx
+                ? ">"
+                : "";
+          pushRow(renderTrainRow(t, marker));
         }
       }
 
-      const footer = renderFooter(snapshot);
-      if (footer !== null) lines.push(footer);
-
-      // Late-night last-train row. Independent of the footer — both
-      // can be present simultaneously (e.g. midnight on a single-
-      // tracking day). Hidden outside the late-night window OR when
-      // the schedule fetch hasn't completed; in either case the
-      // existing line count stays unchanged.
+      // Late-night last-train row stays at the bottom of the body —
+      // it's train-list metadata, not an incident. A blank row sets it
+      // apart from the train rows above (so the left-flowing "Last …"
+      // prose doesn't read as a clipped train row), but only when the
+      // list is short enough that the spacer won't push the summary out
+      // of the ~5-row body. The "Last …" string has no value column.
       const lastTrain = renderLastTrainRow(snapshot, ctx.nowMs);
-      if (lastTrain !== null) lines.push(lastTrain);
-      return lines;
+      if (lastTrain !== null) {
+        if (bodyLeft.length <= 3) pushRow({ left: "", right: "" });
+        pushRow({ left: lastTrain, right: "" });
+      }
+
+      // Footer section: the active service alert / network-error line
+      // when present, otherwise a QUIET fallback (served-lines summary
+      // or a gentle hint) so the bordered footer never reads as an
+      // empty broken box. `renderFooter` always returns ≥1 line for the
+      // three-section layout; `visible` feeds the served-lines summary.
+      footer.push(...renderFooter(snapshot, visible));
+      return {
+        header,
+        // `body` is ignored by the host when `bodyColumns` is present;
+        // we set it to [] per the two-column contract (router.ts).
+        body: [],
+        bodyColumns: { left: bodyLeft, right: bodyRight },
+        footer,
+        clockMarker: stalenessMarker(snapshot, ctx.nowMs),
+      };
     },
     reduce(snapshot, nav, event: ScreenEvent): ReduceResult<PredictionsSnapshot> {
       // Predictions added a cursor + pin model in v1.2. The cursor
@@ -585,16 +1146,31 @@ export function makePredictionsScreen(
           if (visible.length === 0) return { nav };
           return {
             nav: { highlightedIndex: Math.max(0, cursorIdx - 1) },
+            // First scroll surfaces the cursor (WP-M opt-in).
+            snapshot: snapshot.cursorVisible
+              ? snapshot
+              : { ...snapshot, cursorVisible: true },
           };
         case "SCROLL_DOWN":
           if (visible.length === 0) return { nav };
           return {
             nav: { highlightedIndex: Math.min(maxIdx, cursorIdx + 1) },
+            snapshot: snapshot.cursorVisible
+              ? snapshot
+              : { ...snapshot, cursorVisible: true },
           };
         case "TAP": {
           if (visible.length === 0) return { nav };
           const t = visible[cursorIdx]!;
-          const candidate = { line: t.Line, destination: t.Destination };
+          const candidate = {
+            line: t.Line,
+            destination: t.Destination,
+            // Capture DestinationCode so WP-I's TrainPositions
+            // matcher can resolve the same train across ticks even
+            // though the short-name `Destination` may differ
+            // between rail predictions and live positions.
+            destinationCode: t.DestinationCode,
+          };
           // TAP on the already-pinned train toggles the pin off.
           const isAlreadyPinned =
             snapshot.pinned !== null &&
@@ -604,7 +1180,13 @@ export function makePredictionsScreen(
             nav,
             snapshot: {
               ...snapshot,
+              // Unpinning clears the resolved live position too.
               pinned: isAlreadyPinned ? null : candidate,
+              pinnedPosition: isAlreadyPinned ? null : snapshot.pinnedPosition,
+              pinnedGone: false,
+              // Any TAP makes the cursor visible (the user has
+              // engaged with the screen).
+              cursorVisible: true,
             },
           };
         }
@@ -630,7 +1212,35 @@ export function makePredictionsScreen(
     async tick(snapshot: PredictionsSnapshot): Promise<PredictionsSnapshot> {
       const now = Date.now();
       try {
-        const result = await fetcher();
+        const result = await fetcher(snapshot);
+
+        // WP-M "pinned-train gone" detection + auto-clear. Two-tick
+        // state machine:
+        //   1. The user's pinned (line, destination) is no longer
+        //      in the freshly-fetched trains list → set
+        //      `pinnedGone = true` for this tick. The view renders
+        //      "* RD Glnmt (gone)".
+        //   2. Next tick (still no match): clear the pin entirely.
+        let nextPinned = snapshot.pinned;
+        let nextPinnedPosition =
+          result.pinnedPosition ?? snapshot.pinnedPosition;
+        let nextPinnedGone = false;
+        if (snapshot.pinned !== null) {
+          const stillPresent =
+            findPinnedTrainIndex(result.trains, snapshot.pinned) >= 0;
+          if (!stillPresent) {
+            if (snapshot.pinnedGone) {
+              // Second consecutive miss — clear the pin.
+              nextPinned = null;
+              nextPinnedPosition = null;
+              nextPinnedGone = false;
+            } else {
+              // First miss — surface the "(gone)" indicator.
+              nextPinnedGone = true;
+            }
+          }
+        }
+
         return {
           ...snapshot,
           trains: result.trains,
@@ -640,6 +1250,9 @@ export function makePredictionsScreen(
           // user doesn't see the row blink off if the fetcher only
           // populates it on the first call.
           lastTrainToday: result.lastTrainToday ?? snapshot.lastTrainToday,
+          pinned: nextPinned,
+          pinnedPosition: nextPinnedPosition,
+          pinnedGone: nextPinnedGone,
           fetchedAt: now,
           fetchError: null,
           consecutiveFetchFailures: 0,

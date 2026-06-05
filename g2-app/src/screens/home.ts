@@ -1,52 +1,42 @@
 // Home screen — the first thing the user sees on the glasses.
 //
-// Layout (24 columns x up to 8 rendered rows: 1 header + up to 7 body):
+// Layout (1 header + up to 7 body rows):
 //
-//   col: 0         1         2
-//   col: 0123456789012345678901234
-//        WMATA — Favorites (3/5)
-//        > RD!BL YL OR!GR SV
-//          Metro Ctr  RD BL OR SV
-//          Gallery Pl RD YL GR
-//          Union Stn  RD
-//          VOICE LOOKUP
+//        WMATA  Favorites                              2:32p
+//        > Metro Center · RED BLUE ORANGE SILVER
+//          Gallery Pl-Chinatown · RED YELLOW GREEN
+//          Union Station · RED
 //
-// The status glyph row only appears when at least one line the user
+// Favorites render as a single LEFT-FLOWING row:
+//
+//        <prefix>Station Name · LINE LINE LINE
+//
+// i.e. the 2-char highlight prefix, the full station name, a " · "
+// separator, then the full spelled-out line names (RED / BLUE / …).
+// Everything is left-aligned. Earlier revisions right-aligned the
+// line-code column, but because the code strings vary hugely in width
+// (RED vs RED BLUE ORANGE SILVER) and the LVGL font is variable-width,
+// that column floated raggedly — anchored to no edge. Left-flowing
+// text aligns perfectly in any font, so the raggedness is gone.
+//
+// The status (ALERTS) row only appears when at least one line the user
 // follows has an active incident. When visible, it sits ABOVE the
-// favorites (the v1.1 behaviour put a count row BELOW favorites; v1.2
-// promotes the row to a denser per-line status display at the top of
-// the list because that's the surface users peek at first). TAP on it
-// still navigates to the Incidents screen. The 6 line codes (RD BL YL
-// OR GR SV) are always rendered in the same column positions; a
-// trailing `!` on a code means "this line has an active incident".
+// favorites. TAP on it navigates to the Incidents screen. The ACCESS
+// row (elevator/escalator outages) sits just below it. Both are
+// suppressed during quiet hours.
 //
-// Empty state (no favorites): exactly 4 rendered lines —
-//   1. header                ("WMATA — Favorites (0/5)")
-//   2. "No favorites yet."
-//   3. "Open phone to add."
-//   4. VOICE LOOKUP row (with the highlight prefix)
+// Empty state (no favorites): header + two friendly help lines.
 //
-// (The status row, when present, ALSO appears above the help text in
-// the empty-state layout — but the empty-state count-of-lines
-// assertion in the test suite uses fixtures where `affectedLines` is
-// empty, so the line count stays at exactly 4.)
+// (The status / access rows, when present, ALSO appear above the help
+// text in the empty-state layout.)
 //
-// The empty-state line count is locked at 4 by an assertion in the
-// home.test.ts suite (per the WP6 Reviewer's "lock per-screen line
-// counts to exact integers" pattern). Drift will fail CI.
-//
-// Width budget after the 2-char highlight prefix (`> ` or `  `):
-//   - 10 cols for the abbreviated station name
-//   - 1  col spacer
-//   - up to 11 cols for line codes ("RD BL OR SV" or "RD BL OR +N")
-//   - = 22 cols + 2-char prefix = 24 cols total
-//
-// Line codes overflow rule: at most 4 raw codes are shown verbatim
-// ("RD BL OR SV" = 11 cols exactly). 5+ codes collapse the tail into
-// a `+N` suffix ("RD BL OR +1" = 11 cols). The actual WMATA network
-// only exposes 6 distinct line codes total, so N is single-digit by
-// construction; we still defensively truncate if a caller hands us
-// nonsense.
+// Overflow guard: a favorite row is truncated to `SAFE_TEXT_WIDTH`
+// (= 58 columns of real, non-space text — the point at which the LVGL
+// container hard-wraps at the 576px border). We prefer to truncate the
+// STATION NAME, keeping the prefix + separator + full line names
+// intact (the line codes are the higher-value datum for a metro
+// rider). Only when the line names alone already fill the row do we
+// fall back to truncating the whole composed string.
 //
 // PURITY: This module has NO SDK imports and does no DOM access. The
 // glasses host (`glasses-host.ts`) is responsible for everything that
@@ -55,26 +45,58 @@
 import type { FavoriteStation } from "../storage/settings";
 import { MAX_FAVORITES } from "../storage/settings";
 import type { LineCode } from "../wmata";
-import { LINE_WIDTH, highlightPrefix, padRight, truncate } from "../ui/render";
-import { abbreviateStation } from "../ui/format";
-import type { ReduceResult, Screen } from "./router";
+import {
+  LINE_WIDTH,
+  SAFE_TEXT_WIDTH,
+  highlightPrefix,
+  truncate,
+} from "../ui/render";
+import { abbreviateStation, lineName } from "../ui/format";
+// `formatClock` now lives in the shared field-formatter module and is
+// rendered by the host into its own top-right clock container. Re-export
+// it here so existing imports (`import { formatClock } from "./home"`)
+// keep resolving after the screen stopped embedding the clock.
+export { formatClock } from "../ui/format";
+import type { ReduceResult, Screen, ScreenSections } from "./router";
 
 // ---------------------------------------------------------------------------
-// Column budget constants (single source of truth for the 24-col grid)
+// Layout constants
 // ---------------------------------------------------------------------------
 
-/** Width of the highlight prefix ("> " or "  ") in characters. */
-const PREFIX_WIDTH = 2;
 /**
- * Width of the abbreviated-station-name cell. Exported so that other
- * modules (e.g. tests that audit the station-abbreviation map) can refer
- * to the canonical budget rather than hard-coding `10`.
+ * Separator between the station name and the line-name list in a
+ * favorite row. The middot reads as a quiet delimiter without adding
+ * the visual weight of a dash or pipe.
  */
-export const NAME_WIDTH = 10;
-/** Width of the lines-suffix cell. */
-const LINES_WIDTH = LINE_WIDTH - PREFIX_WIDTH - NAME_WIDTH - 1; // = 11
-/** Maximum number of raw line codes shown verbatim before we collapse to `+N`. */
-const MAX_VERBATIM_LINES = 4;
+const FAVORITE_SEPARATOR = " · ";
+
+/**
+ * Width (in columns) of the left-aligned ETA cell that sits between the
+ * cursor prefix and the station name on every favorite row. The widest
+ * realistic content is `"12 min"` (6 chars); 1-digit ETAs (`"4 min"`)
+ * and the sentinels (`"ARR"` / `"BRD"`) are shorter and get
+ * space-padded to this width. A trailing space is added AFTER the cell
+ * by the caller, so station names start at a constant column whether or
+ * not an ETA is present. Three-digit ETAs ("100 min") don't occur on
+ * the real network — trains are scheduled minutes apart — but if WMATA
+ * ever surprises us the cell simply widens for that one row rather than
+ * truncating the datum.
+ */
+export const ETA_CELL_WIDTH = 6;
+
+/**
+ * Max real-text width (columns) of the LEFT column in the two-column
+ * body. The host overlays the RIGHT (value) column in a borderless
+ * container pinned at a fixed pixel x (≈ x=466 ≈ column 50 in the
+ * monospace stand-in), so the left content must stay clear of that
+ * overlay or the two collide. We truncate the left cell to this budget
+ * (preferring to trim the STATION NAME, keeping the line names intact)
+ * so a long favorite never runs under the ETA. Sits at 50 — comfortably
+ * under SAFE_TEXT_WIDTH (58) since the value lives in its own container
+ * now (the old single-row budget had to fit name + ETA + lines on ONE
+ * line; the split frees ~8 columns).
+ */
+export const LEFT_COL_MAX = 50;
 
 /** Label rendered for the synthetic voice-lookup row. */
 export const VOICE_LABEL = "VOICE LOOKUP";
@@ -141,6 +163,32 @@ export interface HomeSnapshot {
    * `bootGlasses` consults for the initial mount.
    */
   quietHours: boolean;
+  /**
+   * Per-favorite soonest next-train ETA, keyed by station code. The
+   * value is the WMATA `Min` token of the soonest upcoming train at
+   * that station, across all of its lines — a numeric-as-string
+   * (`"4"`), the boarding/arriving sentinels (`"BRD"` / `"ARR"`), or
+   * `null` (no upcoming train / unknown). The raw token is kept (not
+   * a parsed number) so `renderFavoriteRow` can show `BRD`/`ARR`
+   * verbatim while still aligning the numeric ETAs in a fixed column.
+   *
+   * Lifecycle:
+   *   - Seeded to `{}` by the init factory. An ABSENT key renders no
+   *     ETA cell content yet ("loading") — the first paint shows the
+   *     names without an ETA blink.
+   *   - Filled by the `refreshFavoriteEtas` tick (one batched
+   *     predictions call for all favorite codes). Best-effort: any
+   *     fetch failure leaves the map untouched (ETAs simply linger /
+   *     stay blank rather than the row vanishing).
+   *   - A key present with a `null` value means "fetched, but this
+   *     station has no upcoming train" — rendered as a blank cell,
+   *     same as the loading state (we keep the column width either
+   *     way so the station names stay aligned).
+   *
+   * This drives ONLY the favorites; the synthetic ALERTS / ACCESS
+   * rows never carry an ETA.
+   */
+  favoriteEtas: Record<string, string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,46 +196,280 @@ export interface HomeSnapshot {
 // ---------------------------------------------------------------------------
 
 /**
- * Render the line-codes cell for a favorite. At most `MAX_VERBATIM_LINES`
- * codes are shown verbatim; the remainder collapses into `+N`.
+ * Render the line-name list for a favorite: every code spelled out in
+ * full and space-joined, in the order supplied.
  *
- * Examples (LINES_WIDTH = 11):
- *   ["RD"]                       -> "RD"
- *   ["RD","BL","OR"]             -> "RD BL OR"      (8 chars)
- *   ["RD","BL","OR","SV"]        -> "RD BL OR SV"   (11 chars — at width)
- *   ["RD","BL","YL","OR","GR"]   -> "RD BL OR +2"   (11 chars)
+ * Examples:
+ *   []                            -> ""
+ *   ["RD"]                        -> "RED"
+ *   ["RD","BL","OR"]              -> "RED BLUE ORANGE"
+ *   ["RD","BL","OR","SV"]         -> "RED BLUE ORANGE SILVER"
  *
- * For 5+ lines we drop to 3 verbatim codes ("RD BL OR" = 8 chars) + a
- * " +N" suffix (≤ 3 chars). That stays within the 11-col cell even when
- * N is double-digit. With only 6 line codes in the real WMATA network
- * N is always single-digit; the truncate at the end is a paranoia
- * guard for malformed input.
+ * No `+N` collapse: the left-flowing favorite row keeps the full names
+ * and lets `renderFavoriteRow` enforce the width budget at the row
+ * level (preferring to truncate the station name, not the codes). With
+ * only six lines in the real WMATA network a station never carries
+ * more than a handful, so the joined string stays short in practice.
  */
 export function renderLinesSuffix(lines: readonly string[]): string {
   if (lines.length === 0) return "";
-  if (lines.length <= MAX_VERBATIM_LINES) {
-    return lines.join(" ");
-  }
-  const head = lines.slice(0, MAX_VERBATIM_LINES - 1).join(" "); // 3 codes = 8 chars
-  const extra = lines.length - (MAX_VERBATIM_LINES - 1);
-  const candidate = `${head} +${extra}`;
-  if (candidate.length <= LINES_WIDTH) return candidate;
-  return truncate(candidate, LINES_WIDTH);
+  return lines.map((code) => lineName(code)).join(" ");
 }
 
 /**
- * Build a single favorite row, including the highlight prefix.
- * Guarantees `result.length <= LINE_WIDTH`.
+ * Map a WMATA `Min` token to a sortable rank for "soonest train"
+ * selection. Mirrors `sortTrainsForDisplay` in the Predictions screen
+ * so the two surfaces agree on ordering:
+ *
+ *   - `"BRD"` (boarding)  -> -2  (soonest)
+ *   - `"ARR"` (arriving)  -> -1
+ *   - numeric-as-string   -> the parsed integer (e.g. `"4"` -> 4)
+ *   - everything else     -> +Infinity (sorts to the tail / never wins)
+ *     (covers `""`, `"---"`, and any junk WMATA surprises us with)
+ *
+ * BRD/ARR rank ahead of every numeric value, which is the design
+ * brief's "treat as 0 for soonest" intent expressed as a strict total
+ * order (a train that is BRD is sooner than one that is ARR is sooner
+ * than one that is 1 minute out).
  */
-export function renderFavoriteRow(
+export function etaSortValue(min: string): number {
+  if (min === "BRD") return -2;
+  if (min === "ARR") return -1;
+  if (/^\d+$/.test(min)) return Number.parseInt(min, 10);
+  return Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Pick the soonest upcoming train's `Min` token from a list of raw
+ * `Min` strings (one favorite station's predictions, across all its
+ * lines). Returns the winning token verbatim (so `"ARR"` / `"BRD"`
+ * survive for display) or `null` when there is no upcoming train —
+ * i.e. the list is empty or every entry is an unknown sentinel
+ * (`""` / `"---"` / junk).
+ *
+ * "Soonest" is by `etaSortValue`: BRD < ARR < numeric. Ties keep the
+ * first occurrence (stable), which doesn't matter for display since the
+ * token is identical.
+ */
+export function soonestEta(mins: readonly string[]): string | null {
+  let best: string | null = null;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const min of mins) {
+    const rank = etaSortValue(min);
+    // Strictly-less keeps the first of equal ranks; the +Infinity
+    // sentinels never beat the initial `bestRank`, so an all-junk list
+    // yields `null`.
+    if (rank < bestRank) {
+      best = min;
+      bestRank = rank;
+    }
+  }
+  return best;
+}
+
+/**
+ * Render the left-aligned, fixed-width ETA cell that precedes the
+ * station name on a favorite row. The cell is always exactly
+ * `ETA_CELL_WIDTH` columns (plus a trailing space the caller appends),
+ * so station names line up regardless of ETA length / presence.
+ *
+ *   - numeric token (`"4"`)  -> `"4 min "`  (padded to width)
+ *   - `"ARR"` / `"BRD"`      -> `"ARR   "` / `"BRD   "` (verbatim, padded)
+ *   - `null` / unknown       -> all spaces (loading or no-train; the
+ *                               column width is preserved so names stay
+ *                               aligned — we never print "null").
+ *
+ * A numeric token wider than the cell (pathological 3-digit ETA) is
+ * allowed to overflow the cell rather than be truncated — losing the
+ * ETA digit would be worse than a one-row misalignment. The row-level
+ * `SAFE_TEXT_WIDTH` guard in `renderFavoriteRow` still prevents a
+ * hard-wrap.
+ */
+export function renderEtaCell(min: string | null): string {
+  if (min === null) return " ".repeat(ETA_CELL_WIDTH);
+  const text =
+    min === "ARR" || min === "BRD"
+      ? min
+      : /^\d+$/.test(min)
+        ? `${min} min`
+        : ""; // unknown sentinel ("" / "---") -> blank cell, kept aligned
+  if (text.length >= ETA_CELL_WIDTH) return text;
+  return text + " ".repeat(ETA_CELL_WIDTH - text.length);
+}
+
+/**
+ * Render the ETA as the borderless RIGHT-column VALUE for the
+ * two-column body. Unlike `renderEtaCell`, this is NOT space-padded —
+ * the host pins the value container at a fixed pixel x, so alignment
+ * comes from container geometry, not padding. Returns:
+ *
+ *   - numeric token (`"4"`)  -> `"4 min"`
+ *   - `"ARR"` / `"BRD"`      -> `"ARR"` / `"BRD"` (verbatim)
+ *   - `null` / unknown       -> `""`  (loading or no-train → empty value
+ *                               cell; the host renders nothing on the
+ *                               right and the row reads as name-only)
+ *
+ * The empty-string return is the column contract's "no value for this
+ * row" sentinel (`right[i] === ""`).
+ */
+export function renderEtaValue(min: string | null): string {
+  if (min === null) return "";
+  if (min === "ARR" || min === "BRD") return min;
+  if (/^\d+$/.test(min)) return `${min} min`;
+  return ""; // unknown sentinel ("" / "---") → empty value cell
+}
+
+/**
+ * Build the LEFT column of a favorite row for the two-column body: the
+ * cursor prefix, the station name, a separator, and the full line
+ * names — i.e. `renderFavoriteRow` WITHOUT the ETA cell (the ETA now
+ * lives in the borderless right column via `renderEtaValue`).
+ *
+ *   "> Metro Center · RED BLUE ORANGE SILVER"
+ *   "  Gallery Pl-Chinatown · RED YELLOW GREEN"
+ *   "  Union Station · RED"
+ *
+ * Width contract: the returned string never exceeds `LEFT_COL_MAX`
+ * (=50) columns, so it can never run under the right-column value
+ * overlay (pinned at ≈ column 50). As in the single-column form we
+ * prefer to truncate the STATION NAME, keeping the separator + full
+ * line names intact (the codes are the higher-value datum); only when
+ * the line names alone already fill the budget do we fall back to
+ * truncating the whole composed string. A favorite with no lines drops
+ * the separator entirely.
+ */
+export function renderFavoriteLeft(
   fav: FavoriteStation,
   isHighlighted: boolean,
 ): string {
   const prefix = highlightPrefix(isHighlighted);
-  const name = padRight(abbreviateStation(fav.name, NAME_WIDTH), NAME_WIDTH);
-  const lines = padRight(renderLinesSuffix(fav.lines), LINES_WIDTH);
-  // prefix(2) + name(10) + " "(1) + lines(11) = 24 exactly.
-  return prefix + name + " " + lines;
+  const lines = renderLinesSuffix(fav.lines);
+  const suffix = lines.length > 0 ? FAVORITE_SEPARATOR + lines : "";
+
+  // Budget for the station name = the left-column width minus the fixed
+  // parts (prefix + separator + line names). When positive we keep the
+  // codes whole and trim the name to fit; abbreviateStation
+  // short-circuits when the name already fits.
+  const nameBudget = LEFT_COL_MAX - prefix.length - suffix.length;
+  if (nameBudget >= 1) {
+    const name = abbreviateStation(fav.name, nameBudget);
+    return prefix + name + suffix;
+  }
+
+  // Pathological case: prefix + line names already fill the column.
+  // Keep at least one character of the name and truncate the whole
+  // composed string so nothing runs under the value overlay.
+  const firstNameChar = fav.name.slice(0, 1);
+  return truncate(prefix + firstNameChar + suffix, LEFT_COL_MAX);
+}
+
+/**
+ * Build the LEFT column of the ALERTS row for the two-column body: the
+ * `renderAlertsRow` content MINUS the right-aligned count (which moves
+ * to the value column via `renderAlertsValue`). Left-flowing, no
+ * padding:
+ *
+ *   "  ALERTS · RED · ORANGE"   (count "2 alerts" lives in right[i])
+ *
+ * Truncated to `LEFT_COL_MAX` for the same overlay-collision reason as
+ * the favorite left cell.
+ */
+export function renderAlertsLeft(
+  affected: ReadonlySet<LineCode>,
+  isHighlighted: boolean,
+): string {
+  const prefix = highlightPrefix(isHighlighted);
+  const affectedNames = STATUS_ROW_LINE_ORDER
+    .filter((c) => affected.has(c))
+    .map((c) => lineName(c));
+  const linesPart =
+    affectedNames.length === 0
+      ? "ALERTS"
+      : `ALERTS · ${affectedNames.join(" · ")}`;
+  return truncate(prefix + linesPart, LEFT_COL_MAX);
+}
+
+/** The ALERTS row's right-column VALUE: the pluralised count. */
+export function renderAlertsValue(alertCount: number): string {
+  return alertCount === 1 ? "1 alert" : `${alertCount} alerts`;
+}
+
+/**
+ * Build the LEFT column of the ACCESS row for the two-column body: the
+ * label only (the count moves to the value column).
+ *
+ *   "  ACCESS"   (count "2 outages" lives in right[i])
+ */
+export function renderAccessLeft(isHighlighted: boolean): string {
+  return truncate(highlightPrefix(isHighlighted) + ACCESS_LABEL_PREFIX, LEFT_COL_MAX);
+}
+
+/** The ACCESS row's right-column VALUE: the pluralised outage count. */
+export function renderAccessValue(count: number): string {
+  return count === 1 ? "1 outage" : `${count} outages`;
+}
+
+/**
+ * Build a single favorite row — a live departure-board line:
+ *
+ *   "▸ 4 min  Metro Center · RED BLUE ORANGE SILVER"
+ *   "  12 min Gallery Pl-Chinatown · RED YELLOW GREEN"
+ *   "  ARR    Union Station · RED"
+ *
+ * Structure, left to right:
+ *   <prefix><eta cell (ETA_CELL_WIDTH)><space><station name>· <LINES>
+ *
+ * The ETA cell is a LEFT-aligned fixed-width column right after the
+ * cursor prefix, so the soonest-train ETAs form a clean aligned column
+ * and the station names all start at the same position (digits are
+ * near-uniform width in the LVGL font). When the ETA is `null`
+ * (not-yet-loaded or no upcoming train) the cell is rendered as spaces
+ * — never "null" — so the names stay aligned either way.
+ *
+ * Everything is left-flowing / left-aligned: no right-alignment, so the
+ * line codes never float raggedly the way a space-padded right column
+ * does in the variable-width LVGL font.
+ *
+ * Overflow guard: the returned string never exceeds `SAFE_TEXT_WIDTH`
+ * (= 58) columns of real text — the wrap point of the 576px container.
+ * The prefix + ETA cell + its trailing space are fixed-width and
+ * always survive; we prefer to truncate the STATION NAME, keeping the
+ * separator and the full line names intact (the codes are the
+ * higher-value datum). Only when those fixed parts plus the line names
+ * already fill the row do we fall back to truncating the whole composed
+ * string. A favorite with no lines drops the separator entirely.
+ *
+ * @param eta soonest-train `Min` token for this station (`"4"` /
+ *   `"ARR"` / `"BRD"`), or `null` for loading / no-train (blank cell).
+ */
+export function renderFavoriteRow(
+  fav: FavoriteStation,
+  isHighlighted: boolean,
+  eta: string | null = null,
+): string {
+  const prefix = highlightPrefix(isHighlighted);
+  // The ETA cell + its single trailing space is a fixed-width column
+  // that always renders (blank when unknown) so names align.
+  const etaCol = renderEtaCell(eta) + " ";
+  const lead = prefix + etaCol;
+  const lines = renderLinesSuffix(fav.lines);
+  const suffix = lines.length > 0 ? FAVORITE_SEPARATOR + lines : "";
+
+  // Budget for the station name = the safe width minus the fixed parts
+  // (prefix + ETA column + separator + line names). When that's
+  // positive we keep the codes whole and trim the name to fit;
+  // abbreviateStation short-circuits when the name already fits.
+  const nameBudget = SAFE_TEXT_WIDTH - lead.length - suffix.length;
+  if (nameBudget >= 1) {
+    const name = abbreviateStation(fav.name, nameBudget);
+    return lead + name + suffix;
+  }
+
+  // Pathological case: the fixed parts (prefix + ETA column) plus the
+  // line names already overflow the row. Keep at least one character of
+  // the name and truncate the whole composed string so nothing wraps.
+  const firstNameChar = fav.name.slice(0, 1);
+  return truncate(lead + firstNameChar + suffix, SAFE_TEXT_WIDTH);
 }
 
 /** Build the always-present "VOICE LOOKUP" row. */
@@ -199,9 +481,53 @@ export function renderVoiceRow(isHighlighted: boolean): string {
 }
 
 /**
- * Build the synthetic `ACCESS (n) !` row. Same right-aligned-`!`
- * pattern as the v1.1 ALERTS row, used here for elevator/escalator
- * outages at favorite stations.
+ * Build the ALERTS row — decoded prose form. The label "ALERTS"
+ * sits at the left, the affected line codes inline as a
+ * `·`-separated list, and a right-aligned count of alerts.
+ *
+ *   `ALERTS · RED                                 1 alert`
+ *   `ALERTS · RED · ORANGE                       3 alerts`
+ *
+ * Replaces the older glyph-row form (`> RD!BL YL OR GR SV`) which
+ * showed the entire 6-line palette with `!` markers on affected
+ * lines — readable as a glance pattern but cryptic.
+ *
+ * Width contract: returns exactly `LINE_WIDTH` columns.
+ */
+export function renderAlertsRow(
+  affected: ReadonlySet<LineCode>,
+  alertCount: number,
+  isHighlighted: boolean,
+): string {
+  const prefix = highlightPrefix(isHighlighted);
+  // Preserve canonical line order so `RED · ORANGE` always lists
+  // lines in the same order regardless of how the Set was constructed.
+  const affectedNames = STATUS_ROW_LINE_ORDER
+    .filter((c) => affected.has(c))
+    .map((c) => lineName(c));
+  const linesPart =
+    affectedNames.length === 0
+      ? "ALERTS"
+      : `ALERTS · ${affectedNames.join(" · ")}`;
+  const countPart =
+    alertCount === 1 ? "1 alert" : `${alertCount} alerts`;
+  const spaces = Math.max(
+    1,
+    LINE_WIDTH - prefix.length - linesPart.length - countPart.length,
+  );
+  return truncate(
+    prefix + linesPart + " ".repeat(spaces) + countPart,
+    LINE_WIDTH,
+  );
+}
+
+/**
+ * Build the ACCESS row in the same right-aligned-count form as
+ * `renderAlertsRow`:
+ *
+ *   `ACCESS                                      2 outages`
+ *
+ * (singular "1 outage" / plural "N outages").
  *
  * Width contract: always exactly LINE_WIDTH cols.
  */
@@ -209,61 +535,36 @@ export function renderAccessRow(
   count: number,
   isHighlighted: boolean,
 ): string {
-  const prefix = highlightPrefix(isHighlighted); // 2 cols
-  const label = `${ACCESS_LABEL_PREFIX} (${count})`;
-  const trailing = "!";
-  const spacesNeeded =
-    LINE_WIDTH - prefix.length - label.length - trailing.length;
-  if (spacesNeeded < 1) {
-    // Defensive — large outage counts shouldn't realistically crowd
-    // the trailing glyph (there are only ~100 elevators system-wide),
-    // but truncate the label rather than overflowing.
-    const safeLabel = truncate(label, LINE_WIDTH - prefix.length - 2);
-    return prefix + safeLabel + " " + trailing;
-  }
-  return prefix + label + " ".repeat(spacesNeeded) + trailing;
+  const prefix = highlightPrefix(isHighlighted);
+  const label = ACCESS_LABEL_PREFIX;
+  const countPart = count === 1 ? "1 outage" : `${count} outages`;
+  const spaces = Math.max(
+    1,
+    LINE_WIDTH - prefix.length - label.length - countPart.length,
+  );
+  return truncate(
+    prefix + label + " ".repeat(spaces) + countPart,
+    LINE_WIDTH,
+  );
 }
 
 /**
- * Build the per-line status glyph row. Six fixed-width 3-col cells,
- * one per WMATA rail line in `STATUS_ROW_LINE_ORDER`, each rendered
- * as the 2-char code followed by either `!` (line has an active
- * incident the user follows) or ` ` (clear).
+ * Render the title row — the screen identifier only, left-aligned:
+ *   "WMATA  Favorites"
  *
- * Width contract: returns exactly `LINE_WIDTH` columns.
+ * The wall clock is NO LONGER part of the header string: the host
+ * renders it into a dedicated top-right clock container on every screen
+ * for consistent placement. The title is truncated to 50 columns so it
+ * can never collide with that clock cell (which starts at x≈486px ≈
+ * column 50).
  *
- *   prefix(2) + 6 cells × 3 chars (18) + 4 trailing pad = 24
- *
- * No leading "ALERTS" label — the bang-suffix glyphs are enough
- * signal (an "RD!" cell is visually distinct from "RD "), and trying
- * to fit a 5-char label drove the row over budget. The 4-col trailing
- * pad keeps the row exactly LINE_WIDTH regardless of how many cells
- * end with `!` vs ` `, so the visual grid stays stable across
- * renders.
+ * The `(n/5)` count parenthetical was dropped earlier — the user can
+ * count favorites by looking at the body rows below — and the
+ * `favoritesCount` / `nowMs` parameters went with the clock; the title
+ * is now a constant.
  */
-export function renderStatusGlyphRow(
-  affected: ReadonlySet<LineCode>,
-  isHighlighted: boolean,
-): string {
-  const prefix = highlightPrefix(isHighlighted); // 2 cols
-  const cells = STATUS_ROW_LINE_ORDER.map(
-    (code) => code + (affected.has(code) ? "!" : " "),
-  ).join("");
-  // padRight handles both the trailing pad and the (defensive)
-  // truncate-on-overflow contract — a future LineCode addition would
-  // truncate at the right edge rather than blowing past LINE_WIDTH.
-  return padRight(prefix + cells, LINE_WIDTH);
-}
-
-/**
- * Render the title row. `WMATA — Favorites (n/5)` is 24 cols when n is a
- * single digit (it's always 0-5 by construction of MAX_FAVORITES), so
- * we don't need to truncate. We still pass it through `truncate` as a
- * belt-and-suspenders guard.
- */
-export function renderHeader(favoritesCount: number): string {
-  const text = `WMATA — Favorites (${favoritesCount}/5)`;
-  return truncate(text, LINE_WIDTH);
+export function renderHeader(): string {
+  return truncate("WMATA  Favorites", 50);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,21 +604,21 @@ export function hasAccessRow(snapshot: HomeSnapshot): boolean {
 
 /**
  * The flat list of selectable rows. The synthetic rows (status,
- * access, voice) are part of the navigation model so SCROLL_UP/DOWN
- * can land on them.
+ * access) are part of the navigation model so SCROLL_UP/DOWN can
+ * land on them. The voice-lookup utility row was removed because
+ * the underlying voice-search feature isn't wired up yet — once it
+ * lands, restore a `+1` here and the `isVoiceIndex` helper below.
  *
  * Index conventions (rows that are absent are skipped, indices shift):
  *   - 0?  (optional) status glyph row
  *   - 1?  (optional) ACCESS row
  *   - …   the favorites
- *   - …+1 the voice-lookup row
  */
 export function rowCount(snapshot: HomeSnapshot): number {
   return (
     (hasAlertsRow(snapshot) ? 1 : 0) +
     (hasAccessRow(snapshot) ? 1 : 0) +
-    snapshot.favorites.length +
-    1
+    snapshot.favorites.length
   );
 }
 
@@ -350,9 +651,12 @@ export function favoritesOffset(snapshot: HomeSnapshot): number {
   );
 }
 
-/** True if `index` points at the voice-lookup synthetic row. */
-export function isVoiceIndex(snapshot: HomeSnapshot, index: number): boolean {
-  return index === favoritesOffset(snapshot) + snapshot.favorites.length;
+/**
+ * Stub retained for callsites — the voice-lookup row was removed
+ * pending the underlying feature wiring up. Always returns false.
+ */
+export function isVoiceIndex(_snapshot: HomeSnapshot, _index: number): boolean {
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +713,18 @@ export function makeHomeScreen(
      * the stored schedule. Wired in `main.ts`.
      */
     refreshQuietHours?: () => Promise<boolean>;
+    /**
+     * Fetch the soonest next-train ETA for every favorite station,
+     * returned as a `stationCode → Min token` map (the token is the
+     * raw WMATA `Min` of the soonest upcoming train, or `null` when a
+     * station has no upcoming train). Wired in `main.ts` to a single
+     * batched predictions call for all favorite codes (WMATA accepts a
+     * comma-joined code list), keeping us well under the 10 req/s
+     * ceiling. Best-effort: a rejection is swallowed and the previous
+     * ETA map is preserved (the rows linger at their last values rather
+     * than blanking).
+     */
+    refreshFavoriteEtas?: () => Promise<Record<string, string | null>>;
     tickIntervalMs?: number;
   },
 ): Screen<HomeSnapshot> {
@@ -416,79 +732,114 @@ export function makeHomeScreen(
     name: "home",
     init: loader,
     // `ctx` (third param) carries the host-supplied wall clock for
-    // time-sensitive UI; Home has none, so we accept-and-ignore it.
-    // Prefixing with `_` quiets `noUnusedParameters` while still
-    // documenting the contract for future readers.
-    view(snapshot, nav, _ctx) {
+    // time-sensitive UI; Home has none — the host renders the clock in
+    // its own container — so we accept-and-ignore it. Prefixing with `_`
+    // quiets `noUnusedParameters` while still documenting the contract.
+    view(snapshot, nav, _ctx): ScreenSections {
       // Defensive clamp: if a future migration / data-corruption bug
       // hands us more than MAX_FAVORITES, render only the first slice
       // rather than throwing or producing an oversized list. The same
       // clamp is applied in `reduce()` via `rowCount`/`isVoiceIndex`,
       // both of which call through `clampedSnapshot()`.
       const clamped = clampedSnapshot(snapshot);
-      const lines: string[] = [];
-      lines.push(renderHeader(clamped.favorites.length));
+      const header: string[] = [renderHeader()];
+      // TRUE two-column body: `left[i]` is the primary content (station
+      // name + line names, or a synthetic label), `right[i]` the value
+      // (ETA / count) — pixel-aligned because the host overlays the
+      // right column in a borderless container pinned at a fixed x. The
+      // two arrays are built in lockstep so `left[i]`/`right[i]` are the
+      // SAME row. `body` is left empty: when `bodyColumns` is present
+      // the host ignores `body` and `flattenSections` zips the columns.
+      const left: string[] = [];
+      const right: string[] = [];
+      // Append a (left, right) pair as one body row, keeping the two
+      // arrays the same length.
+      const pushRow = (l: string, r: string): void => {
+        left.push(l);
+        right.push(r);
+      };
 
       const affected = new Set<LineCode>(clamped.affectedLines);
       const showStatus = hasAlertsRow(clamped);
       const showAccess = hasAccessRow(clamped);
 
+      // Synthetic-row count is just the number of distinct affected
+      // lines — the only count we have at this layer. Drives the
+      // `ALERTS · RD … N alerts` value-column summary.
+      const alertCount = affected.size;
+
       if (clamped.favorites.length === 0) {
-        // Empty state — exactly 4 rendered lines when there are no
-        // active alerts AND no access outages:
-        //   header + "No favorites yet." + "Open phone to add." + voice
-        // Synthetic rows (status / access), when present, slot in
-        // ABOVE the help text. The empty-state line count is locked
-        // at 4 by the test fixtures (which use no alerts / no
-        // outages), so adding any synthetic row to a populated
-        // snapshot bumps the total visibly.
+        // Empty state: synthetic alert / access rows at the top (if
+        // present), then friendly help copy.
+        //
         // NOTE: empty-state branch uses the RAW highlightedIndex (not
         // the clamped value) so that an out-of-range index renders an
-        // un-highlighted row. The reducer clamps separately; this
-        // preserves the WP6 contract that `view` is a pure projection
-        // of (snapshot, nav) without any auto-clamping side effect.
+        // un-highlighted row.
         let cursor = 0;
         if (showStatus) {
-          lines.push(
-            renderStatusGlyphRow(affected, nav.highlightedIndex === cursor),
+          pushRow(
+            renderAlertsLeft(affected, nav.highlightedIndex === cursor),
+            renderAlertsValue(alertCount),
           );
           cursor += 1;
         }
         if (showAccess) {
-          lines.push(
-            renderAccessRow(
-              clamped.accessOutageCount,
-              nav.highlightedIndex === cursor,
-            ),
+          pushRow(
+            renderAccessLeft(nav.highlightedIndex === cursor),
+            renderAccessValue(clamped.accessOutageCount),
           );
           cursor += 1;
         }
-        lines.push(truncate("No favorites yet.", LINE_WIDTH));
-        lines.push(truncate("Open phone to add.", LINE_WIDTH));
-        lines.push(renderVoiceRow(nav.highlightedIndex === cursor));
-        return lines;
+        if (showStatus || showAccess) pushRow("", "");
+        // Friendly two-line empty state. These are real-text (prose)
+        // lines with no value column, so each carries an empty `right`
+        // cell. They wrap at SAFE_TEXT_WIDTH; both sit comfortably under
+        // the budget. We deliberately do not pad with filler — the
+        // favorites list is meant to grow.
+        pushRow(
+          truncate("No favorites yet. Open the phone app", SAFE_TEXT_WIDTH),
+          "",
+        );
+        pushRow(
+          truncate("to add your home + commute stations.", SAFE_TEXT_WIDTH),
+          "",
+        );
+        return { header, body: [], bodyColumns: { left, right } };
       }
 
       const total = rowCount(clamped);
       const idx = clampIndex(nav.highlightedIndex, total);
       const favOffset = favoritesOffset(clamped);
       if (showStatus) {
-        lines.push(renderStatusGlyphRow(affected, isAlertsIndex(clamped, idx)));
-      }
-      if (showAccess) {
-        lines.push(
-          renderAccessRow(
-            clamped.accessOutageCount,
-            isAccessIndex(clamped, idx),
-          ),
+        pushRow(
+          renderAlertsLeft(affected, isAlertsIndex(clamped, idx)),
+          renderAlertsValue(alertCount),
         );
       }
+      if (showAccess) {
+        pushRow(
+          renderAccessLeft(isAccessIndex(clamped, idx)),
+          renderAccessValue(clamped.accessOutageCount),
+        );
+      }
+      // Blank separator between the synthetic alert rows (alerts /
+      // access) and the user's actual favorites — only when there's at
+      // least one synthetic row above to separate from. Both columns
+      // blank.
+      if (showStatus || showAccess) pushRow("", "");
       for (let i = 0; i < clamped.favorites.length; i++) {
         const fav = clamped.favorites[i]!;
-        lines.push(renderFavoriteRow(fav, idx === favOffset + i));
+        // An ABSENT key (the seeded `{}` loading state) and a present
+        // `null` value both render an empty ETA value — `?? null`
+        // normalises `undefined` to `null` so `renderEtaValue` gets a
+        // single "no ETA" representation (returns "").
+        const eta = clamped.favoriteEtas[fav.code] ?? null;
+        pushRow(
+          renderFavoriteLeft(fav, idx === favOffset + i),
+          renderEtaValue(eta),
+        );
       }
-      lines.push(renderVoiceRow(isVoiceIndex(clamped, idx)));
-      return lines;
+      return { header, body: [], bodyColumns: { left, right } };
     },
     reduce(snapshot, nav, event): ReduceResult<HomeSnapshot> {
       const clamped = clampedSnapshot(snapshot);
@@ -559,13 +910,14 @@ export function makeHomeScreen(
   const refreshLines = options?.refreshAffectedLines;
   const refreshAccess = options?.refreshAccessOutageCount;
   const refreshQuiet = options?.refreshQuietHours;
+  const refreshEtas = options?.refreshFavoriteEtas;
   if (
-    (refreshLines || refreshAccess || refreshQuiet) &&
+    (refreshLines || refreshAccess || refreshQuiet || refreshEtas) &&
     (options?.tickIntervalMs ?? 0) > 0
   ) {
     screen.tick = async (snapshot: HomeSnapshot): Promise<HomeSnapshot> => {
-      const [linesResult, accessResult, quietResult] = await Promise.allSettled(
-        [
+      const [linesResult, accessResult, quietResult, etasResult] =
+        await Promise.allSettled([
           refreshLines
             ? refreshLines()
             : Promise.resolve(snapshot.affectedLines),
@@ -575,8 +927,10 @@ export function makeHomeScreen(
           refreshQuiet
             ? refreshQuiet()
             : Promise.resolve(snapshot.quietHours),
-        ],
-      );
+          refreshEtas
+            ? refreshEtas()
+            : Promise.resolve(snapshot.favoriteEtas),
+        ]);
 
       const nextLines =
         linesResult.status === "fulfilled"
@@ -590,11 +944,23 @@ export function makeHomeScreen(
         quietResult.status === "fulfilled"
           ? quietResult.value
           : snapshot.quietHours;
+      const nextEtas =
+        etasResult.status === "fulfilled"
+          ? etasResult.value
+          : snapshot.favoriteEtas;
 
       const linesUnchanged = sameLines(nextLines, snapshot.affectedLines);
       const accessUnchanged = nextAccess === snapshot.accessOutageCount;
       const quietUnchanged = nextQuiet === snapshot.quietHours;
-      if (linesUnchanged && accessUnchanged && quietUnchanged) return snapshot;
+      const etasUnchanged = sameEtas(nextEtas, snapshot.favoriteEtas);
+      if (
+        linesUnchanged &&
+        accessUnchanged &&
+        quietUnchanged &&
+        etasUnchanged
+      ) {
+        return snapshot;
+      }
 
       return {
         ...snapshot,
@@ -603,6 +969,7 @@ export function makeHomeScreen(
           ? snapshot.accessOutageCount
           : nextAccess,
         quietHours: quietUnchanged ? snapshot.quietHours : nextQuiet,
+        favoriteEtas: etasUnchanged ? snapshot.favoriteEtas : nextEtas,
       };
     };
     screen.tickIntervalMs = options!.tickIntervalMs;
@@ -621,5 +988,28 @@ function sameLines(a: readonly LineCode[], b: readonly LineCode[]): boolean {
   if (a.length !== b.length) return false;
   const seen = new Set<LineCode>(a);
   for (const c of b) if (!seen.has(c)) return false;
+  return true;
+}
+
+/**
+ * Key-and-value equality on the favorite-ETA map. Used by the Home tick
+ * to skip a re-render when no ETA actually changed (the common case at
+ * the 60s cadence between trains). Compares both directions so a key
+ * appearing or disappearing counts as a change; values compare with
+ * `===` (string tokens or `null`).
+ */
+function sameEtas(
+  a: Record<string, string | null>,
+  b: Record<string, string | null>,
+): boolean {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    // A key in `a` but absent in `b` → `b[k]` is undefined, which !==
+    // any string-or-null value in `a`, so this correctly flags a diff.
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (a[k] !== b[k]) return false;
+  }
   return true;
 }
