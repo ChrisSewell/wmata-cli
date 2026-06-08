@@ -463,6 +463,18 @@ export async function mountGlassesScreen<S>(
   let lastRenderedFooter: string | null = null;
   let lastRenderedClock: string | null = null;
 
+  // Render serialization. `render()` is invoked from three un-synchronised
+  // sources — the event `dispatch`, the fetch `runTick`, and the 1Hz clock
+  // timer — each of which awaits `bridge.textContainerUpgrade`. Without a
+  // lock, two render bodies can interleave across those awaits and leave a
+  // per-container de-dup cache entry (`lastRendered*`) disagreeing with the
+  // last content actually pushed. We coalesce: only one render body runs at
+  // a time; a render requested while one is in flight sets `renderPending`,
+  // and the in-flight render loops once more so the LATEST snapshot/clock
+  // is always the final frame (no dropped renders).
+  let renderInFlight = false;
+  let renderPending = false;
+
   /**
    * The screen's static layout mode. Cached because it controls
    * whether the footer container exists; switching it at runtime
@@ -515,8 +527,19 @@ export async function mountGlassesScreen<S>(
   // steady between fetch ticks).
   const render = async (): Promise<void> => {
     if (!active) return;
-    const ctx = makeCtx();
-    const sections = screen.view(snapshot, nav, ctx);
+    // Coalescing guard (see `renderInFlight` declaration): never run two
+    // render bodies concurrently; instead loop once more for the latest.
+    if (renderInFlight) {
+      renderPending = true;
+      return;
+    }
+    renderInFlight = true;
+    try {
+      do {
+        renderPending = false;
+        if (!active) break;
+        const ctx = makeCtx();
+        const sections = screen.view(snapshot, nav, ctx);
     const headerContent = joinForRender(sections.header);
     // Two-column body: the LEFT lines go in the normal body container,
     // the RIGHT (value) lines in the borderless overlay. Single-column
@@ -599,6 +622,10 @@ export async function mountGlassesScreen<S>(
       } catch (err) {
         console.warn(`[glasses-host] clock textContainerUpgrade failed:`, err);
       }
+    }
+      } while (renderPending && active);
+    } finally {
+      renderInFlight = false;
     }
   };
 

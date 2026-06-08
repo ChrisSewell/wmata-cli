@@ -76,6 +76,14 @@ export type NavIntent =
   | { to: "voice" }
   | { to: "tutorial" }
   | { to: "journey" }
+  /**
+   * Pre-config placeholder: shown on the glasses when no API key /
+   * favorites are set yet, prompting the user to finish setup on the
+   * phone. The boot watcher in `main.ts` swaps it for `home` the
+   * instant config becomes complete (no page reload). See
+   * `screens/unconfigured.ts`.
+   */
+  | { to: "unconfigured" }
   | { to: "exit" };
 
 /**

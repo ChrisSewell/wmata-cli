@@ -166,6 +166,23 @@ const KEY_VOICE_TARGETS = "wmata.g2.voiceTargets";
 const KEY_JOURNEY_PLAN = "wmata.g2.journeyPlan";
 const KEY_GEOFENCE_ENABLED = "wmata.g2.geofenceEnabled";
 
+/**
+ * Every namespaced settings key, in one place, for the bridge-storage
+ * sync layer (`storage/bridge-sync.ts`) to hydrate from / mirror to the
+ * Even Hub durable store. Keep in sync with the `KEY_*` consts above —
+ * a key missing here simply won't survive an app restart on hardware.
+ */
+export const STORAGE_KEYS: readonly string[] = [
+  KEY_API_KEY,
+  KEY_FAVORITES,
+  KEY_STT_API_KEY,
+  KEY_TUTORIAL_SEEN,
+  KEY_SCHEDULE,
+  KEY_VOICE_TARGETS,
+  KEY_JOURNEY_PLAN,
+  KEY_GEOFENCE_ENABLED,
+];
+
 /** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
   "RD",
@@ -180,6 +197,38 @@ const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
 interface Envelope<T> {
   schemaVersion: number;
   value: T;
+}
+
+// ---------------------------------------------------------------------------
+// Durable-store mirror (Even Hub bridge)
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional sink that mirrors every settings write to a durable store —
+ * the Even Hub bridge's `setLocalStorage` (see `storage/bridge-sync.ts`).
+ * Registered at boot by `main.ts` once the bridge is ready; stays `null`
+ * in tests and browser-only mode (writes then live only in
+ * `window.localStorage`).
+ *
+ * Why this matters: per the Even Hub SDK, WebView `localStorage` "may be
+ * cleared on app restart" — only the bridge store reliably persists
+ * across the packed app being closed and reopened. We keep `localStorage`
+ * as the fast synchronous working copy (so this module stays pure +
+ * sync, and all callers/tests are untouched) and mirror writes to the
+ * bridge so settings actually survive between sessions on hardware.
+ *
+ * The signature is deliberately SDK-free (`(key, value) => void`) so this
+ * module keeps its "no SDK imports" contract. An empty `value` means
+ * "unset" (the bridge store has no delete; an empty string reads back as
+ * absent — matching the hydrate side in `bridge-sync.ts`).
+ */
+let storageMirror: ((key: string, value: string) => void) | null = null;
+
+/** Register (or clear, with `null`) the durable-store mirror. */
+export function setStorageMirror(
+  fn: ((key: string, value: string) => void) | null,
+): void {
+  storageMirror = fn;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,21 +256,25 @@ function safeGet(key: string): string | null {
  */
 function safeSet(key: string, value: string): void {
   try {
-    if (typeof localStorage === "undefined") return;
-    localStorage.setItem(key, value);
+    if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
   } catch (err) {
     console.warn(`[settings] localStorage.setItem(${key}) failed:`, err);
   }
+  // Mirror to the durable bridge store (best-effort, fire-and-forget).
+  // Runs even if the localStorage write above threw — the bridge store
+  // is the copy that survives an app restart on hardware.
+  storageMirror?.(key, value);
 }
 
 /** Remove a key. Same swallow-and-warn semantics as `safeSet`. */
 function safeRemove(key: string): void {
   try {
-    if (typeof localStorage === "undefined") return;
-    localStorage.removeItem(key);
+    if (typeof localStorage !== "undefined") localStorage.removeItem(key);
   } catch (err) {
     console.warn(`[settings] localStorage.removeItem(${key}) failed:`, err);
   }
+  // Mirror the removal: an empty string is the bridge store's "unset".
+  storageMirror?.(key, "");
 }
 
 // ---------------------------------------------------------------------------

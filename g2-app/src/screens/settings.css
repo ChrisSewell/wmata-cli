@@ -351,6 +351,20 @@
   animation: wmata-settings-done-pulse 1.4s ease-out 2;
 }
 
+/* Passive "live on your glasses" confirmation (replaces the old reload
+ * button now that the glasses auto-transition). Centered, with a little
+ * breathing room; the --attention variant reuses the pulse on the
+ * 0 -> 1 favorite transition so it announces itself once. */
+.wmata-settings__live {
+  text-align: center;
+  padding: 10px 14px;
+  border-radius: 8px;
+}
+
+.wmata-settings__live--attention {
+  animation: wmata-settings-done-pulse 1.4s ease-out 2;
+}
+
 /* --------------------------------------------------------------------- */
 /* Footer                                                                */
 /* --------------------------------------------------------------------- */

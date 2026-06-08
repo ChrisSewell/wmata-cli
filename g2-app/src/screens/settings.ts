@@ -114,8 +114,8 @@ interface ScreenState {
   /**
    * Tracks `state.favorites.length` from the *previous* render of the
    * favorites card. Used to detect the 0 -> 1 transition so we can give
-   * the "Done — launch on glasses" button a brief attention-grabbing
-   * class on the render right after the user adds their first favorite.
+   * the "live on your glasses" confirmation a brief attention-grabbing
+   * pulse on the render right after the user adds their first favorite.
    *
    * Initialised to the loaded favorites count so the highlight does NOT
    * fire on the very first render (the user didn't just add a favorite —
@@ -923,45 +923,35 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
       favoritesMount.appendChild(favList);
     }
 
-    // Done — launch on glasses --------------------------------------------
+    // Live-on-glasses confirmation ----------------------------------------
     //
-    // Surface a prominent action at the bottom of the favorites card so
-    // the user has an obvious way to "finish here and move to the
-    // glasses HUD" without manually reloading the page. The handoff is
-    // intentionally a `window.location.reload()` — simple and reliable;
-    // the boot logic in `main.ts` re-evaluates the settings on every
-    // start and routes to the glasses Home screen when a key is saved
-    // and favorites are present.
+    // The glasses are glasses-first now: they boot the moment the app
+    // launches and show a "finish setup on your phone" card until an API
+    // key + a favorite are saved. A watcher in `main.ts` then swaps that
+    // card for the live Home screen within ~1.5s — no page reload, no
+    // button. So this is a PASSIVE confirmation that setup is complete and
+    // the HUD is live, not an action to trigger the hand-off.
     //
-    // The button is hidden when either prerequisite is missing (no key
-    // accepted OR zero favorites), because the glasses route would be a
-    // dead-end in that state.
-    //
-    // The 0 -> 1 favorites transition triggers a brief class toggle
-    // (`wmata-settings__button--attention`) so the button visually
-    // announces itself on the same render where it first appears.
-    // The class is cleared on the next render to avoid the highlight
-    // becoming permanent.
+    // Shown only when both prerequisites are met (key accepted AND ≥1
+    // favorite). The 0 -> 1 favorites transition adds a brief attention
+    // pulse so the confirmation announces itself on first appearance.
     if (state.keyAccepted && state.favorites.length > 0) {
       const justGotFirstFavorite =
         previousCount === 0 && state.favorites.length >= 1;
-      const doneBtn = el(
-        'button',
+      const liveBanner = el(
+        'div',
         {
-          type: 'button',
           class: justGotFirstFavorite
-            ? 'wmata-settings__button wmata-settings__button--primary wmata-settings__button--done wmata-settings__button--attention'
-            : 'wmata-settings__button wmata-settings__button--primary wmata-settings__button--done',
-          'data-testid': 'wmata-settings-done',
-          'aria-label': 'Done. Launch on glasses.',
+            ? 'wmata-settings__status wmata-settings__status--ok wmata-settings__live wmata-settings__live--attention'
+            : 'wmata-settings__status wmata-settings__status--ok wmata-settings__live',
+          'data-testid': 'wmata-settings-live',
+          role: 'status',
+          'aria-live': 'polite',
         },
-        ['Done — launch on glasses'],
+        ['✓ Live on your glasses — edits apply automatically'],
       );
-      doneBtn.addEventListener('click', () => {
-        window.location.reload();
-      });
       favoritesMount.appendChild(
-        el('div', { class: 'wmata-settings__done-row' }, [doneBtn]),
+        el('div', { class: 'wmata-settings__done-row' }, [liveBanner]),
       );
     }
 
