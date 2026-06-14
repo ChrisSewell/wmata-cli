@@ -582,9 +582,9 @@ describe("incidents view: first-load fetch error", () => {
     expectFits(lines);
     expect(lines).toEqual([
       "ALERTS",
-      "Couldn't reach WMATA. Will retry shortly.",
+      "Couldn't reach WMATA.",
       "",
-      "(double-tap to return)",
+      "Tap to retry · double-tap to return",
     ]);
     expect(lines.length).toBe(4);
     expect(sections.clockMarker).toBe("?");
@@ -639,11 +639,29 @@ describe("incidents reduce: DOUBLE_TAP returns to home", () => {
     }
   });
 
-  it("TAP is a no-op (read-only screen)", () => {
+  it("TAP is a no-op when data is present (read-only screen)", () => {
     const screen = makeIncidentsScreen(noopFetcher, makeSnap(FIVE_INCIDENTS));
     const r = screen.reduce(screen.init(), initialNav(), { type: "TAP" });
     expect(r.navigate).toBeUndefined();
     expect(r.nav).toEqual(initialNav());
+    expect(r.requestTick).toBeUndefined();
+  });
+
+  it("TAP in the first-load error state requests a retry (tap to retry)", () => {
+    const errSnap = makeSnap([], { fetchedAt: 0, fetchError: "boom" });
+    const screen = makeIncidentsScreen(noopFetcher, errSnap);
+    const r = screen.reduce(errSnap, initialNav(), { type: "TAP" });
+    expect(r.requestTick).toBe(true);
+    expect(r.navigate).toBeUndefined();
+  });
+
+  it("TAP after a successful empty fetch does NOT retry (genuine all-clear)", () => {
+    // fetchedAt > 0 with no error: a real all-clear, not a reachability
+    // failure — TAP must stay a no-op.
+    const okEmpty = makeSnap([], { fetchedAt: 1000, fetchError: null });
+    const screen = makeIncidentsScreen(noopFetcher, okEmpty);
+    const r = screen.reduce(okEmpty, initialNav(), { type: "TAP" });
+    expect(r.requestTick).toBeUndefined();
   });
 });
 

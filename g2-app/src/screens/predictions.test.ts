@@ -815,10 +815,34 @@ describe("predictions reduce", () => {
     expect(r.nav).toEqual(initialNav());
   });
 
-  it("TAP is a no-op", () => {
+  it("TAP is a no-op in the genuine-empty state (no trains, fetched OK)", () => {
+    // snap({}) → trains [], fetchedAt NOW, no error: a real "no trains".
     const r = screen.reduce(screen.init(), initialNav(), { type: "TAP" });
     expect(r.navigate).toBeUndefined();
     expect(r.nav).toEqual(initialNav());
+    expect(r.requestTick).toBeUndefined();
+  });
+
+  it("TAP in the first-load error state requests a retry (tap to retry)", () => {
+    const errScreen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: [], fetchedAt: 0, fetchError: "boom" }),
+    );
+    const r = errScreen.reduce(errScreen.init(), initialNav(), { type: "TAP" });
+    expect(r.requestTick).toBe(true);
+    expect(r.navigate).toBeUndefined();
+  });
+
+  it("renders 'Couldn't reach WMATA' + tap-to-retry copy on first-load error", () => {
+    const errScreen = makePredictionsScreen(
+      noopFetcher,
+      snap({ trains: [], fetchedAt: 0, fetchError: "boom" }),
+    );
+    const lines = flattenSections(
+      errScreen.view(errScreen.init(), initialNav(), CTX),
+    );
+    expect(lines.some((l) => l.includes("Couldn't reach WMATA"))).toBe(true);
+    expect(lines.some((l) => l.includes("Tap to retry"))).toBe(true);
   });
 
   it("DOUBLE_TAP navigates BACK to home (not exit)", () => {

@@ -28,6 +28,7 @@ import {
 
 import { SCREEN_WIDTH_PX } from "./ui/render";
 import { formatClock } from "./ui/format";
+import { TIER } from "./ui/palette";
 import { buildCards, type ScreenCard } from "./preview/gallery";
 
 // --- Container geometry (mirrors glasses-host.ts) ---
@@ -59,8 +60,12 @@ const BODY_RIGHT_ID = 7;
 const BODY_RIGHT_X = 466;
 const BODY_RIGHT_W = SCREEN_WIDTH_PX - BODY_RIGHT_X;
 
-const BORDER_COLOR = 8;
-const BORDER_RADIUS = 4;
+// Per-section brightness tiers + 6px OS default radius (mirrors
+// glasses-host.ts: header SECONDARY, body PRIMARY, footer MUTED).
+const HEADER_BORDER_COLOR = TIER.SECONDARY;
+const BODY_BORDER_COLOR = TIER.PRIMARY;
+const FOOTER_BORDER_COLOR = TIER.MUTED;
+const BORDER_RADIUS = 6;
 const PADDING = 6;
 
 type Layout = "two-section" | "three-section";
@@ -112,7 +117,7 @@ function buildPage(
           width: SCREEN_WIDTH_PX,
           height: THREE_HEADER_H,
           borderWidth: 1,
-          borderColor: BORDER_COLOR,
+          borderColor: HEADER_BORDER_COLOR,
           borderRadius: BORDER_RADIUS,
           paddingLength: PADDING,
           containerID: HEADER_ID,
@@ -126,7 +131,7 @@ function buildPage(
           width: SCREEN_WIDTH_PX,
           height: THREE_BODY_H,
           borderWidth: 1,
-          borderColor: BORDER_COLOR,
+          borderColor: BODY_BORDER_COLOR,
           borderRadius: BORDER_RADIUS,
           paddingLength: PADDING,
           containerID: BODY_ID,
@@ -140,7 +145,7 @@ function buildPage(
           width: SCREEN_WIDTH_PX,
           height: THREE_FOOTER_H,
           borderWidth: 1,
-          borderColor: BORDER_COLOR,
+          borderColor: FOOTER_BORDER_COLOR,
           borderRadius: BORDER_RADIUS,
           paddingLength: PADDING,
           containerID: FOOTER_ID,
@@ -163,7 +168,7 @@ function buildPage(
         width: SCREEN_WIDTH_PX,
         height: TWO_HEADER_H,
         borderWidth: 1,
-        borderColor: BORDER_COLOR,
+        borderColor: HEADER_BORDER_COLOR,
         borderRadius: BORDER_RADIUS,
         paddingLength: PADDING,
         containerID: HEADER_ID,
@@ -177,7 +182,7 @@ function buildPage(
         width: SCREEN_WIDTH_PX,
         height: TWO_BODY_H,
         borderWidth: 1,
-        borderColor: BORDER_COLOR,
+        borderColor: BODY_BORDER_COLOR,
         borderRadius: BORDER_RADIUS,
         paddingLength: PADDING,
         containerID: BODY_ID,

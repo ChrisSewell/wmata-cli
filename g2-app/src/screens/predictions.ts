@@ -1061,13 +1061,25 @@ export function makePredictionsScreen(
         // at all. If there's no data yet AND we've never fetched, show a
         // "Loading…" cue; otherwise show "No trains predicted". These are
         // value-less prose rows: all content in the LEFT column.
+        const firstLoadError =
+          snapshot.fetchedAt === 0 && snapshot.fetchError !== null;
         if (snapshot.fetchedAt === 0 && snapshot.fetchError === null) {
           pushRow({ left: truncate("Loading…", LINE_WIDTH), right: "" });
+        } else if (firstLoadError) {
+          pushRow({ left: truncate("Couldn't reach WMATA.", LINE_WIDTH), right: "" });
         } else {
           pushRow({ left: truncate("No trains predicted.", LINE_WIDTH), right: "" });
         }
         pushRow({ left: "", right: "" });
-        pushRow({ left: truncate("(double-tap to exit)", LINE_WIDTH), right: "" });
+        // On the first-load error, TAP retries the fetch (wired in the
+        // reducer); otherwise the only action is double-tap to exit.
+        pushRow({
+          left: truncate(
+            firstLoadError ? "Tap to retry · double-tap to exit" : "(double-tap to exit)",
+            LINE_WIDTH,
+          ),
+          right: "",
+        });
       } else {
         // Cursor: `nav.highlightedIndex` is clamped to the visible
         // range. The pinned train (if any) is marked with "*"; the
@@ -1160,7 +1172,15 @@ export function makePredictionsScreen(
               : { ...snapshot, cursorVisible: true },
           };
         case "TAP": {
-          if (visible.length === 0) return { nav };
+          if (visible.length === 0) {
+            // Empty body: TAP is "tap to retry" in the first-load error
+            // state (couldn't reach WMATA, never fetched) — ask the host
+            // to refetch now (single-flight-guarded). In the benign empty
+            // states (still loading / genuinely no trains) TAP is a no-op.
+            const firstLoadError =
+              snapshot.fetchedAt === 0 && snapshot.fetchError !== null;
+            return { nav, requestTick: firstLoadError ? true : undefined };
+          }
           const t = visible[cursorIdx]!;
           const candidate = {
             line: t.Line,

@@ -54,6 +54,7 @@ import {
 
 import { SCREEN_WIDTH_PX } from "../ui/render";
 import { formatClock } from "../ui/format";
+import { TIER } from "../ui/palette";
 
 import type {
   NavState,
@@ -165,18 +166,29 @@ const THREE_FOOTER_Y_PX = THREE_HEADER_HEIGHT_PX + THREE_BODY_HEIGHT_PX; // 200
 const THREE_FOOTER_HEIGHT_PX = 84; // = 288 - 204
 
 /**
- * Container border colour index (16-shade greyscale, 0..15). Index 8
- * is the midpoint — visible enough to read as a frame without
- * competing with the brighter content (rendered at ~14-15).
+ * Container border-colour brightness tiers (16-shade greyscale, 0..15).
+ *
+ * Hierarchy on the G2 is expressed through BRIGHTNESS, not hue (see
+ * `ui/palette.ts`). We render ~3 tiers per screen so the one focused /
+ * active element stands out from its frame, replacing the previous flat
+ * single index where header / body / footer all read at one weight:
+ *
+ *   - HEADER → SECONDARY (9): structural chrome that should recede.
+ *   - BODY   → PRIMARY (15): the sole `isEventCapture` element — the
+ *     focused / interactive container, so it carries the brightest frame.
+ *   - FOOTER → MUTED (6): the dimmest still-legible weight (the floor).
  */
-const BORDER_COLOR = 8;
+const HEADER_BORDER_COLOR = TIER.SECONDARY;
+const BODY_BORDER_COLOR = TIER.PRIMARY;
+const FOOTER_BORDER_COLOR = TIER.MUTED;
 
 /**
- * Border-radius (0..10) for the container corners. A small non-zero
- * value gives the bordered sections a "card" feel instead of sharp
- * 90° corners. Empirically tuned in the simulator.
+ * Border-radius for the container corners. 6px is the official Even
+ * Realities OS default frame radius (figma-extract guidelines `02 §2.3`;
+ * 6px is also by far the most-used corner radius in the design tokens),
+ * giving the bordered sections the system "card" feel.
  */
-const BORDER_RADIUS = 4;
+const BORDER_RADIUS = 6;
 
 /** Padding inside every container, in pixels. A small inset keeps
  *  content (especially the cursor marker and first text column) from
@@ -203,12 +215,39 @@ const FOOTER_PADDING = 6;
  */
 const CLOCK_TICK_MS = 1000;
 
-/** Map a raw SDK eventType to `OsEventTypeList`, defaulting to CLICK_EVENT (0). */
-function normalizeEventType(raw: OsEventTypeList | undefined): OsEventTypeList {
-  // Protobuf strips zero-value fields on the wire, so `CLICK_EVENT = 0`
-  // arrives as `undefined`. Coalescing with the enum's zero member
-  // restores the intended semantics.
+/**
+ * Coalesce a `textEvent` eventType to `OsEventTypeList`, defaulting to
+ * CLICK_EVENT (0).
+ *
+ * Protobuf strips zero-value fields on the wire, so `CLICK_EVENT = 0`
+ * arrives as `undefined`. The `?? CLICK` coalesce is correct ONLY for
+ * the `textEvent` envelope: that is the one place a real single press
+ * legitimately arrives with no `eventType`. It must NOT be applied to
+ * `sysEvent` — lifecycle events (FOREGROUND_*, EXITs) ride the sys
+ * envelope and a zero-value/unrecognised sysEvent must never be coerced
+ * into a phantom TAP (see `sysEventType`).
+ */
+function normalizeTextEventType(
+  raw: OsEventTypeList | undefined,
+): OsEventTypeList {
   return raw ?? OsEventTypeList.CLICK_EVENT;
+}
+
+/**
+ * Read a `sysEvent` eventType WITHOUT the zero-value coalesce.
+ *
+ * The sys envelope carries lifecycle events (FOREGROUND_ENTER/EXIT,
+ * ABNORMAL/SYSTEM exit, IMU) as well as the global touchpad fallback.
+ * Coalescing `undefined → CLICK` here would turn any zero-value-omitted
+ * or unrecognised sysEvent into a phantom press (which on Home navigates
+ * away). Instead we return `undefined` for a missing type and match
+ * every real type EXPLICITLY at the call sites — never defaulting an
+ * unknown sysEvent to a gesture.
+ */
+function sysEventType(
+  sys: { eventType?: OsEventTypeList } | undefined,
+): OsEventTypeList | undefined {
+  return sys?.eventType;
 }
 
 /**
@@ -218,26 +257,68 @@ function normalizeEventType(raw: OsEventTypeList | undefined): OsEventTypeList {
  * Lifecycle events (FOREGROUND_*, SYSTEM_EXIT, IMU) are reported
  * separately by the caller — this function only deals with
  * navigation gestures.
+ *
+ * Envelope handling is deliberately asymmetric:
+ *   - `textEvent`: the page's sole event capturer; a real single press
+ *     arrives here with eventType omitted (protobuf zero-value), so we
+ *     coalesce `undefined → CLICK`.
+ *   - `sysEvent`: the global fallback that ALSO carries lifecycle. We
+ *     match gesture types EXPLICITLY and never coalesce — a zero-value
+ *     or unrecognised sysEvent returns no gesture (so it cannot fire a
+ *     phantom TAP). DOUBLE_CLICK is honoured on both envelopes.
  */
 export function eventToScreenEvent(event: EvenHubEvent): ScreenEvent | null {
-  // The text container captures every touchpad gesture (it is the
-  // page's sole event capturer); the sys envelope is the global
-  // fallback. Both can carry scroll AND tap event types — handle
-  // all four `OsEventTypeList` gesture values on both.
   const text = event.textEvent;
   if (text) {
-    const mapped = mapGestureEventType(normalizeEventType(text.eventType));
+    const mapped = mapGestureEventType(normalizeTextEventType(text.eventType));
     if (mapped) return mapped;
   }
   const sys = event.sysEvent;
   if (sys) {
-    const mapped = mapGestureEventType(normalizeEventType(sys.eventType));
-    if (mapped) return mapped;
+    // Explicit match only — no `?? CLICK`. An unknown/zero-value
+    // sysEvent (e.g. a future lifecycle code) yields `undefined` and is
+    // dropped, never coerced into a press.
+    const t = sysEventType(sys);
+    if (t !== undefined) {
+      const mapped = mapGestureEventType(t);
+      if (mapped) return mapped;
+    }
   }
   return null;
 }
 
-/** Map a touchpad-gesture `OsEventTypeList` value to a `ScreenEvent`. */
+/**
+ * Lifecycle kind extracted from a sysEvent, or `null` for non-lifecycle
+ * envelopes. Lets the host pause/resume timers on FOREGROUND_EXIT/ENTER
+ * (so a backgrounded app stops burning the WMATA rate budget) and tear
+ * the page down on the two exit codes.
+ */
+export type LifecycleEvent =
+  | "FOREGROUND_ENTER"
+  | "FOREGROUND_EXIT"
+  | "EXIT";
+
+export function lifecycleEvent(event: EvenHubEvent): LifecycleEvent | null {
+  const t = sysEventType(event.sysEvent);
+  if (t === undefined) return null;
+  if (t === OsEventTypeList.FOREGROUND_ENTER_EVENT) return "FOREGROUND_ENTER";
+  if (t === OsEventTypeList.FOREGROUND_EXIT_EVENT) return "FOREGROUND_EXIT";
+  if (
+    t === OsEventTypeList.SYSTEM_EXIT_EVENT ||
+    t === OsEventTypeList.ABNORMAL_EXIT_EVENT
+  ) {
+    return "EXIT";
+  }
+  return null;
+}
+
+/**
+ * Map a touchpad-gesture `OsEventTypeList` value to a `ScreenEvent`.
+ *
+ * Only the four real gesture codes map. Lifecycle codes
+ * (FOREGROUND_ENTER/EXIT, ABNORMAL/SYSTEM exit, IMU) return `null` so
+ * they can never be mistaken for a press even if they reach this mapper.
+ */
 function mapGestureEventType(t: OsEventTypeList): ScreenEvent | null {
   if (t === OsEventTypeList.CLICK_EVENT) return { type: "TAP" };
   if (t === OsEventTypeList.DOUBLE_CLICK_EVENT) return { type: "DOUBLE_TAP" };
@@ -248,13 +329,11 @@ function mapGestureEventType(t: OsEventTypeList): ScreenEvent | null {
 
 /** True if the event is a system-exit (the page is being torn down by the OS). */
 export function isSystemExit(event: EvenHubEvent): boolean {
-  const sys = event.sysEvent;
-  if (!sys) return false;
-  const t = normalizeEventType(sys.eventType);
-  return (
-    t === OsEventTypeList.SYSTEM_EXIT_EVENT ||
-    t === OsEventTypeList.ABNORMAL_EXIT_EVENT
-  );
+  // Use the non-coalescing sys reader: a zero-value/omitted eventType is
+  // NOT an exit (the old `?? CLICK` coalesce made every type-less
+  // sysEvent read as CLICK, which happened not to match the exit codes
+  // but masked the asymmetry we now make explicit).
+  return lifecycleEvent(event) === "EXIT";
 }
 
 /**
@@ -336,7 +415,7 @@ function buildPage(
       width: SCREEN_WIDTH_PX,
       height: THREE_HEADER_HEIGHT_PX,
       borderWidth: 1,
-      borderColor: BORDER_COLOR,
+      borderColor: HEADER_BORDER_COLOR,
       borderRadius: BORDER_RADIUS,
       paddingLength: HEADER_PADDING,
       containerID: HEADER_CONTAINER_ID,
@@ -350,7 +429,7 @@ function buildPage(
       width: SCREEN_WIDTH_PX,
       height: THREE_BODY_HEIGHT_PX,
       borderWidth: 1,
-      borderColor: BORDER_COLOR,
+      borderColor: BODY_BORDER_COLOR,
       borderRadius: BORDER_RADIUS,
       paddingLength: BODY_PADDING,
       containerID: BODY_CONTAINER_ID,
@@ -364,7 +443,7 @@ function buildPage(
       width: SCREEN_WIDTH_PX,
       height: THREE_FOOTER_HEIGHT_PX,
       borderWidth: 1,
-      borderColor: BORDER_COLOR,
+      borderColor: FOOTER_BORDER_COLOR,
       borderRadius: BORDER_RADIUS,
       paddingLength: FOOTER_PADDING,
       containerID: FOOTER_CONTAINER_ID,
@@ -385,7 +464,8 @@ function buildPage(
     width: SCREEN_WIDTH_PX,
     height: TWO_HEADER_HEIGHT_PX,
     borderWidth: 1,
-    borderColor: BORDER_COLOR,
+    borderColor: HEADER_BORDER_COLOR,
+    borderRadius: BORDER_RADIUS,
     paddingLength: HEADER_PADDING,
     containerID: HEADER_CONTAINER_ID,
     containerName: "wmata.header",
@@ -398,7 +478,8 @@ function buildPage(
     width: SCREEN_WIDTH_PX,
     height: TWO_BODY_HEIGHT_PX,
     borderWidth: 1,
-    borderColor: BORDER_COLOR,
+    borderColor: BODY_BORDER_COLOR,
+    borderRadius: BORDER_RADIUS,
     paddingLength: BODY_PADDING,
     containerID: BODY_CONTAINER_ID,
     containerName: "wmata.body",
@@ -692,6 +773,14 @@ export async function mountGlassesScreen<S>(
       return;
     }
     void render();
+    // "Tap to retry" affordance: a reducer in an error/empty state can
+    // ask the host to refetch immediately. `runTick` honours the normal
+    // single-flight guard, so a retry while a fetch is already in flight
+    // is harmlessly dropped. Declared later in this scope but only ever
+    // invoked here at event time (well after mount), so no TDZ issue.
+    if (result.requestTick) {
+      void runTick();
+    }
   };
 
   // Optional: side-effect setup tied to the screen's lifetime. The
@@ -742,35 +831,108 @@ export async function mountGlassesScreen<S>(
     }
   };
 
-  // Wire up auto-refresh if the screen opted in. We deliberately fire
-  // the first tick AFTER the initial mount-render, so the user sees
-  // whatever the snapshot's `init()` produced (e.g. "Loading…") rather
-  // than a blank container during the network round-trip.
-  if (screen.tick && screen.tickIntervalMs && screen.tickIntervalMs > 0) {
-    void runTick();
-    tickTimer = setInterval(() => {
-      void runTick();
-    }, screen.tickIntervalMs);
-  }
+  // Whether the screen opted into auto-refresh. Cached so `resume()`
+  // (after a FOREGROUND_ENTER) knows whether to restart the fetch timer.
+  const fetchEnabled = Boolean(
+    screen.tick && screen.tickIntervalMs && screen.tickIntervalMs > 0,
+  );
 
-  // Wire up the always-on 1Hz clock tick. This is independent of the
-  // fetch interval (and runs whether or not the screen opted into a
-  // `tick`/`tickIntervalMs`). It calls `render()` with a freshly
-  // stamped `ctx.nowMs`; the de-dup cache means most ticks are no-ops
-  // (HH:MM doesn't change inside the same minute). The whole point
-  // is to keep the visible clock advancing even while a fetch is hung.
-  clockTimer = setInterval(() => {
-    if (!active) return;
+  /** Whether the host is currently paused (backgrounded via FOREGROUND_EXIT). */
+  let paused = false;
+
+  /**
+   * Start (or restart) the fetch + clock timers. Idempotent: clears any
+   * existing timer first so a double `resume` can't leak intervals.
+   * Used at mount and on every FOREGROUND_ENTER.
+   */
+  const startTimers = (): void => {
+    if (fetchEnabled) {
+      if (tickTimer !== null) clearInterval(tickTimer);
+      tickTimer = setInterval(() => {
+        void runTick();
+      }, screen.tickIntervalMs);
+    }
+    if (clockTimer !== null) clearInterval(clockTimer);
+    clockTimer = setInterval(() => {
+      if (!active) return;
+      void render();
+    }, CLOCK_TICK_MS);
+  };
+
+  /**
+   * Stop the fetch + clock timers without tearing the page down.
+   * Used on FOREGROUND_EXIT so a backgrounded app stops firing fetches
+   * (honouring the WMATA rate budget) and stops the 1Hz clock churn.
+   */
+  const stopTimers = (): void => {
+    if (tickTimer !== null) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+    if (clockTimer !== null) {
+      clearInterval(clockTimer);
+      clockTimer = null;
+    }
+  };
+
+  /**
+   * Pause on FOREGROUND_EXIT: the OS has put the app in the background
+   * (e.g. the user opened another feature). Stop the timers so we don't
+   * burn the fetch rate budget or re-render an off-screen page.
+   */
+  const pause = (): void => {
+    if (!active || paused) return;
+    paused = true;
+    stopTimers();
+  };
+
+  /**
+   * Resume on FOREGROUND_ENTER: restart the timers and run one immediate
+   * fetch + render so the user sees fresh data the moment the app returns
+   * to the foreground (rather than waiting a full tick interval).
+   */
+  const resume = (): void => {
+    if (!active || !paused) return;
+    paused = false;
+    startTimers();
+    // Immediate catch-up: a render to refresh the clock, plus one fetch
+    // tick if the screen polls (so stale predictions update on return).
     void render();
-  }, CLOCK_TICK_MS);
+    if (fetchEnabled) void runTick();
+  };
+
+  // Wire up auto-refresh if the screen opted in, and the always-on 1Hz
+  // clock tick. We deliberately fire the first fetch tick AFTER the
+  // initial mount-render (inside `startTimers` via the interval, plus an
+  // explicit kickoff here), so the user sees whatever the snapshot's
+  // `init()` produced (e.g. "Loading…") rather than a blank container
+  // during the network round-trip. The clock tick keeps the visible
+  // clock advancing even while a fetch is hung; the de-dup cache means
+  // most clock ticks are no-ops (HH:MM doesn't change inside a minute).
+  if (fetchEnabled) {
+    void runTick();
+  }
+  startTimers();
 
   const unsubscribe = bridge.onEvenHubEvent((event: EvenHubEvent) => {
     if (!active) return;
 
-    // Lifecycle first — a SYSTEM_EXIT means the page is going away and
-    // we should clean up regardless of what screen owns it.
-    if (isSystemExit(event)) {
+    // Lifecycle first — match the sys envelope EXPLICITLY (no zero-value
+    // coalesce), so a type-less or unrecognised sysEvent can never be
+    // mistaken for a press.
+    const lifecycle = lifecycleEvent(event);
+    if (lifecycle === "EXIT") {
+      // SYSTEM_EXIT / ABNORMAL_EXIT: the page is going away — clean up
+      // regardless of which screen owns it.
       void unmount();
+      return;
+    }
+    if (lifecycle === "FOREGROUND_EXIT") {
+      pause();
+      return;
+    }
+    if (lifecycle === "FOREGROUND_ENTER") {
+      resume();
       return;
     }
 

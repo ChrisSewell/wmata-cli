@@ -108,6 +108,14 @@ export interface ReduceResult<Snapshot = unknown> {
   nav: NavState;
   navigate?: NavIntent;
   snapshot?: Snapshot;
+  /**
+   * Optional: ask the host to run one immediate `tick()` (a fresh fetch)
+   * after applying this result. Used by the "tap to retry" affordance on
+   * error / empty states: the pure reducer can't fetch itself, so it sets
+   * this flag and the host kicks off `runTick` once (honouring the normal
+   * single-flight guard). Most reducer steps leave it unset.
+   */
+  requestTick?: boolean;
 }
 
 /**

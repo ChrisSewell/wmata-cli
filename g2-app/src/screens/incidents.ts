@@ -499,9 +499,9 @@ export function makeIncidentsScreen(
         snapshot.fetchedAt === 0 &&
         snapshot.fetchError !== null
       ) {
-        body.push(truncate("Couldn't reach WMATA. Will retry shortly.", LINE_WIDTH));
+        body.push(truncate("Couldn't reach WMATA.", LINE_WIDTH));
         body.push("");
-        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        body.push(truncate("Tap to retry · double-tap to return", LINE_WIDTH));
         return { header, body, clockMarker };
       }
 
@@ -535,9 +535,21 @@ export function makeIncidentsScreen(
           return { nav: { highlightedIndex: clamp(offset - 1, maxOffset) } };
         case "SCROLL_DOWN":
           return { nav: { highlightedIndex: clamp(offset + 1, maxOffset) } };
-        case "TAP":
-          // Read-only screen — no per-row tappable actions.
-          return { nav: { highlightedIndex: offset } };
+        case "TAP": {
+          // Read-only screen — no per-row tappable actions. But in the
+          // first-load error state (couldn't reach WMATA, nothing to
+          // show) TAP is the "tap to retry" affordance: ask the host to
+          // refetch immediately (single-flight-guarded, so it's safe even
+          // mid-fetch). In every other state TAP stays a pure no-op.
+          const firstLoadError =
+            snapshot.incidents.length === 0 &&
+            snapshot.fetchedAt === 0 &&
+            snapshot.fetchError !== null;
+          return {
+            nav: { highlightedIndex: offset },
+            requestTick: firstLoadError ? true : undefined,
+          };
+        }
         case "DOUBLE_TAP":
           return {
             nav: { highlightedIndex: offset },
