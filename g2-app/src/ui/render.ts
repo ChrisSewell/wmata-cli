@@ -2,8 +2,11 @@
 //
 // The G2 panel is 576x288 4-bit greyscale. We render text in a fixed grid;
 // the SDK does NOT expose font-metrics, so this module encodes a
-// conservative 24-column x 10-row grid (7 usable body rows after we
-// reserve space for headers/footers/status). All helpers here are pure
+// 40-column x 10-row grid (7 usable body rows after we reserve space
+// for headers/footers/status). The column count is empirically tuned
+// in the simulator — capital-letter content packs at ~34 cols per
+// line and mixed text at ~52, so 40 is a safe sweet spot. All
+// helpers here are pure
 // string math: no SDK imports, no DOM, no I/O. That makes the layout
 // fully unit-testable in Vitest.
 //
@@ -18,9 +21,34 @@ export const SCREEN_WIDTH_PX = 576;
 /** Physical panel height in pixels. */
 export const SCREEN_HEIGHT_PX = 288;
 
-/** Conservative monospace column budget per row. Tighten only once we
- *  have empirical font metrics from the device. */
-export const LINE_WIDTH = 24;
+/** Monospace column budget per row, empirically tuned in the
+ *  simulator. The G2's LVGL font is variable-width: trailing spaces
+ *  (the narrowest glyph) are the lever that pushes right-anchored
+ *  content (the clock cell, the right-aligned ETA, alert counts)
+ *  flush to the visible right border. We sit at 72 — past the
+ *  ~50-digit wrap point of a uniform-digit ruler, but realistic
+ *  mixed content (Title-Case + ALL-CAPS + spaces) fits comfortably
+ *  because the average glyph width is well below the digit width.
+ *  Bumping further makes capital-heavy fixtures wrap. */
+export const LINE_WIDTH = 72;
+
+/**
+ * Max columns of ACTUAL (non-space) text that fit one row before the
+ * LVGL container hard-wraps it at the 576px border. Calibrated in the
+ * simulator: mixed-case prose fits ~64 cols (64 sits flush at the
+ * border); we sit at 58 for margin (indents, caps-heavy fragments,
+ * the occasional wide glyph run). Use this — NOT `LINE_WIDTH` — as the
+ * wrap budget for any line whose content is real text (station names,
+ * descriptions, alert prose). `LINE_WIDTH` stays the budget for
+ * space-padded right-alignment math, where the filler is narrow spaces
+ * that never overflow.
+ *
+ * Why two widths: padding to 72 with spaces is safe (spaces are the
+ * narrowest glyph) but 72 cols of *text* overflows and the container
+ * silently re-wraps, dumping orphan words at column 0. Wrapping prose
+ * at 58 prevents that.
+ */
+export const SAFE_TEXT_WIDTH = 58;
 
 /** Total grid rows on the panel (header + body + status). */
 export const TOTAL_ROWS = 10;
@@ -48,6 +76,89 @@ export function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   if (maxLen === 1) return ELLIPSIS;
   return text.slice(0, maxLen - 1) + ELLIPSIS;
+}
+
+/**
+ * Word-wrap `text` to at most `maxLines` lines of `width` columns each.
+ *
+ * Greedy line-fill: pack words onto the current line until the next
+ * word doesn't fit, then break. Words longer than `width` are
+ * hard-broken at the column boundary (no hyphenation — the glasses
+ * font is monospace and we keep visual rules simple).
+ *
+ * If the input doesn't fit in `maxLines`, the LAST line is truncated
+ * with the canonical `…` so the reader knows there's more.
+ *
+ * Returns an empty array for empty/whitespace-only input — callers
+ * can spread the result with no special-case handling.
+ */
+export function wrapText(
+  text: string,
+  width: number,
+  maxLines: number,
+): string[] {
+  if (!text || width <= 0 || maxLines <= 0) return [];
+  const words = text.trim().split(/\s+/).filter((w) => w.length > 0);
+  if (words.length === 0) return [];
+  const lines: string[] = [];
+  let current = "";
+  let consumed = 0;
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!;
+    // Hard-break overlong words by chunking into width-sized slices.
+    if (word.length > width) {
+      if (current.length > 0) {
+        if (lines.length >= maxLines) break;
+        lines.push(current);
+        current = "";
+      }
+      let remaining = word;
+      while (remaining.length > width) {
+        if (lines.length >= maxLines) break;
+        lines.push(remaining.slice(0, width));
+        remaining = remaining.slice(width);
+      }
+      if (lines.length >= maxLines) break;
+      current = remaining;
+      consumed = i + 1;
+      continue;
+    }
+    const candidate = current.length === 0 ? word : current + " " + word;
+    if (candidate.length <= width) {
+      current = candidate;
+      consumed = i + 1;
+      continue;
+    }
+    // Word doesn't fit on the current line — flush and start a new
+    // line with this word. If we've already filled `maxLines`, stop.
+    if (lines.length >= maxLines) break;
+    lines.push(current);
+    if (lines.length >= maxLines) {
+      current = "";
+      break;
+    }
+    current = word;
+    consumed = i + 1;
+  }
+  if (current.length > 0 && lines.length < maxLines) {
+    lines.push(current);
+  }
+  // Overflow: if any input word didn't make it onto a line, mark the
+  // last line with the canonical `…` so the reader knows there's more.
+  // We always *add* the ellipsis (vs. just `truncate(line, width)`,
+  // which is a no-op when `line` is already short enough); sacrifice
+  // the last char of the line only when there's no slack.
+  if (consumed < words.length && lines.length > 0) {
+    const last = lines[lines.length - 1]!;
+    if (last.endsWith(ELLIPSIS)) {
+      // Already terminated by the hard-break path — leave it alone.
+    } else if (last.length + 1 <= width) {
+      lines[lines.length - 1] = last + ELLIPSIS;
+    } else {
+      lines[lines.length - 1] = last.slice(0, width - 1) + ELLIPSIS;
+    }
+  }
+  return lines;
 }
 
 /**

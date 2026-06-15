@@ -1,14 +1,21 @@
-// Entry point. Decides — based on persisted settings — whether to
-// render the companion settings UI on the phone or to mount the
-// glasses HUD. Never both: the glasses are useless without an API key
-// + at least one favorite, and the settings UI is useless once the
-// glasses are running.
+// Entry point. Glasses-first, matching the Even Hub SDK model (and our
+// other G2 apps, e.g. FlightAware_G2): on launch we acquire the bridge,
+// then run the phone companion settings UI AND the glasses HUD
+// CONCURRENTLY — never gating one behind the other.
 //
-// Routing rules:
-//   - apiKey empty OR favorites empty   ->  companion settings DOM.
-//                                           Glasses are not touched.
-//   - otherwise                         ->  glasses Home screen via
-//                                           `mountGlassesScreen`.
+// Boot sequence (`main`):
+//   1. `waitForEvenAppBridge()` with a timeout fallback — so a plain
+//      browser (no host) degrades to companion-only instead of hanging.
+//   2. Hydrate settings from the durable bridge store into localStorage
+//      and register the write-mirror, so variables persist across
+//      sessions on hardware (WebView localStorage alone may be cleared).
+//   3. Mount the companion settings UI on the phone (always).
+//   4. Boot the glasses (always, when a bridge exists): show the
+//      `unconfigured` placeholder until an API key + a favorite are set,
+//      then auto-swap to the live Home screen — no reload, no button.
+//      A lightweight watcher (`bootGlasses`) re-evaluates settings and
+//      rebuilds the glasses view when the API key changes or config
+//      becomes complete / is cleared on the phone.
 //
 // The Router below handles every `NavIntent.to` variant: `home`,
 // `exit`, `predictions`, `incidents`, and `voice`. Each branch tears
@@ -18,13 +25,21 @@
 // `src/screens/voice.ts`): it bounces back to Home rather than mounting
 // a half-broken screen, so a missing STT never strands the user.
 
-import { waitForEvenAppBridge } from "@evenrealities/even_hub_sdk";
+import {
+  waitForEvenAppBridge,
+  type EvenAppBridge,
+} from "@evenrealities/even_hub_sdk";
 
 import { recordOpen } from "./storage/history";
-import { loadSettings } from "./storage/settings";
+import { loadSettings, setStorageMirror } from "./storage/settings";
+import {
+  hydrateSettingsFromBridge,
+  mirrorToBridge,
+} from "./storage/bridge-sync";
 import { mountSettingsScreen } from "./screens/settings";
 import { mountGlassesScreen } from "./screens/glasses-host";
-import { makeHomeScreen } from "./screens/home";
+import { makeUnconfiguredScreen } from "./screens/unconfigured";
+import { makeHomeScreen, soonestEta } from "./screens/home";
 import {
   computeUserLines,
   makeIncidentsScreen,
@@ -37,8 +52,15 @@ import {
 import {
   makeInitialJourneySnapshot,
   makeJourneyScreen,
+  type JourneyNextTrain,
 } from "./screens/journey";
-import { makePredictionsScreen, pickLastTrainTime } from "./screens/predictions";
+import {
+  bucketLastTrainsByLine,
+  makePredictionsScreen,
+  resolvePinnedPosition,
+  type LastTrainByLine,
+  type PredictionsSnapshot,
+} from "./screens/predictions";
 import type { NavIntent, Router } from "./screens/router";
 import { makeTutorialScreen } from "./screens/tutorial";
 import {
@@ -53,10 +75,27 @@ import { parseLinesAffected } from "./wmata/incidents-cache";
 import {
   buildRailPredictionsUrl,
   type LineCode,
+  type PathStep,
   type PredictionsResponse,
   type RailIncident,
   type Station,
 } from "./wmata";
+
+/**
+ * How long to wait for the Even App bridge before falling back to
+ * companion-only (browser / no-host) mode, so the app never hangs on a
+ * bridge that will never arrive. Matches the 2s used by FlightAware_G2.
+ */
+const BRIDGE_TIMEOUT_MS = 2_000;
+
+/**
+ * How often the glasses boot watcher re-reads settings to detect a
+ * phone-side config change (setup completed, API key changed, config
+ * cleared) and swap the glasses view. Reads are synchronous localStorage,
+ * so this is cheap; 1.5s keeps the unconfigured→Home hand-off feeling
+ * immediate without busy-looping.
+ */
+const CONFIG_WATCH_INTERVAL_MS = 1_500;
 
 /**
  * Collect the non-null line codes a Station serves. Inline rather than
@@ -111,6 +150,62 @@ function computeAffectedLines(
 }
 
 /**
+ * Fetch the soonest next-train ETA for every favorite station in ONE
+ * batched WMATA predictions call and return a `stationCode → Min token`
+ * map. The token is the raw `Min` of the soonest upcoming train at that
+ * station across all of its lines (`"4"` / `"ARR"` / `"BRD"`), or
+ * `null` when the station has no upcoming train. Drives the Home
+ * screen's live departure board.
+ *
+ * Batching: WMATA's `GetPrediction` endpoint accepts a comma-joined
+ * list of station codes (`.../GetPrediction/A01,B01,B03`) and returns a
+ * single `Trains[]` array spanning them all — so N favorites cost ONE
+ * request, not N, keeping us comfortably under the 10 req/s ceiling.
+ * The returned trains carry `LocationCode`, which we group by to find
+ * each station's soonest departure.
+ *
+ * Best-effort: any failure (network, decode) throws, and the caller
+ * (`refreshFavoriteEtas`) lets the tick swallow it so the rows linger
+ * at their last values rather than blanking. An empty favorites list
+ * short-circuits to `{}` without a network call.
+ */
+async function buildFavoriteEtaMap(
+  session: Session,
+  codes: readonly string[],
+): Promise<Record<string, string | null>> {
+  if (codes.length === 0) return {};
+  // One request for all favorites. The comma-join is the documented
+  // multi-station form of GetPrediction.
+  const url = buildRailPredictionsUrl(codes.join(","));
+  const data = await session.client.get<PredictionsResponse>(url);
+  const trains = data.Trains ?? [];
+
+  // Bucket each train's `Min` token by the station it departs from
+  // (`LocationCode`). We only collect tokens for codes the user
+  // actually favorites — the multi-station response can include
+  // platform siblings (e.g. Gallery Place B01/F01) we didn't ask for.
+  const wanted = new Set<string>(codes);
+  const minsByCode = new Map<string, string[]>();
+  for (const t of trains) {
+    const code = t.LocationCode;
+    if (!code || !wanted.has(code)) continue;
+    const bucket = minsByCode.get(code);
+    if (bucket) bucket.push(t.Min);
+    else minsByCode.set(code, [t.Min]);
+  }
+
+  // Build the map for every requested code so a station with no trains
+  // in the response gets an explicit `null` (rendered as a blank,
+  // aligned cell — distinct from the absent-key "loading" state before
+  // the first successful fetch).
+  const out: Record<string, string | null> = {};
+  for (const code of wanted) {
+    out[code] = soonestEta(minsByCode.get(code) ?? []);
+  }
+  return out;
+}
+
+/**
  * Best-effort geolocation lookup. Returns `null` on any failure
  * (permission denied, timeout, runtime without `navigator.geolocation`,
  * any thrown error). The boot path treats null as "geofence didn't
@@ -159,36 +254,76 @@ const WEEKDAY_KEYS = [
 ] as const;
 
 /**
- * Read the latest scheduled departure time from `code`'s
- * `LastTrains[]` for today's day-of-week. Returns `null` on any
- * failure (cache miss, unknown station, network blip). The session
- * cache makes calls after the first one essentially free.
+ * Read tonight's last-train summary for `code`, bucketed by line.
+ * Each entry is the latest PM departure on a line that this station
+ * serves. Returns `null` on any failure (cache miss, unknown
+ * station, network blip).
+ *
+ * Per-line resolution (WP-J): for each `LastTrains[]` entry, the
+ * destination station's primary line (`LineCode1`, falling through
+ * to `LineCode2`/3/4 for multi-line termini) tells us which line
+ * the train is running on. We bucket by that line and pick the
+ * latest PM time per bucket.
  */
 async function readLastTrainToday(
   session: Session,
   code: string,
-): Promise<string | null> {
+): Promise<LastTrainByLine[] | null> {
   try {
     const times = await session.getStationTimes(code);
     if (!times) return null;
     const today = WEEKDAY_KEYS[new Date().getDay()];
     const day = times[today];
     if (!day) return null;
-    return pickLastTrainTime(day.LastTrains ?? []);
+    const lastTrains = day.LastTrains ?? [];
+    if (lastTrains.length === 0) return [];
+    // Build a `destinationStation → line` map by resolving each
+    // unique destination through the stations cache. We only
+    // resolve uniques (a busy station has lots of duplicates in
+    // LastTrains[]) to minimise the lookup load.
+    const uniqueDests = new Set<string>(
+      lastTrains.map((t) => t.DestinationStation).filter((s) => s.length > 0),
+    );
+    const destToLine = new Map<string, string>();
+    for (const dest of uniqueDests) {
+      const station = await session.resolveStationCode(dest);
+      if (!station) continue;
+      // For multi-line termini, prefer LineCode1 by convention. A
+      // future WP could be smarter (cross-reference with the
+      // station's served-lines), but the heuristic is correct for
+      // every WMATA terminus today — all terminus stations are
+      // single-line.
+      const line =
+        station.LineCode1 ??
+        station.LineCode2 ??
+        station.LineCode3 ??
+        station.LineCode4 ??
+        null;
+      if (line) destToLine.set(dest, line);
+    }
+    return bucketLastTrainsByLine(lastTrains, destToLine);
   } catch {
     return null;
   }
 }
 
-async function bootGlasses(): Promise<void> {
-  const bridge = await waitForEvenAppBridge();
-
-  // One Session per glasses session — the API key only changes when
-  // the user re-runs the companion settings flow, which forces a full
-  // page reload anyway. The Session owns the WmataClient AND the
-  // stations/incidents caches; when v1.1 adds a "swap settings without
-  // reload" path, the implementation is just "drop the old Session,
-  // build a new one".
+/**
+ * Boot the fully-configured glasses app: build a Session from the saved
+ * API key, wire the screen router, and navigate to the initial screen.
+ *
+ * Returns a teardown function the boot watcher (`bootGlasses`) calls to
+ * tear the whole thing down — used when the user changes their API key on
+ * the phone (rebuild with a fresh Session) or clears their config (fall
+ * back to the `unconfigured` placeholder). Precondition: `loadSettings()`
+ * has a non-empty `apiKey` AND at least one favorite (the watcher only
+ * calls this once config is complete).
+ */
+async function bootConfiguredApp(
+  bridge: EvenAppBridge,
+): Promise<() => Promise<void>> {
+  // One Session per configured boot. The Session owns the WmataClient AND
+  // the stations/incidents caches; when the API key changes on the phone,
+  // the watcher tears this down and calls us again to build a fresh one.
   const session = new Session(loadSettings().apiKey);
 
   // Build the Home screen with a fresh-load snapshot factory. We
@@ -212,6 +347,11 @@ async function bootGlasses(): Promise<void> {
         affectedLines: computeAffectedLines(cached, userLines),
         accessOutageCount: cachedAccess,
         quietHours: evaluation.quietHours,
+        // Seed empty = "loading": no per-favorite ETA is known until
+        // the first `refreshFavoriteEtas` tick lands. An empty map
+        // renders the rows without an ETA cell content (blank, aligned)
+        // so the first paint doesn't blink an ETA in then out.
+        favoriteEtas: {},
       };
     },
     {
@@ -231,6 +371,16 @@ async function bootGlasses(): Promise<void> {
           Date.now(),
         );
         return evaluation.quietHours;
+      },
+      refreshFavoriteEtas: async (): Promise<
+        Record<string, string | null>
+      > => {
+        // Re-read favorites each tick so a phone-side edit is picked up
+        // without remounting. One batched predictions call covers them
+        // all. Any throw here propagates to the tick's allSettled, which
+        // preserves the prior ETA map (rows linger, never blank).
+        const codes = loadSettings().favorites.map((f) => f.code);
+        return buildFavoriteEtaMap(session, codes);
       },
       tickIntervalMs: 60_000,
     },
@@ -298,7 +448,9 @@ async function bootGlasses(): Promise<void> {
             );
           }
 
-          const fetcher = async () => {
+          const fetcher = async (
+            snapshot: PredictionsSnapshot,
+          ) => {
             const url = buildRailPredictionsUrl(intent.stationCode);
             // Fire predictions + cache-refresh in sequence (not parallel)
             // to keep the request rate under WMATA's 10 req/s ceiling
@@ -316,10 +468,28 @@ async function bootGlasses(): Promise<void> {
               session,
               intent.stationCode,
             );
+            // WP-I live-position lookup. Only burns a fetch when
+            // the user has a pin active — otherwise null. The two
+            // calls run in parallel (StandardRoutes is cached after
+            // the first hit so it's free thereafter).
+            let pinnedPosition = null;
+            if (snapshot.pinned !== null) {
+              const [positions, routes] = await Promise.all([
+                session.getTrainPositions(),
+                session.getStandardRoutes(),
+              ]);
+              pinnedPosition = resolvePinnedPosition(
+                snapshot.pinned,
+                intent.stationCode,
+                positions,
+                routes,
+              );
+            }
             return {
               trains: data.Trains ?? [],
               incidentHeadline: readFirstIncidentHeadline(session),
               lastTrainToday,
+              pinnedPosition,
             };
           };
 
@@ -345,6 +515,15 @@ async function bootGlasses(): Promise<void> {
             // they navigate back to Predictions. This avoids stale
             // pins surviving across station changes.
             pinned: null,
+            // WP-I: resolved once the user pins a train AND the
+            // first TrainPositions tick lands. `null` hides the
+            // schematic + "stops away" rows.
+            pinnedPosition: null,
+            // WP-M opt-in cursor: hidden until the user scrolls.
+            cursorVisible: false,
+            // WP-M pin-gone latch: set by the tick when a pinned
+            // train rolls off; cleared on the next miss.
+            pinnedGone: false,
           });
           router.current = "predictions";
           unmount = await mountGlassesScreen(screen, bridge, router);
@@ -451,20 +630,80 @@ async function bootGlasses(): Promise<void> {
           const plan = loadSettings().journeyPlan;
           const fetcher = async () => {
             if (plan.origin.length === 0 || plan.destination.length === 0) {
-              return { path: null, originName: "", destinationName: "" };
+              return {
+                legs: null,
+                originName: "",
+                destinationName: "",
+                transferName: "",
+                nextTrain: null,
+              };
             }
-            // Resolve names + path in parallel — both come from cached
-            // session calls so this is essentially free after the
-            // first round trip.
-            const [origStation, destStation, path] = await Promise.all([
-              session.resolveStationCode(plan.origin),
-              session.resolveStationCode(plan.destination),
-              session.getPath(plan.origin, plan.destination),
-            ]);
+            const hasTransfer =
+              typeof plan.transfer === "string" && plan.transfer.length > 0;
+            const [origStation, destStation, transferStation] =
+              await Promise.all([
+                session.resolveStationCode(plan.origin),
+                session.resolveStationCode(plan.destination),
+                hasTransfer
+                  ? session.resolveStationCode(plan.transfer!)
+                  : Promise.resolve(null),
+              ]);
+
+            // Path composition.
+            let legs: PathStep[][] | null = null;
+            if (hasTransfer) {
+              const [leg1, leg2] = await Promise.all([
+                session.getPath(plan.origin, plan.transfer!),
+                session.getPath(plan.transfer!, plan.destination),
+              ]);
+              if (leg1 === null || leg2 === null) {
+                legs = null;
+              } else if (leg1.length === 0 || leg2.length === 0) {
+                // One leg is itself cross-line — the user picked a
+                // bad transfer station.
+                legs = [];
+              } else {
+                legs = [leg1, leg2];
+              }
+            } else {
+              const path = await session.getPath(plan.origin, plan.destination);
+              if (path === null) legs = null;
+              else if (path.length === 0) legs = [];
+              else legs = [path];
+            }
+
+            // Live next-train at origin (WP-K). Pull the predictions
+            // for the origin station and pick the first train whose
+            // line matches the origin leg. Best-effort: any failure
+            // here resolves to null.
+            let nextTrain: JourneyNextTrain | null = null;
+            try {
+              const data = await session.client.get<PredictionsResponse>(
+                buildRailPredictionsUrl(plan.origin),
+              );
+              const trains = data.Trains ?? [];
+              const originLine =
+                legs && legs.length > 0 ? legs[0]![0]?.LineCode : null;
+              const match = originLine
+                ? trains.find((t) => t.Line === originLine)
+                : trains[0];
+              if (match) {
+                nextTrain = {
+                  line: match.Line,
+                  min: match.Min,
+                  destination: match.Destination || match.DestinationName,
+                };
+              }
+            } catch {
+              nextTrain = null;
+            }
+
             return {
-              path,
+              legs,
               originName: origStation?.Name ?? plan.origin,
               destinationName: destStation?.Name ?? plan.destination,
+              transferName: transferStation?.Name ?? plan.transfer ?? "",
+              nextTrain,
             };
           };
           const initial = makeInitialJourneySnapshot(plan);
@@ -516,6 +755,138 @@ async function bootGlasses(): Promise<void> {
     initialIntent = await pickInitialIntent(settings);
   }
   await router.navigate(initialIntent);
+
+  // Teardown for the boot watcher: route to `exit`, which unmounts the
+  // active screen and shuts down the page container. The watcher calls
+  // this before rebuilding (API-key change) or before dropping back to
+  // the unconfigured placeholder (config cleared on the phone).
+  return async (): Promise<void> => {
+    await router.navigate({ to: "exit" });
+  };
+}
+
+/**
+ * Glasses boot orchestrator + live-settings watcher.
+ *
+ * Mounts the right glasses view for the current settings and keeps it in
+ * sync as the user edits config on the phone — WITHOUT a page reload:
+ *
+ *   - No API key OR no favorites  ->  the `unconfigured` placeholder
+ *                                     ("finish setup on your phone").
+ *   - API key + ≥1 favorite       ->  the full app via `bootConfiguredApp`.
+ *
+ * A cheap interval re-reads `loadSettings()` (synchronous localStorage)
+ * and computes a config "signature". When the signature changes it tears
+ * down the current view and mounts the new one:
+ *
+ *   - unconfigured -> configured : first-time setup completes; the card
+ *                                  auto-swaps to Home (the user never
+ *                                  touches the glasses).
+ *   - API key changes            : rebuild with a fresh Session, so a new
+ *                                  key takes effect live.
+ *   - configured -> unconfigured : config cleared on the phone; fall back
+ *                                  to the placeholder.
+ *
+ * Favorites edits that DON'T cross the empty/non-empty boundary need no
+ * rebuild — the Home screen already re-reads favorites every tick.
+ */
+async function bootGlasses(bridge: EvenAppBridge): Promise<void> {
+  // Active view's teardown (placeholder or configured app), and the
+  // signature it was built for. `null` teardown = nothing mounted.
+  let activeTeardown: (() => Promise<void>) | null = null;
+  let activeSignature: string | null = null;
+  // Guards against overlapping reconciles (a slow teardown/mount while
+  // the next interval fires) — we skip a tick rather than race.
+  let reconciling = false;
+  // The watch-interval handle, and a flag that retires the whole
+  // subsystem once the user dismisses the setup card (double-tap → exit).
+  let watchTimer: ReturnType<typeof setInterval> | null = null;
+  let stopped = false;
+
+  /**
+   * Config signature: `"configured:<apiKey>"` when the app can run (key
+   * + ≥1 favorite), else `"unconfigured"`. Embedding the API key means a
+   * key change yields a new signature and forces a Session rebuild.
+   */
+  const computeSignature = (): string => {
+    const s = loadSettings();
+    return s.apiKey.length > 0 && s.favorites.length > 0
+      ? `configured:${s.apiKey}`
+      : "unconfigured";
+  };
+
+  /**
+   * Tear down the active view AND stop watching — a clean, final exit.
+   * Used when the user double-taps the setup card to leave: we don't want
+   * a zombie interval polling against a shut-down page. Re-launching the
+   * app re-runs `main()` and starts the watcher fresh.
+   */
+  const stopWatching = async (): Promise<void> => {
+    stopped = true;
+    if (watchTimer !== null) {
+      clearInterval(watchTimer);
+      watchTimer = null;
+    }
+    if (activeTeardown) {
+      const teardown = activeTeardown;
+      activeTeardown = null;
+      await teardown();
+    }
+    activeSignature = null;
+  };
+
+  /** Trivial router for the placeholder: it only ever emits `exit`. */
+  const placeholderRouter: Router = {
+    current: "unconfigured",
+    navigate: async (intent: NavIntent): Promise<void> => {
+      if (intent.to === "exit") await stopWatching();
+    },
+  };
+
+  const reconcile = async (): Promise<void> => {
+    if (stopped || reconciling) return;
+    if (computeSignature() === activeSignature) return;
+    reconciling = true;
+    try {
+      // Tear down whatever is mounted before building the next view.
+      if (activeTeardown) {
+        const teardown = activeTeardown;
+        activeTeardown = null;
+        await teardown();
+      }
+      // Re-read the signature AFTER the (async) teardown so we build for
+      // the LATEST config — a phone-side change during teardown is
+      // reflected now rather than one interval later, and the Session
+      // `bootConfiguredApp` builds matches the signature we record.
+      if (stopped) return;
+      const sig = computeSignature();
+      activeSignature = sig;
+      if (sig === "unconfigured") {
+        activeTeardown = await mountGlassesScreen(
+          makeUnconfiguredScreen(),
+          bridge,
+          placeholderRouter,
+        );
+      } else {
+        activeTeardown = await bootConfiguredApp(bridge);
+      }
+    } catch (err) {
+      // A failed build leaves nothing mounted; reset the signature so the
+      // next tick retries rather than wedging on a half-built state.
+      console.warn("[main] glasses reconcile failed:", err);
+      activeSignature = null;
+    } finally {
+      reconciling = false;
+    }
+  };
+
+  // Mount the initial view, then poll for phone-side config changes.
+  await reconcile();
+  if (!stopped) {
+    watchTimer = setInterval(() => {
+      void reconcile();
+    }, CONFIG_WATCH_INTERVAL_MS);
+  }
 }
 
 /**
@@ -546,10 +917,11 @@ async function pickInitialIntent(
 }
 
 function bootCompanion(root: HTMLElement): void {
-  // The settings screen returns an unmount fn, but main.ts doesn't
-  // currently need to call it — the user navigates by reloading the
-  // page after they save settings. Capturing the handle anyway so a
-  // future "Reset" flow can reuse it cleanly.
+  // The companion settings UI is mounted once at startup and stays up for
+  // the whole session (it runs concurrently with the glasses now — no
+  // page reload on save; the glasses watcher picks up edits live). The
+  // settings screen returns an unmount fn we don't currently call;
+  // captured anyway so a future "Reset" flow can reuse it cleanly.
   const unmount = mountSettingsScreen(root);
   // Stash on a module-private symbol for debugging only.
   type GlobalWithUnmount = typeof globalThis & {
@@ -559,24 +931,56 @@ function bootCompanion(root: HTMLElement): void {
 }
 
 async function main(): Promise<void> {
-  const settings = loadSettings();
-  const hasKey = settings.apiKey.length > 0;
-  const hasFavorites = settings.favorites.length > 0;
-
-  if (!hasKey || !hasFavorites) {
-    const root = document.getElementById("app");
-    if (!root) {
-      console.error("[main] #app root missing; cannot mount companion UI");
-      return;
-    }
-    bootCompanion(root);
-    return;
+  // 1. Acquire the bridge, but never hang. A plain browser (dev server,
+  //    the preview gallery) has no Even App host, so the bridge never
+  //    becomes ready — fall back to `null` after a short timeout and run
+  //    companion-only. On real hardware / the simulator the bridge
+  //    resolves well within the timeout.
+  let bridge: EvenAppBridge | null = null;
+  try {
+    bridge = await Promise.race([
+      waitForEvenAppBridge(),
+      new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), BRIDGE_TIMEOUT_MS),
+      ),
+    ]);
+  } catch (err) {
+    console.warn("[main] waitForEvenAppBridge failed; companion-only:", err);
+    bridge = null;
   }
 
-  try {
-    await bootGlasses();
-  } catch (err) {
-    console.error("[main] bootGlasses failed:", err);
+  // 2. Durable settings. Hydrate localStorage from the bridge store, then
+  //    register the write-mirror so future saves echo back to it. MUST
+  //    run before anything reads settings (companion render, glasses
+  //    boot) so a freshly-cleared WebView is repopulated from the store.
+  if (bridge) {
+    const activeBridge = bridge;
+    try {
+      await hydrateSettingsFromBridge(activeBridge);
+    } catch (err) {
+      console.warn("[main] settings hydrate failed; using localStorage:", err);
+    }
+    setStorageMirror((key, value) => {
+      mirrorToBridge(activeBridge, key, value);
+    });
+  }
+
+  // 3. Companion settings UI on the phone — ALWAYS mounted (concurrent
+  //    with the glasses), so the user can enter / edit their variables
+  //    at any time.
+  const root = document.getElementById("app");
+  if (root) bootCompanion(root);
+  else console.error("[main] #app root missing; cannot mount companion UI");
+
+  // 4. Glasses — ALWAYS boot when a bridge is present. The watcher shows
+  //    the unconfigured placeholder until an API key + favorite are set,
+  //    then auto-swaps to the live Home screen (no reload, no button).
+  if (bridge) {
+    try {
+      await bootGlasses(bridge);
+    } catch (err) {
+      console.error("[main] bootGlasses failed:", err);
+    }
   }
 }
 

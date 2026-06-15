@@ -2,10 +2,20 @@
   "package_id": "com.wmata.g2transit",
   "edition": "202601",
   "name": "WMATA Transit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
-  "permissions": [],
+  "permissions": [
+    {
+      "name": "network",
+      "desc": "Fetches real-time Metrorail predictions, service alerts, elevator/escalator outages, and station data from the WMATA API.",
+      "whitelist": ["https://api.wmata.com"]
+    },
+    {
+      "name": "location",
+      "desc": "Optional: when enabled, auto-opens predictions for the nearest favorite station as you approach it."
+    }
+  ],
   "supported_languages": ["en"]
 }

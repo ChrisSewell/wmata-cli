@@ -11,33 +11,40 @@
 // `Screen<S>` + router pattern is a regular screen that always
 // navigates away on first input. Mount cost ≈ one page create.
 //
-// Layout (24 cols × exactly 8 rows — pinned by `tutorial.test.ts`):
+// Layout (exactly 8 rows — pinned by `tutorial.test.ts`). Terminal-
+// style help with a single aligned description column (descriptions
+// start at col 10 so the gesture labels read as a tidy table):
 //
-//   col:   0         1         2
-//   col:   0123456789012345678901234
-//          WMATA G2 — gestures
+//          WMATA G2 — gestures                      2:32p
 //
 //          SCROLL    move cursor
 //          TAP       select
 //          DBL TAP   back to Home
-//          VOICE     tap & speak
-//                    a station
+//          VOICE     tap, then speak a station
+//
 //          (tap to continue)
 //
-// Why the trimmed VOICE wording? "speak after TAP on VOICE LOOKUP" is
-// the natural English description but it overflows 24 cols by one
-// character on each of two lines. "tap & speak / a station" preserves
-// the affordance (TAP + speech) without dropping the row count.
+// The wide grid (SAFE_TEXT_WIDTH = 58) fits the full VOICE
+// affordance ("tap, then speak a station") on one line, so the old
+// two-line "tap & speak / a station" wrap is gone; the reclaimed row
+// becomes a blank spacer above the continue cue for vertical balance.
+// The row COUNT is unchanged (7 body lines), keeping the 8-line lock.
 //
 // PURITY: no SDK imports inside `view` / `reduce`. The only side
 // effect is `markTutorialSeen()` inside `onUnmount`.
 
 import { markTutorialSeen } from "../storage/settings";
 import { LINE_WIDTH, truncate } from "../ui/render";
+// `formatClock` now lives in the shared field-formatter module and is
+// rendered by the host into its own top-right clock container. Re-export
+// it here so existing imports (`import { formatClock } from "./tutorial"`)
+// keep resolving after the screen stopped embedding the clock.
+export { formatClock } from "../ui/format";
 import type {
   ReduceResult,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
 
@@ -48,17 +55,39 @@ import type {
  */
 export type TutorialSnapshot = Record<string, never>;
 
-/** Exact body lines for the cheat sheet. Pinned verbatim by the test. */
-export const TUTORIAL_LINES: readonly string[] = [
-  "WMATA G2 — gestures",
+/** Title for the tutorial header. */
+export const TUTORIAL_TITLE = "WMATA G2 — gestures";
+
+/**
+ * Body lines for the cheat sheet (header rendered separately).
+ *
+ * Description column is aligned at col 10 across all four gestures so
+ * the labels form a clean table. The VOICE affordance fits on one
+ * line on the wide grid; the freed row is a blank spacer above the
+ * continue cue. Exactly 7 lines — the view + test lock the 8-line
+ * (header + body) total.
+ */
+export const TUTORIAL_BODY_LINES: readonly string[] = [
   "",
   "SCROLL    move cursor",
   "TAP       select",
   "DBL TAP   back to Home",
-  "VOICE     tap & speak",
-  "          a station",
+  "VOICE     tap, then speak a station",
+  "",
   "(tap to continue)",
 ];
+
+/**
+ * Render the tutorial header — the title only, left-aligned.
+ *
+ * The wall clock is NO LONGER part of the header string: the host
+ * renders it into a dedicated top-right clock container on every screen.
+ * The title is truncated to 50 columns so it can never collide with that
+ * clock cell (which starts at x≈486px ≈ column 50).
+ */
+export function renderHeader(): string {
+  return truncate(TUTORIAL_TITLE, 50);
+}
 
 /**
  * Build the Tutorial screen. No fetcher, no tick — just a static page
@@ -69,13 +98,15 @@ export function makeTutorialScreen(): Screen<TutorialSnapshot> {
     name: "tutorial",
     init: (): TutorialSnapshot => ({}),
 
-    // `ctx` is unused — the tutorial has no time-sensitive UI.
-    // Prefixing with `_` quiets `noUnusedParameters`.
-    view(_snapshot, _nav, _ctx: ViewContext): string[] {
-      // Defensive truncate — `TUTORIAL_LINES` is a constant under
-      // LINE_WIDTH, but a future copy-edit could slip an oversize
-      // line in. Truncate-at-render keeps the contract honest.
-      return TUTORIAL_LINES.map((l) => truncate(l, LINE_WIDTH));
+    view(_snapshot, _nav, _ctx: ViewContext): ScreenSections {
+      return {
+        header: [renderHeader()],
+        // Defensive truncate — `TUTORIAL_BODY_LINES` are constants
+        // under LINE_WIDTH, but a future copy-edit could slip an
+        // oversize line in. Truncate-at-render keeps the contract
+        // honest.
+        body: TUTORIAL_BODY_LINES.map((l) => truncate(l, LINE_WIDTH)),
+      };
     },
 
     reduce(

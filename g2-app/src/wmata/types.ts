@@ -190,6 +190,55 @@ export interface PathResponse {
   Path: PathStep[];
 }
 
+/**
+ * One live train from `/TrainPositions/TrainPositions`. Non-revenue
+ * trains (deadheading, special service) may have `LineCode === null`
+ * and `DestinationStationCode === null`; both are typed as
+ * `string | null` to match the wire shape.
+ */
+export interface TrainPosition {
+  TrainId: string;
+  TrainNumber: string;
+  CarCount: number;
+  DirectionNum: number;
+  CircuitId: number;
+  DestinationStationCode: string | null;
+  LineCode: string | null;
+  SecondsAtLocation: number;
+  ServiceType: string;
+}
+
+export interface TrainPositionsResponse {
+  TrainPositions: TrainPosition[];
+}
+
+/**
+ * One track circuit on a StandardRoute. `StationCode` is non-null for
+ * revenue stations and null for inter-station circuit segments; the
+ * line schematic uses only the non-null entries.
+ */
+export interface TrackCircuit {
+  SeqNum: number;
+  CircuitId: number;
+  StationCode: string | null;
+}
+
+/**
+ * One ordered route per (line, track). Track 1 is generally
+ * northbound/eastbound; Track 2 the reverse direction. The line
+ * schematic uses Track 1 by convention — it doesn't matter which
+ * track we read since station ordering is the same.
+ */
+export interface StandardRoute {
+  LineCode: string;
+  TrackNum: number;
+  TrackCircuits: TrackCircuit[];
+}
+
+export interface StandardRoutesResponse {
+  StandardRoutes: StandardRoute[];
+}
+
 export interface StationsResponse {
   Stations: Station[];
 }

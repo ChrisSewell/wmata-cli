@@ -14,6 +14,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+  OsEventTypeList,
   StartUpPageCreateResult,
   type CreateStartUpPageContainer,
   type EvenAppBridge,
@@ -21,12 +22,18 @@ import {
   type TextContainerUpgrade,
 } from "@evenrealities/even_hub_sdk";
 
-import { mountGlassesScreen } from "./glasses-host";
+import {
+  eventToScreenEvent,
+  isSystemExit,
+  lifecycleEvent,
+  mountGlassesScreen,
+} from "./glasses-host";
 import type {
   NavIntent,
   Router,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
 
@@ -137,10 +144,10 @@ function makeTicker(initial: TickerSnapshot, intervalMs: number): Ticker {
       snapshot: TickerSnapshot,
       _nav,
       _ctx: ViewContext,
-    ): string[] {
+    ): ScreenSections {
       const lines = [`gen=${String(snapshot.generation)}`];
       ticker.latestRenderedLines = lines;
-      return lines;
+      return { header: lines, body: [] };
     },
     reduce(_s: TickerSnapshot, nav, _e: ScreenEvent) {
       return { nav };
@@ -263,8 +270,8 @@ function makeHungClockScreen(): {
   } = {
     name: "predictions",
     init: () => ({ marker: "hung" }),
-    view(snapshot, _nav, ctx: ViewContext): string[] {
-      return [`now=${ctx.nowMs}`, snapshot.marker];
+    view(snapshot, _nav, ctx: ViewContext): ScreenSections {
+      return { header: [`now=${ctx.nowMs}`], body: [snapshot.marker] };
     },
     reduce(_s, nav, _e: ScreenEvent) {
       return { nav };
@@ -346,45 +353,28 @@ describe("glasses-host clock tick (decoupled from fetch)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Page-container shape (host-side deserialiser expectations)
+// Page-container shape (host-side deserialiser + event-routing expectations)
 // ---------------------------------------------------------------------------
 //
-// The Rust simulator and the on-device Dart bridge use a strict
-// deserialiser that rejects a `ListContainerProperty` without an
-// `itemContainer`, even though the SDK's TypeScript model marks the
-// field optional. When this regression last shipped, the simulator
-// logged `Failed to parse data for CreateStartUpPageContainer: missing
-// field 'itemContainer'` and then every `textContainerUpgrade` to the
-// (never-created) container 1 failed. We pin the shape here so the
-// mistake can't sneak back in.
+// The page is a single TextContainer that fills the 576x288 panel
+// and is the page's sole event capturer. Earlier iterations mounted
+// a hidden 1x1 ListContainer "to harvest scrolls", on the assumption
+// that only LIST containers emit SCROLL_TOP/SCROLL_BOTTOM. That was
+// a misreading: lists *consume* scroll events internally for native
+// scrolling and never surface them to the page. Empirical testing
+// (simulator with `RUST_LOG=debug`) confirmed text containers
+// receive every gesture (taps, double-taps, AND swipes) when they
+// hold `isEventCapture: 1`. Pin the shape so a future "let's add a
+// list back" attempt fails loudly here instead of silently breaking
+// every swipe.
 
 describe("glasses-host page-container shape", () => {
-  it("includes an itemContainer on the scroll ListContainerProperty", async () => {
-    const { bridge, record } = makeFakeBridge();
-    const router = makeStubRouter();
-    const ticker = makeTicker({ generation: 0 }, 10_000);
-
-    const unmount = await mountGlassesScreen(ticker.screen, bridge, router);
-    try {
-      expect(record.pageCreates).toHaveLength(1);
-      const page = record.pageCreates[0]!;
-      const lists = (page.listObject ?? []);
-      expect(lists.length).toBeGreaterThan(0);
-      for (const list of lists) {
-        expect(list.itemContainer).toBeDefined();
-      }
-    } finally {
-      await unmount();
-    }
-  });
-
   // SDK README "Important Notes": when multiple containers are mounted
-  // in a single page, EXACTLY ONE may have `isEventCapture: 1`.
-  // Violating this makes the host-side deserialiser reject the page
-  // outright — and the error it surfaces is the stale "missing field
-  // `itemContainer`" parse failure, not anything mentioning event
-  // capture, so the symptom looks identical to the regression the
-  // previous test pins. Pin both shapes so neither can sneak back.
+  // in a single page, EXACTLY ONE may have `isEventCapture: 1`. The
+  // simulator's validation error for the multi-capturer case is
+  // "multiple event listeners (N) not allowed", surfaced only via
+  // `RUST_LOG=debug`; without it the page creation simply returns
+  // `invalid (1)`. Pin the shape here.
   it("has exactly one container with isEventCapture=1 (SDK constraint)", async () => {
     const { bridge, record } = makeFakeBridge();
     const router = makeStubRouter();
@@ -406,5 +396,233 @@ describe("glasses-host page-container shape", () => {
     } finally {
       await unmount();
     }
+  });
+
+  // The page must use a TEXT container as the event capturer, NOT a
+  // list. Lists consume scroll events internally (native scrolling)
+  // and never deliver them to the page — using a list as the
+  // capturer silently drops every swipe.
+  it("uses a TextContainer as the event capturer (no list)", async () => {
+    const { bridge, record } = makeFakeBridge();
+    const router = makeStubRouter();
+    const ticker = makeTicker({ generation: 0 }, 10_000);
+
+    const unmount = await mountGlassesScreen(ticker.screen, bridge, router);
+    try {
+      expect(record.pageCreates).toHaveLength(1);
+      const page = record.pageCreates[0]!;
+      // No list container at all — lists swallow scrolls natively.
+      expect((page.listObject ?? []).length).toBe(0);
+      const capturer = (page.textObject ?? []).find(
+        (t) => (t.isEventCapture ?? 0) === 1,
+      );
+      expect(capturer).toBeDefined();
+    } finally {
+      await unmount();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Event-envelope normalisation (phantom-press guard + lifecycle)
+// ---------------------------------------------------------------------------
+//
+// The two envelopes are deliberately asymmetric:
+//   - textEvent: the sole event capturer; a real single press arrives with
+//     eventType omitted (protobuf zero-value), so `undefined → CLICK`.
+//   - sysEvent: ALSO carries lifecycle (FOREGROUND_*, EXITs). It must NEVER
+//     coalesce `undefined → CLICK` — otherwise a type-less / unrecognised
+//     sysEvent fires a phantom TAP (which on Home navigates away).
+
+describe("eventToScreenEvent envelope handling", () => {
+  it("coalesces a type-less textEvent to TAP (protobuf zero-value)", () => {
+    const ev = { textEvent: {} } as unknown as EvenHubEvent;
+    expect(eventToScreenEvent(ev)).toEqual({ type: "TAP" });
+  });
+
+  it("maps explicit textEvent gesture types", () => {
+    const mk = (t: OsEventTypeList) =>
+      eventToScreenEvent({ textEvent: { eventType: t } } as EvenHubEvent);
+    expect(mk(OsEventTypeList.CLICK_EVENT)).toEqual({ type: "TAP" });
+    expect(mk(OsEventTypeList.DOUBLE_CLICK_EVENT)).toEqual({ type: "DOUBLE_TAP" });
+    expect(mk(OsEventTypeList.SCROLL_TOP_EVENT)).toEqual({ type: "SCROLL_UP" });
+    expect(mk(OsEventTypeList.SCROLL_BOTTOM_EVENT)).toEqual({ type: "SCROLL_DOWN" });
+  });
+
+  it("does NOT coerce a type-less sysEvent into a phantom TAP", () => {
+    // The regression this guards: `undefined → CLICK` applied to sysEvent
+    // turned every zero-value / lifecycle sysEvent into a press.
+    const ev = { sysEvent: {} } as unknown as EvenHubEvent;
+    expect(eventToScreenEvent(ev)).toBeNull();
+  });
+
+  it("does NOT map a lifecycle sysEvent (FOREGROUND_*) to a gesture", () => {
+    const enter = {
+      sysEvent: { eventType: OsEventTypeList.FOREGROUND_ENTER_EVENT },
+    } as EvenHubEvent;
+    const exit = {
+      sysEvent: { eventType: OsEventTypeList.FOREGROUND_EXIT_EVENT },
+    } as EvenHubEvent;
+    expect(eventToScreenEvent(enter)).toBeNull();
+    expect(eventToScreenEvent(exit)).toBeNull();
+  });
+
+  it("honours an explicit DOUBLE_CLICK on the sysEvent envelope", () => {
+    const ev = {
+      sysEvent: { eventType: OsEventTypeList.DOUBLE_CLICK_EVENT },
+    } as EvenHubEvent;
+    expect(eventToScreenEvent(ev)).toEqual({ type: "DOUBLE_TAP" });
+  });
+});
+
+describe("lifecycleEvent / isSystemExit", () => {
+  it("classifies FOREGROUND enter/exit and the two exit codes", () => {
+    const mk = (t: OsEventTypeList) =>
+      lifecycleEvent({ sysEvent: { eventType: t } } as EvenHubEvent);
+    expect(mk(OsEventTypeList.FOREGROUND_ENTER_EVENT)).toBe("FOREGROUND_ENTER");
+    expect(mk(OsEventTypeList.FOREGROUND_EXIT_EVENT)).toBe("FOREGROUND_EXIT");
+    expect(mk(OsEventTypeList.SYSTEM_EXIT_EVENT)).toBe("EXIT");
+    expect(mk(OsEventTypeList.ABNORMAL_EXIT_EVENT)).toBe("EXIT");
+  });
+
+  it("returns null for a non-lifecycle / type-less sysEvent", () => {
+    expect(lifecycleEvent({ sysEvent: {} } as unknown as EvenHubEvent)).toBeNull();
+    expect(
+      lifecycleEvent({ textEvent: {} } as unknown as EvenHubEvent),
+    ).toBeNull();
+  });
+
+  it("isSystemExit is true only for the two exit codes (not a type-less sysEvent)", () => {
+    expect(
+      isSystemExit({
+        sysEvent: { eventType: OsEventTypeList.SYSTEM_EXIT_EVENT },
+      } as EvenHubEvent),
+    ).toBe(true);
+    expect(
+      isSystemExit({
+        sysEvent: { eventType: OsEventTypeList.ABNORMAL_EXIT_EVENT },
+      } as EvenHubEvent),
+    ).toBe(true);
+    // A type-less sysEvent must NOT read as an exit (the old `?? CLICK`
+    // coalesce masked this asymmetry).
+    expect(isSystemExit({ sysEvent: {} } as unknown as EvenHubEvent)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FOREGROUND lifecycle: pause fetches on EXIT, resume on ENTER
+// ---------------------------------------------------------------------------
+//
+// A backgrounded app must stop firing fetch ticks (so it doesn't burn the
+// WMATA rate budget); returning to the foreground must resume polling and
+// run one immediate catch-up tick.
+
+describe("glasses-host FOREGROUND lifecycle", () => {
+  function makeEventBridge(): {
+    bridge: EvenAppBridge;
+    record: FakeBridgeRecord;
+    emit: (event: EvenHubEvent) => void;
+  } {
+    const record: FakeBridgeRecord = {
+      upgrades: [],
+      shutdownCalls: 0,
+      pageCreates: [],
+    };
+    let handler: ((event: EvenHubEvent) => void) | null = null;
+    const fake = {
+      createStartUpPageContainer: (
+        container: CreateStartUpPageContainer,
+      ): Promise<StartUpPageCreateResult> => {
+        record.pageCreates.push(container);
+        return Promise.resolve(StartUpPageCreateResult.success);
+      },
+      textContainerUpgrade: (container: TextContainerUpgrade): Promise<boolean> => {
+        const content =
+          (container as unknown as { content?: string }).content ?? "";
+        record.upgrades.push(content);
+        return Promise.resolve(true);
+      },
+      shutDownPageContainer: (_exitMode?: number): Promise<boolean> => {
+        record.shutdownCalls += 1;
+        return Promise.resolve(true);
+      },
+      onEvenHubEvent: (cb: (event: EvenHubEvent) => void): (() => void) => {
+        handler = cb;
+        return () => {
+          handler = null;
+        };
+      },
+    };
+    return {
+      bridge: fake as unknown as EvenAppBridge,
+      record,
+      emit: (event: EvenHubEvent) => handler?.(event),
+    };
+  }
+
+  it("stops fetch ticks on FOREGROUND_EXIT and resumes + catches up on FOREGROUND_ENTER", async () => {
+    const { bridge, emit } = makeEventBridge();
+    const router = makeStubRouter();
+    // A long interval so only the mount tick fires on its own; we drive
+    // pause/resume explicitly and assert against the resume catch-up tick
+    // rather than racing the interval.
+    const ticker = makeTicker({ generation: 0 }, 10_000);
+    const unmount = await mountGlassesScreen(ticker.screen, bridge, router);
+
+    // Initial fetch tick fires once at mount; resolve it so the
+    // single-flight guard is unlocked.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(ticker.callCount).toBe(1);
+    ticker.resolveCurrent({ generation: 1 });
+    await new Promise((r) => setTimeout(r, 10));
+
+    // FOREGROUND_EXIT → pause: the long interval wouldn't fire anyway, but
+    // the clock timer is also stopped (covered by the resume assertion).
+    emit({
+      sysEvent: { eventType: OsEventTypeList.FOREGROUND_EXIT_EVENT },
+    } as EvenHubEvent);
+    const callsAtPause = ticker.callCount;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ticker.callCount).toBe(callsAtPause);
+
+    // FOREGROUND_ENTER → resume fires one immediate catch-up tick.
+    emit({
+      sysEvent: { eventType: OsEventTypeList.FOREGROUND_ENTER_EVENT },
+    } as EvenHubEvent);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(ticker.callCount).toBe(callsAtPause + 1);
+
+    // Drain the catch-up tick before unmounting.
+    ticker.resolveCurrent({ generation: 2 });
+    await unmount();
+  });
+
+  it("a type-less sysEvent does not navigate or tick (phantom-press guard)", async () => {
+    const { bridge, emit } = makeEventBridge();
+    const navIntents: NavIntent[] = [];
+    const router: Router = {
+      current: "home" as NavIntent["to"],
+      navigate: (intent: NavIntent): Promise<void> => {
+        navIntents.push(intent);
+        return Promise.resolve();
+      },
+    };
+    // A screen whose TAP navigates — so a phantom press would be visible.
+    const screen: Screen<{ n: number }> = {
+      name: "home",
+      init: () => ({ n: 0 }),
+      view: (): ScreenSections => ({ header: ["H"], body: ["B"] }),
+      reduce(_s, nav, e: ScreenEvent) {
+        if (e.type === "TAP") return { nav, navigate: { to: "predictions", stationCode: "A01" } };
+        return { nav };
+      },
+    };
+    const unmount = await mountGlassesScreen(screen, bridge, router);
+    // Emit a type-less sysEvent (protobuf zero-value / unknown lifecycle).
+    emit({ sysEvent: {} } as unknown as EvenHubEvent);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(navIntents).toEqual([]);
+    await unmount();
   });
 });

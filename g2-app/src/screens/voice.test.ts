@@ -22,7 +22,8 @@
 import { describe, expect, it } from "vitest";
 import { LINE_WIDTH } from "../ui/render";
 import type { Station } from "../wmata";
-import { initialNav, type ScreenEvent, type ViewContext } from "./router";
+import {
+  flattenSections, initialNav, type ScreenEvent, type ViewContext } from "./router";
 import {
   MAX_MATCHES,
   MockSttEngine,
@@ -102,11 +103,14 @@ describe("voice formatClock", () => {
 });
 
 describe("voice renderHeader", () => {
-  it("renders VOICE + clock at exactly LINE_WIDTH cols", () => {
-    const out = renderHeader(NOW);
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out.startsWith("VOICE")).toBe(true);
-    expect(out.endsWith("2:32p")).toBe(true);
+  it("renders the VOICE title only (clock is host-rendered)", () => {
+    const out = renderHeader();
+    expect(out).toBe("VOICE");
+    // The clock is no longer embedded in the header string.
+    expect(out).not.toContain(" 2:32p");
+    // Stays within the 50-col title budget so it can't collide with the
+    // host's top-right clock container.
+    expect(out.length).toBeLessThanOrEqual(50);
   });
 });
 
@@ -150,9 +154,9 @@ describe("voice formatTranscriptWindow", () => {
 describe("voice view: initial render (listening, empty transcript)", () => {
   it("renders header + 'Listening...' + empty transcript line + cancel cue", () => {
     const { screen } = makeRig();
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    expect(lines[0]).toBe(renderHeader(NOW));
+    expect(lines[0]).toBe(renderHeader());
     expect(lines.some((l) => l.includes("Listening"))).toBe(true);
     expect(lines.some((l) => l.includes("double-tap to cancel"))).toBe(true);
     // The transcript row is the "> " prefix + empty window = "> ".
@@ -167,7 +171,7 @@ describe("voice view: initial render (listening, empty transcript)", () => {
 describe("voice view: partial transcript", () => {
   it("renders 'metr' verbatim under the listening cue", () => {
     const { screen } = makeRig(emptySearch, { transcript: "metr" });
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.some((l) => l.includes("metr"))).toBe(true);
   });
@@ -177,7 +181,7 @@ describe("voice view: partial transcript", () => {
     const { screen } = makeRig(emptySearch, {
       transcript: longTranscript,
     });
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     // The transcript row's content (excluding the "> " prefix) is at
     // most TRANSCRIPT_WINDOW chars wide.
@@ -223,7 +227,7 @@ describe("voice reduce: silence → resolving", () => {
       phase: "resolving",
       lastQuery: "metro center",
     });
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.some((l) => l.includes("Resolving"))).toBe(true);
     expect(lines.some((l) => l.includes("metro center"))).toBe(true);
@@ -287,7 +291,7 @@ describe("voice view + reduce: three matches", () => {
       matches: THREE,
       matchIndex: 0,
     });
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     // header + "Did you mean:" + spacer + 3 match rows + spacer + cue = 8
     expect(lines.length).toBe(8);
@@ -296,7 +300,7 @@ describe("voice view + reduce: three matches", () => {
     expect(lines[4]!.startsWith("  ")).toBe(true);
     expect(lines[5]!.startsWith("  ")).toBe(true);
     // Names appear (abbreviated where the map provides one).
-    expect(lines[3]).toContain("Metro Ctr");
+    expect(lines[3]).toContain("Metro Center");
     expect(lines[4]).toContain("Mt Vernon");
     expect(lines[5]).toContain("McPherson");
   });
@@ -390,7 +394,7 @@ describe("voice view + reduce: noMatch", () => {
       phase: "noMatch",
       lastQuery: "metropolish",
     });
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.some((l) => l.includes("No match"))).toBe(true);
     expect(lines.some((l) => l.includes("metropolish"))).toBe(true);
@@ -421,7 +425,7 @@ describe("voice view + reduce: error phase", () => {
       phase: "error",
       errorMessage: "Network down",
     });
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
     expect(lines.some((l) => l.includes("Error"))).toBe(true);
     expect(lines.some((l) => l.includes("Network down"))).toBe(true);
@@ -527,7 +531,7 @@ describe("voice view: width check across every phase", () => {
 
     for (const snap of cases) {
       const { screen } = makeRig(emptySearch, snap);
-      const lines = screen.view(screen.init(), initialNav(), CTX);
+      const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
       expectFits(lines);
     }
   });
@@ -565,24 +569,30 @@ describe("voice view snapshot: 3 matches at highlight idx 0", () => {
       matches: THREE,
       matchIndex: 0,
     });
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expectFits(lines);
-    // Header: "VOICE" + 13 spaces + " 2:32p" = 24 cols.
-    // Match rows: "> " or "  " + name(10) + " " + lines(11).
+    // Header: the "VOICE" title only — the host renders the clock in its
+    // own top-right container, so it's no longer in the header string.
+    // Match rows: left-flowing "> "/"  " cursor + full station name +
+    // " · " + full line names (lineName), truncated to SAFE_TEXT_WIDTH.
+    // Mirrors the Home screen's favorite rows; no right-pad to
+    // LINE_WIDTH (the panel ignores trailing space for monospace rows).
     expect(lines).toEqual([
-      "VOICE              2:32p",
+      "VOICE",
       "Did you mean:",
       "",
-      renderMatchRow(THREE[0]!, true),
-      renderMatchRow(THREE[1]!, false),
-      renderMatchRow(THREE[2]!, false),
+      "> Metro Center · RED BLUE",
+      "  Mt Vernon Sq 7th St-Convention Center · GREEN YELLOW",
+      "  McPherson Sq · BLUE ORANGE SILVER",
       "",
       "(scroll=pick, tap=ok)",
     ]);
-    expect(lines[0]!.length).toBe(LINE_WIDTH);
-    expect(lines[3]!.length).toBe(LINE_WIDTH);
-    expect(lines[4]!.length).toBe(LINE_WIDTH);
-    expect(lines[5]!.length).toBe(LINE_WIDTH);
+    // The pinned strings are exactly what renderMatchRow produces.
+    expect(lines[3]).toBe(renderMatchRow(THREE[0]!, true));
+    expect(lines[4]).toBe(renderMatchRow(THREE[1]!, false));
+    expect(lines[5]).toBe(renderMatchRow(THREE[2]!, false));
+    // The header is the bare title; the clock lives in the host container.
+    expect(lines[0]).toBe("VOICE");
   });
 });
 

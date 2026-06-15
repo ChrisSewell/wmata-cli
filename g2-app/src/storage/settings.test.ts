@@ -26,7 +26,10 @@ import {
   removeFavorite,
   reorderFavorites,
   saveApiKey,
+  saveGeofenceEnabled,
+  saveJourneyPlan,
   saveSchedule,
+  saveVoiceTargets,
   type FavoriteStation,
 } from "./settings";
 import type { ScheduleRule } from "../schedule/rules";
@@ -494,5 +497,131 @@ describe("saveApiKey: localStorage throws on setItem", () => {
     // Swap to a non-throwing storage to read back — nothing was written.
     vi.stubGlobal("localStorage", mockStorage);
     expect(loadSettings().apiKey).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// voiceTargets storage round-trip (WP-M)
+// ---------------------------------------------------------------------------
+
+describe("loadSettings.voiceTargets + saveVoiceTargets", () => {
+  it("returns empty strings on a fresh install", () => {
+    expect(loadSettings().voiceTargets).toEqual({ home: "", work: "" });
+  });
+
+  it("round-trips both labels", () => {
+    saveVoiceTargets({ home: "C01", work: "A01" });
+    expect(loadSettings().voiceTargets).toEqual({
+      home: "C01",
+      work: "A01",
+    });
+  });
+
+  it("trims whitespace before persisting", () => {
+    saveVoiceTargets({ home: "  C01  ", work: " A01 " });
+    expect(loadSettings().voiceTargets).toEqual({
+      home: "C01",
+      work: "A01",
+    });
+  });
+
+  it("returns defaults when the envelope is corrupt JSON", () => {
+    mockStorage.store.set("wmata.g2.voiceTargets", "{not valid json}");
+    expect(loadSettings().voiceTargets).toEqual({ home: "", work: "" });
+  });
+
+  it("returns defaults when the schema version mismatches", () => {
+    mockStorage.store.set(
+      "wmata.g2.voiceTargets",
+      JSON.stringify({
+        schemaVersion: 99,
+        value: { home: "C01", work: "A01" },
+      }),
+    );
+    expect(loadSettings().voiceTargets).toEqual({ home: "", work: "" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// journeyPlan storage round-trip (WP-M)
+// ---------------------------------------------------------------------------
+
+describe("loadSettings.journeyPlan + saveJourneyPlan", () => {
+  it("returns empty strings on a fresh install", () => {
+    const out = loadSettings().journeyPlan;
+    expect(out.origin).toBe("");
+    expect(out.destination).toBe("");
+  });
+
+  it("round-trips an origin / destination / transfer triple", () => {
+    saveJourneyPlan({ origin: "C01", destination: "F02", transfer: "C03" });
+    expect(loadSettings().journeyPlan).toEqual({
+      origin: "C01",
+      destination: "F02",
+      transfer: "C03",
+    });
+  });
+
+  it("uppercases codes before persisting", () => {
+    saveJourneyPlan({ origin: "c01", destination: "f02" });
+    const out = loadSettings().journeyPlan;
+    expect(out.origin).toBe("C01");
+    expect(out.destination).toBe("F02");
+  });
+
+  it("returns defaults when the envelope is corrupt JSON", () => {
+    mockStorage.store.set("wmata.g2.journeyPlan", "{not valid json}");
+    expect(loadSettings().journeyPlan.origin).toBe("");
+  });
+
+  it("tolerates a missing transfer field (backward-compat with pre-WP-K saves)", () => {
+    mockStorage.store.set(
+      "wmata.g2.journeyPlan",
+      JSON.stringify({
+        schemaVersion: 1,
+        value: { origin: "C01", destination: "F02" },
+      }),
+    );
+    const out = loadSettings().journeyPlan;
+    expect(out.origin).toBe("C01");
+    expect(out.destination).toBe("F02");
+    expect(out.transfer ?? "").toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// geofenceEnabled storage round-trip (WP-M)
+// ---------------------------------------------------------------------------
+
+describe("loadSettings.geofenceEnabled + saveGeofenceEnabled", () => {
+  it("returns false on a fresh install", () => {
+    expect(loadSettings().geofenceEnabled).toBe(false);
+  });
+
+  it("round-trips a true value", () => {
+    saveGeofenceEnabled(true);
+    expect(loadSettings().geofenceEnabled).toBe(true);
+  });
+
+  it("round-trips a false value (explicit opt-out)", () => {
+    saveGeofenceEnabled(true);
+    saveGeofenceEnabled(false);
+    expect(loadSettings().geofenceEnabled).toBe(false);
+  });
+
+  it("returns defaults when the stored value isn't a boolean", () => {
+    mockStorage.store.set(
+      "wmata.g2.geofenceEnabled",
+      JSON.stringify({ schemaVersion: 1, value: "not-a-bool" }),
+    );
+    expect(loadSettings().geofenceEnabled).toBe(false);
+  });
+
+  it("returns defaults when the schema version mismatches", () => {
+    mockStorage.store.set(
+      "wmata.g2.geofenceEnabled",
+      JSON.stringify({ schemaVersion: 99, value: true }),
+    );
+    expect(loadSettings().geofenceEnabled).toBe(false);
   });
 });

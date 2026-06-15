@@ -18,6 +18,7 @@ import {
   scrollWindowWithMarkers,
   truncate,
   withEdgeMarkers,
+  wrapText,
 } from "./render";
 
 describe("grid constants", () => {
@@ -32,8 +33,8 @@ describe("grid constants", () => {
     expect(TOTAL_ROWS - USABLE_ROWS).toBe(3);
   });
 
-  it("uses a 24-column conservative line width", () => {
-    expect(LINE_WIDTH).toBe(24);
+  it("uses a 72-column line width (empirically tuned from simulator)", () => {
+    expect(LINE_WIDTH).toBe(72);
   });
 });
 
@@ -134,15 +135,15 @@ describe("row", () => {
     expect(r.length).toBe(10);
   });
 
-  it("fits exactly at LINE_WIDTH (24 cols)", () => {
-    // 11 + 1 + 12 = 24 columns, no overflow.
-    const r = row(["a".repeat(11), "b".repeat(12)], [11, 12]);
+  it("fits exactly at LINE_WIDTH (72 cols)", () => {
+    // 35 + 1 + 36 = 72 columns, no overflow.
+    const r = row(["a".repeat(35), "b".repeat(36)], [35, 36]);
     expect(r.length).toBe(LINE_WIDTH);
   });
 
   it("throws when total width + separators exceeds LINE_WIDTH", () => {
-    // 12 + 1 + 12 = 25 > 24
-    expect(() => row(["x".repeat(12), "y".repeat(12)], [12, 12])).toThrow(
+    // 36 + 1 + 36 = 73 > 72
+    expect(() => row(["x".repeat(36), "y".repeat(36)], [36, 36])).toThrow(
       /LINE_WIDTH/,
     );
   });
@@ -387,5 +388,68 @@ describe("highlightPrefix", () => {
   it("returns a fixed-width 2-char prefix so columns stay aligned", () => {
     expect(highlightPrefix(true).length).toBe(2);
     expect(highlightPrefix(false).length).toBe(2);
+  });
+});
+
+describe("wrapText", () => {
+  it("returns an empty array for empty input", () => {
+    expect(wrapText("", 24, 3)).toEqual([]);
+    expect(wrapText("   ", 24, 3)).toEqual([]);
+  });
+
+  it("returns an empty array when the budget is non-positive", () => {
+    expect(wrapText("hello world", 0, 3)).toEqual([]);
+    expect(wrapText("hello world", 24, 0)).toEqual([]);
+  });
+
+  it("returns a single line when the text fits", () => {
+    expect(wrapText("hello world", 24, 3)).toEqual(["hello world"]);
+  });
+
+  it("wraps at word boundaries when the text overflows one line", () => {
+    const out = wrapText(
+      "Single-tracking on RD between Foggy Bottom and Rosslyn",
+      24,
+      4,
+    );
+    expect(out.length).toBeGreaterThan(1);
+    expect(out.length).toBeLessThanOrEqual(4);
+    for (const line of out) expect(line.length).toBeLessThanOrEqual(24);
+    // No information lost: every word from the input appears across
+    // the wrapped lines (in order).
+    expect(out.join(" ")).toContain("Single-tracking");
+    expect(out.join(" ")).toContain("Rosslyn");
+  });
+
+  it("packs words greedily — never leaves a line shorter than necessary", () => {
+    // "a a a a" (7 chars) all fits on one 7-col line; we should NOT
+    // pre-emptively break.
+    expect(wrapText("a a a a", 7, 3)).toEqual(["a a a a"]);
+    // At 5 cols "a a a" (5) fits, "a" is the overflow → 2 lines.
+    expect(wrapText("a a a a", 5, 3)).toEqual(["a a a", "a"]);
+  });
+
+  it("hard-breaks a single word longer than the line width", () => {
+    // "abcdefghij" (10 chars) at width=4 -> "abcd","efgh","ij"
+    expect(wrapText("abcdefghij", 4, 5)).toEqual(["abcd", "efgh", "ij"]);
+  });
+
+  it("appends the canonical ellipsis when content overflows maxLines", () => {
+    const out = wrapText(
+      "one two three four five six seven eight nine ten",
+      6,
+      2,
+    );
+    expect(out.length).toBe(2);
+    for (const line of out) expect(line.length).toBeLessThanOrEqual(6);
+    // The last line ends with "…" to signal "more content was
+    // dropped" — without this, the user has no signal that the
+    // message was cut.
+    expect(out[1]!.endsWith(ELLIPSIS)).toBe(true);
+  });
+
+  it("does NOT append ellipsis when the entire input fits", () => {
+    const out = wrapText("hello world", 6, 3);
+    expect(out.join("")).not.toContain(ELLIPSIS);
   });
 });

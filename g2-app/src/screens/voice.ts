@@ -53,13 +53,19 @@
 
 import type { Station } from "../wmata";
 import type { VoiceTargets } from "../storage/settings";
-import { LINE_WIDTH, padRight, truncate } from "../ui/render";
-import { abbreviateStation, lineGlyph } from "../ui/format";
+import { LINE_WIDTH, SAFE_TEXT_WIDTH, truncate } from "../ui/render";
+import { lineName } from "../ui/format";
+// `formatClock` now lives in the shared field-formatter module and is
+// rendered by the host into its own top-right clock container. Re-export
+// it here so existing imports (`import { formatClock } from "./voice"`)
+// keep resolving after the screen stopped embedding the clock.
+export { formatClock } from "../ui/format";
 import type {
   NavIntent,
   ReduceResult,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
 import type { EvenAppBridge } from "@evenrealities/even_hub_sdk";
@@ -317,33 +323,16 @@ export const MIN_QUERY_LENGTH = 2;
 // ---------------------------------------------------------------------------
 
 /**
- * Format an epoch-ms timestamp as a 12-hour clock string (` 9:05a` /
- * `12:32p`). Identical helper to the Predictions / Incidents /
- * Elevator / Journey screens. Duplicated here so the Voice module
- * has no cross-screen import.
- */
-export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
-  const d = new Date(epochMs);
-  const h24 = d.getHours();
-  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
-  const hh = String(h12).padStart(2, " ");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ap = h24 < 12 ? "a" : "p";
-  return `${hh}:${mm}${ap}`;
-}
-
-/**
- * Render the header row: `VOICE` + a right-aligned 12-hour clock.
+ * Render the header row — the screen identifier only, left-aligned:
+ * `VOICE`.
  *
- * Always returns exactly `LINE_WIDTH` columns.
+ * The wall clock is NO LONGER part of the header string: the host
+ * renders it into a dedicated top-right clock container on every screen.
+ * The title is truncated to 50 columns so it can never collide with that
+ * clock cell (which starts at x≈486px ≈ column 50).
  */
-export function renderHeader(nowMs: number): string {
-  const left = "VOICE";
-  const clock = formatClock(nowMs);
-  // left(5) + spaces + clock(6) = LINE_WIDTH(24)  -> 13 spaces.
-  const spaces = Math.max(1, LINE_WIDTH - left.length - clock.length);
-  return truncate(left + " ".repeat(spaces) + clock, LINE_WIDTH);
+export function renderHeader(): string {
+  return truncate("VOICE", 50);
 }
 
 /**
@@ -365,28 +354,43 @@ export function formatTranscriptWindow(transcript: string): string {
 /**
  * Render one match row for the `matches` phase.
  *
- * Width contract: returns a string of exactly `LINE_WIDTH` columns.
- * Cells: prefix(2) + name(10) + " "(1) + lines(11) = 24.
+ * Left-flowing form that mirrors the Home screen's favorite rows:
+ *
+ *   `> Metro Center · RED BLUE ORANGE SILVER`
+ *   `  McPherson Sq · BLUE ORANGE SILVER`
+ *
+ * The full station name and full line names (`lineName`: RED / BLUE
+ * / …) are rendered for consistency with Home / Predictions /
+ * Incidents — Voice no longer uses the abbreviated `lineGlyph` codes.
+ * The 2-char cursor marker (`> ` / `  `) leads the row; the name and
+ * the `·`-separated line names follow, left-aligned. The whole row is
+ * truncated to `SAFE_TEXT_WIDTH` real columns so it never hard-wraps
+ * at the panel border (container padding supplies the frame inset, so
+ * no manual leading space is added here).
+ *
+ * Width contract: returns a string of ≤ `LINE_WIDTH` columns (and
+ * ≤ prefix + `SAFE_TEXT_WIDTH` of real text).
  */
 export function renderMatchRow(
   station: Station,
   isHighlighted: boolean,
 ): string {
   const prefix = isHighlighted ? "> " : "  ";
-  const name = padRight(abbreviateStation(station.Name, 10), 10);
-  const lineCodes: string[] = [];
+  const lineNames: string[] = [];
   for (const code of [
     station.LineCode1,
     station.LineCode2,
     station.LineCode3,
     station.LineCode4,
   ]) {
-    if (code && lineGlyph(code) !== "--") lineCodes.push(code);
+    if (code && lineName(code) !== "--") lineNames.push(lineName(code));
   }
-  // 11-col lines cell; truncate if a future malformed station has
-  // more than 3 codes (would only show up if the wire shape changes).
-  const lines = padRight(truncate(lineCodes.join(" "), 11), 11);
-  return prefix + name + " " + lines;
+  const linesPart = lineNames.length > 0 ? ` · ${lineNames.join(" ")}` : "";
+  // Truncate the visible content (name + line names) to SAFE_TEXT_WIDTH
+  // so the rendered row can't overflow the 576px border; the cursor
+  // marker sits outside that text budget.
+  const content = truncate(station.Name + linesPart, SAFE_TEXT_WIDTH);
+  return prefix + content;
 }
 
 /**
@@ -477,62 +481,62 @@ export function makeVoiceScreen(
     name: "voice",
     init: () => seeded,
 
-    view(snapshot, _nav, ctx: ViewContext): string[] {
-      const lines: string[] = [];
-      lines.push(renderHeader(ctx.nowMs));
+    view(snapshot, _nav, _ctx: ViewContext): ScreenSections {
+      const header: string[] = [renderHeader()];
+      const body: string[] = [];
 
       switch (snapshot.phase) {
         case "listening": {
-          lines.push(truncate("Listening...", LINE_WIDTH));
-          lines.push("");
+          body.push(truncate("Listening...", LINE_WIDTH));
+          body.push("");
           const window = formatTranscriptWindow(snapshot.transcript);
           // Always render the transcript line, even when empty, so the
           // total line count is stable while the user is speaking and
           // the bridge dedupe doesn't oscillate the row height. The
           // `> ` prefix marks the live-input row visually.
-          lines.push(truncate("> " + window, LINE_WIDTH));
-          lines.push("");
-          lines.push(truncate("(double-tap to cancel)", LINE_WIDTH));
-          return lines;
+          body.push(truncate("> " + window, LINE_WIDTH));
+          body.push("");
+          body.push(truncate("(double-tap to cancel)", LINE_WIDTH));
+          return { header, body };
         }
         case "resolving": {
-          lines.push(truncate("Resolving...", LINE_WIDTH));
-          lines.push("");
+          body.push(truncate("Resolving...", LINE_WIDTH));
+          body.push("");
           const q = formatTranscriptWindow(snapshot.lastQuery);
-          lines.push(truncate("> " + q, LINE_WIDTH));
-          return lines;
+          body.push(truncate("> " + q, LINE_WIDTH));
+          return { header, body };
         }
         case "matches": {
-          lines.push(truncate("Did you mean:", LINE_WIDTH));
-          lines.push("");
+          body.push(truncate("Did you mean:", LINE_WIDTH));
+          body.push("");
           for (let i = 0; i < snapshot.matches.length; i++) {
             const station = snapshot.matches[i]!;
-            lines.push(renderMatchRow(station, i === snapshot.matchIndex));
+            body.push(renderMatchRow(station, i === snapshot.matchIndex));
           }
-          lines.push("");
-          lines.push(truncate("(scroll=pick, tap=ok)", LINE_WIDTH));
-          return lines;
+          body.push("");
+          body.push(truncate("(scroll=pick, tap=ok)", LINE_WIDTH));
+          return { header, body };
         }
         case "noMatch": {
-          lines.push(truncate("No match.", LINE_WIDTH));
-          lines.push("");
+          body.push(truncate("No match.", LINE_WIDTH));
+          body.push("");
           // Quote the query verbatim so the user can tell whether the
           // STT misheard them or the station name is genuinely off.
           const q = formatTranscriptWindow(snapshot.lastQuery);
-          lines.push(truncate('"' + q + '"', LINE_WIDTH));
-          lines.push("");
-          lines.push(truncate("(tap to retry)", LINE_WIDTH));
-          return lines;
+          body.push(truncate('"' + q + '"', LINE_WIDTH));
+          body.push("");
+          body.push(truncate("(tap to retry)", LINE_WIDTH));
+          return { header, body };
         }
         case "error": {
-          lines.push(truncate("Error.", LINE_WIDTH));
-          lines.push("");
-          lines.push(
+          body.push(truncate("Error.", LINE_WIDTH));
+          body.push("");
+          body.push(
             truncate(snapshot.errorMessage ?? "Unknown error", LINE_WIDTH),
           );
-          lines.push("");
-          lines.push(truncate("(double-tap to exit)", LINE_WIDTH));
-          return lines;
+          body.push("");
+          body.push(truncate("(double-tap to exit)", LINE_WIDTH));
+          return { header, body };
         }
       }
     },

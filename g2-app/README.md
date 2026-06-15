@@ -20,12 +20,50 @@ service alerts, and a voice-lookup affordance for any WMATA rail station.
 ```bash
 npm install
 npm run dev        # Vite dev server on :5173 (LAN-bound for QR access)
+npm run qr         # QR code to sideload onto the glasses (see below)
 npm run simulate   # render in the desktop simulator
 ```
+
+Both `npm run dev` and `npm run simulate` serve two pages:
+
+- `/index.html` — the production entry. Renders the companion
+  settings UI on the phone, then hands off to the glasses HUD when
+  the SDK bridge is available.
+- `/preview.html` — a browser-only **screens gallery** that renders
+  every glasses screen state through its real `view()` function.
+  No SDK bridge required; works in any desktop browser. Useful for
+  reviewing layout drift, capturing screenshots, and demoing the
+  app without hardware.
 
 The desktop simulator (`evenhub-simulator`) works out-of-the-box on macOS
 and Windows. On Linux it requires `webkit2gtk` (`apt install
 libwebkit2gtk-4.1-0` or your distro's equivalent).
+
+## Sideloading to the glasses
+
+Sideloading runs the app straight from your machine's dev server over Wi-Fi —
+no store submission, and edits hot-reload on the glasses as you save. Your
+computer and phone must be on the **same Wi-Fi network**.
+
+```bash
+npm run dev        # terminal 1 — Vite dev server, bound to 0.0.0.0:5173
+npm run qr         # terminal 2 — prints a QR for http://<your-LAN-IP>:5173/
+```
+
+`npm run qr` auto-detects your LAN IP and renders a scannable QR code in the
+terminal. In the Even Realities phone app, scan it to load WMATA G2 onto your
+glasses, then follow the first-launch flow below.
+
+If the detected IP is wrong (VPN, multiple network interfaces) or you'd rather
+scan from an image, pass the address explicitly or open the code externally:
+
+```bash
+npx evenhub qr --url http://192.168.1.50:5173   # exact address
+npx evenhub qr --http -p 5173 --path / -e        # open QR in an external viewer
+```
+
+For a store-submittable package instead of a live dev sideload, use
+`npm run pack` (see [Development](#development)).
 
 ## First-launch flow
 
@@ -89,7 +127,8 @@ Home, so the rest of the app stays usable.
 ```bash
 npm test           # Vitest (pure-view + reducer + cache unit tests)
 npm run build      # tsc --noEmit && vite build
-npm run pack       # produce a sideload .ehpk bundle for the device
+npm run qr         # QR code to sideload the dev server onto the glasses
+npm run pack       # bundle dist/ → wmata-transit.ehpk for store submission
 npm run simulate   # desktop simulator
 ```
 

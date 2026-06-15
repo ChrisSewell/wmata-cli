@@ -3,14 +3,18 @@
 import { describe, expect, it } from "vitest";
 import { LINE_WIDTH } from "../ui/render";
 import type { PathStep } from "../wmata";
-import { initialNav, type ViewContext } from "./router";
+import {
+  flattenSections, initialNav, type ViewContext } from "./router";
 import {
   MINUTES_PER_STOP,
   estimateTravelMinutes,
+  estimateTravelMinutesForLegs,
   formatClock,
+  formatLineSummary,
   makeInitialJourneySnapshot,
   makeJourneyScreen,
   renderHeader,
+  stopsAcrossLegs,
   type JourneyFetchResult,
   type JourneySnapshot,
 } from "./journey";
@@ -31,10 +35,12 @@ function step(over: Partial<PathStep>): PathStep {
 
 function snap(over: Partial<JourneySnapshot> = {}): JourneySnapshot {
   return {
-    plan: { origin: "A01", destination: "A04" },
+    plan: { origin: "A01", destination: "A04", transfer: "" },
     originName: "Metro Center",
     destinationName: "Foggy Bottom-GWU",
-    path: null,
+    transferName: "",
+    legs: null,
+    nextTrain: null,
     fetchedAt: 0,
     fetchError: null,
     ...over,
@@ -42,10 +48,16 @@ function snap(over: Partial<JourneySnapshot> = {}): JourneySnapshot {
 }
 
 const noopFetcher = (): Promise<JourneyFetchResult> =>
-  Promise.resolve({ path: null, originName: "", destinationName: "" });
+  Promise.resolve({
+    legs: null,
+    originName: "",
+    destinationName: "",
+    transferName: "",
+    nextTrain: null,
+  });
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Pure helpers
 // ---------------------------------------------------------------------------
 
 describe("estimateTravelMinutes", () => {
@@ -61,26 +73,73 @@ describe("estimateTravelMinutes", () => {
   });
 });
 
+describe("estimateTravelMinutesForLegs", () => {
+  it("returns 0 for an empty leg list", () => {
+    expect(estimateTravelMinutesForLegs([])).toBe(0);
+  });
+
+  it("matches the single-leg estimator for one leg", () => {
+    const path = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    expect(estimateTravelMinutesForLegs([path])).toBe(MINUTES_PER_STOP);
+  });
+
+  it("adds a 2-minute transfer dwell between legs", () => {
+    const a = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    const b = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    expect(estimateTravelMinutesForLegs([a, b])).toBe(
+      2 * MINUTES_PER_STOP + 2,
+    );
+  });
+});
+
+describe("stopsAcrossLegs", () => {
+  it("returns 0 for an empty leg list", () => {
+    expect(stopsAcrossLegs([])).toBe(0);
+  });
+  it("sums intermediate hops across legs", () => {
+    const a = [step({ SeqNum: 1 }), step({ SeqNum: 2 }), step({ SeqNum: 3 })];
+    const b = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+    expect(stopsAcrossLegs([a, b])).toBe(3);
+  });
+});
+
+describe("formatLineSummary", () => {
+  it("returns the single full line name for a one-leg journey", () => {
+    const a = [step({ LineCode: "RD" })];
+    expect(formatLineSummary([a])).toBe("RED");
+  });
+  it("joins distinct full line names with `→`", () => {
+    const a = [step({ LineCode: "OR" })];
+    const b = [step({ LineCode: "YL" })];
+    expect(formatLineSummary([a, b])).toBe("ORANGE→YELLOW");
+  });
+  it("dedups consecutive identical line codes", () => {
+    // (Unusual but possible if the user picks a same-line transfer.)
+    const a = [step({ LineCode: "RD" })];
+    const b = [step({ LineCode: "RD" })];
+    expect(formatLineSummary([a, b])).toBe("RED");
+  });
+});
+
 describe("formatClock + renderHeader", () => {
   it("formatClock returns canonical 12-hour clock", () => {
     expect(formatClock(NOW)).toBe(" 2:32p");
   });
 
-  it("renderHeader for an unconfigured plan collapses to 'Journey' + clock", () => {
-    const out = renderHeader(
-      snap({ plan: { origin: "", destination: "" } }),
-      NOW,
-    );
-    expect(out.length).toBe(LINE_WIDTH);
-    expect(out).toContain("Journey");
-    expect(out).toContain("2:32p");
+  it("renderHeader for an unconfigured plan collapses to 'Journey' (no clock)", () => {
+    const out = renderHeader(snap({ plan: { origin: "", destination: "" } }));
+    expect(out).toBe("Journey");
+    // The clock is host-rendered now; it's not in the header string.
+    expect(out).not.toContain(" 2:32p");
+    // Within the 50-col title budget so it can't collide with the clock.
+    expect(out.length).toBeLessThanOrEqual(50);
   });
 
-  it("renderHeader includes the orig→dest pair when configured", () => {
-    const out = renderHeader(snap({}), NOW);
-    expect(out.length).toBe(LINE_WIDTH);
+  it("renderHeader includes the orig→dest pair when configured (no clock)", () => {
+    const out = renderHeader(snap({}));
     expect(out).toContain("→");
-    expect(out).toContain("2:32p");
+    expect(out).not.toContain(" 2:32p");
+    expect(out.length).toBeLessThanOrEqual(50);
   });
 });
 
@@ -94,51 +153,118 @@ describe("view: empty plan", () => {
       noopFetcher,
       snap({ plan: { origin: "", destination: "" } }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     for (const line of lines) {
       expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
     }
     expect(lines.some((l) => l.includes("No journey saved."))).toBe(true);
-    expect(lines.some((l) => l.includes("Open phone to add."))).toBe(true);
+    expect(lines.some((l) => l.includes("Open the phone app"))).toBe(true);
     expect(lines.some((l) => l.includes("double-tap to return"))).toBe(true);
   });
 });
 
-describe("view: cross-line route", () => {
-  it("surfaces the 'transfer required' message when path is empty", () => {
+describe("view: not-routable", () => {
+  it("surfaces the 'add a transfer' message when legs is empty", () => {
     const screen = makeJourneyScreen(
       noopFetcher,
-      snap({ path: [], fetchedAt: NOW }),
+      snap({ legs: [], fetchedAt: NOW }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
-    expect(lines.some((l) => l.includes("Not a same-line"))).toBe(true);
-    expect(lines.some((l) => l.includes("Transfer"))).toBe(true);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    expect(lines.some((l) => l.includes("Not a routable"))).toBe(true);
+    expect(lines.some((l) => l.includes("transfer"))).toBe(true);
   });
 });
 
-describe("view: happy path", () => {
-  it("renders line glyph + stop count + ETA estimate", () => {
+describe("view: happy path (same line)", () => {
+  it("renders full-name line summary + stop count + ETA estimate", () => {
     const path = [
       step({ SeqNum: 1, StationCode: "A01", LineCode: "RD" }),
       step({ SeqNum: 2, StationCode: "A02", LineCode: "RD" }),
       step({ SeqNum: 3, StationCode: "A03", LineCode: "RD" }),
       step({ SeqNum: 4, StationCode: "A04", LineCode: "RD" }),
     ];
-    const screen = makeJourneyScreen(noopFetcher, snap({ path, fetchedAt: NOW }));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({ legs: [path], fetchedAt: NOW }),
+    );
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     for (const line of lines) {
       expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
     }
-    expect(lines.some((l) => l.includes("RD"))).toBe(true);
-    expect(lines.some((l) => l.includes("3 stops"))).toBe(true);
+    expect(lines.some((l) => l.includes("RED · 3 stops"))).toBe(true);
     expect(lines.some((l) => l.includes("6 min"))).toBe(true);
+  });
+});
+
+describe("view: cross-line (two legs)", () => {
+  it("renders ORANGE→YELLOW summary + via transfer + combined estimate", () => {
+    const leg1 = [
+      step({ SeqNum: 1, StationCode: "C01", LineCode: "OR" }),
+      step({ SeqNum: 2, StationCode: "C02", LineCode: "OR" }),
+      step({ SeqNum: 3, StationCode: "C03", LineCode: "OR" }),
+    ];
+    const leg2 = [
+      step({ SeqNum: 1, StationCode: "C03", LineCode: "YL" }),
+      step({ SeqNum: 2, StationCode: "F01", LineCode: "YL" }),
+      step({ SeqNum: 3, StationCode: "F02", LineCode: "YL" }),
+    ];
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({
+        legs: [leg1, leg2],
+        transferName: "Lenfant Plaza",
+        fetchedAt: NOW,
+      }),
+    );
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    for (const line of lines) {
+      expect(line.length).toBeLessThanOrEqual(LINE_WIDTH);
+    }
+    expect(lines.some((l) => l.includes("ORANGE→YELLOW"))).toBe(true);
+    expect(lines.some((l) => l.includes("via Lenfant Plaza"))).toBe(true);
+    expect(lines.some((l) => l.includes("4 stops"))).toBe(true);
+    // 2 segs × 2 min/seg × 2 legs + 2 dwell = 10 min.
+    expect(lines.some((l) => l.includes("10 min"))).toBe(true);
+  });
+});
+
+describe("view: next-train integration", () => {
+  it("renders a 'Next:' row when nextTrain is populated", () => {
+    const path = [step({ SeqNum: 1, LineCode: "RD" })];
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({
+        legs: [path],
+        fetchedAt: NOW,
+        nextTrain: { line: "RD", min: "5", destination: "Glenmont" },
+      }),
+    );
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    expect(lines.some((l) => l.includes("Next: RED Glenmont 5 min"))).toBe(
+      true,
+    );
+  });
+
+  it("renders ARR/BRD sentinels without 'min' suffix", () => {
+    const path = [step({ SeqNum: 1, LineCode: "RD" })];
+    const screen = makeJourneyScreen(
+      noopFetcher,
+      snap({
+        legs: [path],
+        fetchedAt: NOW,
+        nextTrain: { line: "RD", min: "ARR", destination: "Glenmont" },
+      }),
+    );
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
+    expect(lines.some((l) => l.includes("ARR"))).toBe(true);
+    expect(lines.some((l) => /ARR min/.test(l))).toBe(false);
   });
 });
 
 describe("view: loading state", () => {
   it("shows 'Loading path…' before the first tick", () => {
     const screen = makeJourneyScreen(noopFetcher, snap({}));
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expect(lines.some((l) => l.includes("Loading path"))).toBe(true);
   });
 
@@ -147,7 +273,7 @@ describe("view: loading state", () => {
       noopFetcher,
       snap({ fetchError: "boom", fetchedAt: 0 }),
     );
-    const lines = screen.view(screen.init(), initialNav(), CTX);
+    const lines = flattenSections(screen.view(screen.init(), initialNav(), CTX));
     expect(lines.some((l) => l.includes("Couldn't reach WMATA"))).toBe(true);
   });
 });
@@ -179,19 +305,26 @@ describe("reduce", () => {
 // ---------------------------------------------------------------------------
 
 describe("tick", () => {
-  it("folds a resolved path + names into the snapshot", async () => {
-    const path = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
+  it("folds resolved legs + names + nextTrain into the snapshot", async () => {
+    const leg = [step({ SeqNum: 1 }), step({ SeqNum: 2 })];
     const fetcher = () =>
       Promise.resolve<JourneyFetchResult>({
-        path,
+        legs: [leg],
         originName: "Metro Center",
         destinationName: "Foggy Bottom-GWU",
+        transferName: "",
+        nextTrain: { line: "RD", min: "3", destination: "Glenmont" },
       });
     const screen = makeJourneyScreen(fetcher, snap({}));
     const next = await screen.tick(screen.init());
-    expect(next.path).toEqual(path);
+    expect(next.legs).toEqual([leg]);
     expect(next.originName).toBe("Metro Center");
     expect(next.destinationName).toBe("Foggy Bottom-GWU");
+    expect(next.nextTrain).toEqual({
+      line: "RD",
+      min: "3",
+      destination: "Glenmont",
+    });
     expect(next.fetchedAt).toBeGreaterThan(0);
   });
 
@@ -219,12 +352,22 @@ describe("makeInitialJourneySnapshot", () => {
       destination: "A04",
     });
     expect(out.plan.origin).toBe("A01");
-    expect(out.path).toBeNull();
+    expect(out.legs).toBeNull();
   });
 
   it("seeds an empty plan as 'unconfigured'", () => {
     const out = makeInitialJourneySnapshot({ origin: "", destination: "" });
     expect(out.plan.origin).toBe("");
     expect(out.plan.destination).toBe("");
+  });
+
+  it("captures the optional transfer code", () => {
+    const out = makeInitialJourneySnapshot({
+      origin: "C01",
+      destination: "F02",
+      transfer: "C03",
+    });
+    expect(out.plan.transfer).toBe("C03");
+    expect(out.transferName).toBe("C03");
   });
 });

@@ -351,6 +351,20 @@
   animation: wmata-settings-done-pulse 1.4s ease-out 2;
 }
 
+/* Passive "live on your glasses" confirmation (replaces the old reload
+ * button now that the glasses auto-transition). Centered, with a little
+ * breathing room; the --attention variant reuses the pulse on the
+ * 0 -> 1 favorite transition so it announces itself once. */
+.wmata-settings__live {
+  text-align: center;
+  padding: 10px 14px;
+  border-radius: 8px;
+}
+
+.wmata-settings__live--attention {
+  animation: wmata-settings-done-pulse 1.4s ease-out 2;
+}
+
 /* --------------------------------------------------------------------- */
 /* Footer                                                                */
 /* --------------------------------------------------------------------- */
@@ -359,4 +373,96 @@
   display: flex;
   justify-content: center;
   padding: 8px 0 24px;
+}
+
+/* --------------------------------------------------------------------- */
+/* WP-H additions: schedule rule rows, day toggles, inline fields,       */
+/* checkbox toggle                                                       */
+/* --------------------------------------------------------------------- */
+
+/* One rule in the schedule editor. Lays out kind / day-row / times /
+ * target / remove in a compact horizontal-on-desktop, wrapping on
+ * narrow viewports. */
+.wmata-settings__rule-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid #2a2f3a;
+}
+
+.wmata-settings__rule-row:first-child {
+  border-top: 0;
+}
+
+/* 7-day toggle row: small square buttons in canonical M T W T F S S order. */
+.wmata-settings__day-row {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.wmata-settings__day-btn {
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #232732;
+  color: #ccd1de;
+  border: 1px solid #2f3441;
+  cursor: pointer;
+}
+
+.wmata-settings__day-btn--on {
+  background: #314b80;
+  color: #fff;
+  border-color: #4a6cb6;
+}
+
+/* HH:MM input pair with a separator. */
+.wmata-settings__times-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.wmata-settings__times-sep {
+  font-size: 14px;
+  color: #8a92a3;
+}
+
+.wmata-settings__input--time {
+  max-width: 110px;
+  padding: 6px 8px;
+}
+
+.wmata-settings__target-wrap {
+  display: inline-flex;
+}
+
+/* Inline field: checkbox + label on one line (geofence toggle). */
+.wmata-settings__field--inline {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.wmata-settings__toggle {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+/* Native <select> styling — match the input look. */
+.wmata-settings__select {
+  background: #232732;
+  color: #e6e9f1;
+  border: 1px solid #2f3441;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 14px;
+  min-height: 32px;
 }

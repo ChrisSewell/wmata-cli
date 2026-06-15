@@ -42,13 +42,38 @@ import {
   loadSettings,
   saveApiKey,
   saveSttApiKey,
+  saveSchedule,
+  saveVoiceTargets,
+  saveJourneyPlan,
+  saveGeofenceEnabled,
   addFavorite,
   removeFavorite,
   reorderFavorites,
   clearSettings,
   MAX_FAVORITES,
   type FavoriteStation,
+  type JourneyPlan,
+  type VoiceTargets,
 } from '../storage/settings';
+import {
+  WEEKDAYS,
+  type AutoRotateRule,
+  type ScheduleRule,
+} from '../schedule/rules';
+import { loadHistory } from '../storage/history';
+import { suggestReorder } from '../storage/history';
+import { estimateTravelMinutes } from './journey';
+import {
+  buildPathUrl,
+  type PathResponse,
+} from '../wmata';
+import {
+  MAX_SCHEDULE_RULES,
+  changeRuleKind,
+  defaultAutoRotateRule,
+  toggleDay,
+  validateScheduleRule,
+} from './settings-helpers';
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -89,15 +114,33 @@ interface ScreenState {
   /**
    * Tracks `state.favorites.length` from the *previous* render of the
    * favorites card. Used to detect the 0 -> 1 transition so we can give
-   * the "Done — launch on glasses" button a brief attention-grabbing
-   * class on the render right after the user adds their first favorite.
+   * the "live on your glasses" confirmation a brief attention-grabbing
+   * pulse on the render right after the user adds their first favorite.
    *
    * Initialised to the loaded favorites count so the highlight does NOT
    * fire on the very first render (the user didn't just add a favorite —
    * they reloaded the page).
    */
   favoritesCountAtLastRender: number;
+  // WP-H additions ----------------------------------------------------
+  /** Schedule rules (auto-rotate + quiet hours). */
+  schedule: ScheduleRule[];
+  /** Labelled voice-target stations. */
+  voiceTargets: VoiceTargets;
+  /** Saved origin → destination commute. */
+  journeyPlan: JourneyPlan;
+  /** Boot-time geofence enable. */
+  geofenceEnabled: boolean;
+  /** Transient: hide the reorder banner until next mount. */
+  reorderDismissed: boolean;
+  /** Debounced re-render of the journey-preview row. */
+  journeyPreviewTimer: ReturnType<typeof setTimeout> | null;
+  /** Latest preview text for the journey card (resolved path summary). */
+  journeyPreviewText: string;
 }
+
+/** Day-button labels (M T W T F S S). Indexed by `WEEKDAYS`. */
+const DAY_LABELS: readonly string[] = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 
 // ---------------------------------------------------------------------------
 // DOM helpers
@@ -197,6 +240,14 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     favoritesNotice: null,
     favoritesNoticeTimer: null,
     favoritesCountAtLastRender: initial.favorites.length,
+    // WP-H state — hydrated from the same `loadSettings()` call.
+    schedule: initial.schedule.slice(),
+    voiceTargets: { ...initial.voiceTargets },
+    journeyPlan: { ...initial.journeyPlan },
+    geofenceEnabled: initial.geofenceEnabled,
+    reorderDismissed: false,
+    journeyPreviewTimer: null,
+    journeyPreviewText: '',
   };
 
   // Container & layout shell ------------------------------------------------
@@ -237,9 +288,29 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     class: 'wmata-settings__card',
     'aria-labelledby': 'wmata-settings-stt-title',
   });
+  const scheduleMount = el('section', {
+    class: 'wmata-settings__card',
+    'aria-labelledby': 'wmata-settings-schedule-title',
+  });
+  const voiceTargetsMount = el('section', {
+    class: 'wmata-settings__card',
+    'aria-labelledby': 'wmata-settings-voice-title',
+  });
+  const journeyMount = el('section', {
+    class: 'wmata-settings__card',
+    'aria-labelledby': 'wmata-settings-journey-title',
+  });
+  const geofenceMount = el('section', {
+    class: 'wmata-settings__card',
+    'aria-labelledby': 'wmata-settings-geofence-title',
+  });
   container.appendChild(apiKeyMount);
   container.appendChild(favoritesMount);
   container.appendChild(sttMount);
+  container.appendChild(scheduleMount);
+  container.appendChild(voiceTargetsMount);
+  container.appendChild(journeyMount);
+  container.appendChild(geofenceMount);
 
   // Footer
   const footerResetBtn = el(
@@ -265,9 +336,19 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     state.searchQuery = '';
     state.favoritesNotice = null;
     state.favoritesCountAtLastRender = 0;
+    state.schedule = [];
+    state.voiceTargets = { home: '', work: '' };
+    state.journeyPlan = { origin: '', destination: '', transfer: '' };
+    state.geofenceEnabled = false;
+    state.reorderDismissed = false;
+    state.journeyPreviewText = '';
     renderApiKeyCard();
     renderFavoritesCard();
     renderSttCard();
+    renderScheduleCard();
+    renderVoiceTargetsCard();
+    renderJourneyCard();
+    renderGeofenceCard();
   };
   footerResetBtn.addEventListener('click', onReset);
   container.appendChild(
@@ -674,6 +755,75 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
       );
     }
 
+    // Reorder hint (WP-H/H5) ---------------------------------------------
+    //
+    // Surface a "your most-tapped stations differ from this order"
+    // suggestion when the travel-history log has enough signal. The
+    // pure `suggestReorder` helper returns null in every "don't
+    // surface" case (sparse history, already-matches-current, etc),
+    // so we just check truthiness here.
+    if (!state.reorderDismissed && state.favorites.length >= 2) {
+      const history = loadHistory();
+      const suggested = suggestReorder(state.favorites, history);
+      if (suggested !== null) {
+        const top = suggested
+          .slice(0, 3)
+          .map((f) => f.name)
+          .join(', ');
+        const applyBtn = el(
+          'button',
+          {
+            type: 'button',
+            class:
+              'wmata-settings__button wmata-settings__button--small wmata-settings__button--primary',
+            'data-testid': 'wmata-settings-reorder-apply',
+          },
+          ['Apply suggested order'],
+        );
+        const dismissBtn = el(
+          'button',
+          {
+            type: 'button',
+            class:
+              'wmata-settings__button wmata-settings__button--small wmata-settings__button--ghost',
+            'data-testid': 'wmata-settings-reorder-dismiss',
+          },
+          ['Dismiss'],
+        );
+        applyBtn.addEventListener('click', () => {
+          try {
+            state.favorites = reorderFavorites(suggested);
+          } catch (err) {
+            console.error('[settings] reorderFavorites threw:', err);
+            showErrorToast("Couldn't apply suggested order.");
+            return;
+          }
+          renderFavoritesCard();
+        });
+        dismissBtn.addEventListener('click', () => {
+          state.reorderDismissed = true;
+          renderFavoritesCard();
+        });
+        favoritesMount.appendChild(
+          el(
+            'div',
+            {
+              class: 'wmata-settings__status wmata-settings__status--info',
+              role: 'status',
+              'aria-live': 'polite',
+            },
+            [`Your most-tapped: ${top}.`],
+          ),
+        );
+        favoritesMount.appendChild(
+          el('div', { class: 'wmata-settings__button-row' }, [
+            applyBtn,
+            dismissBtn,
+          ]),
+        );
+      }
+    }
+
     // Favorites list -----------------------------------------------------
     const previousCount = state.favoritesCountAtLastRender;
     favoritesMount.appendChild(
@@ -773,45 +923,35 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
       favoritesMount.appendChild(favList);
     }
 
-    // Done — launch on glasses --------------------------------------------
+    // Live-on-glasses confirmation ----------------------------------------
     //
-    // Surface a prominent action at the bottom of the favorites card so
-    // the user has an obvious way to "finish here and move to the
-    // glasses HUD" without manually reloading the page. The handoff is
-    // intentionally a `window.location.reload()` — simple and reliable;
-    // the boot logic in `main.ts` re-evaluates the settings on every
-    // start and routes to the glasses Home screen when a key is saved
-    // and favorites are present.
+    // The glasses are glasses-first now: they boot the moment the app
+    // launches and show a "finish setup on your phone" card until an API
+    // key + a favorite are saved. A watcher in `main.ts` then swaps that
+    // card for the live Home screen within ~1.5s — no page reload, no
+    // button. So this is a PASSIVE confirmation that setup is complete and
+    // the HUD is live, not an action to trigger the hand-off.
     //
-    // The button is hidden when either prerequisite is missing (no key
-    // accepted OR zero favorites), because the glasses route would be a
-    // dead-end in that state.
-    //
-    // The 0 -> 1 favorites transition triggers a brief class toggle
-    // (`wmata-settings__button--attention`) so the button visually
-    // announces itself on the same render where it first appears.
-    // The class is cleared on the next render to avoid the highlight
-    // becoming permanent.
+    // Shown only when both prerequisites are met (key accepted AND ≥1
+    // favorite). The 0 -> 1 favorites transition adds a brief attention
+    // pulse so the confirmation announces itself on first appearance.
     if (state.keyAccepted && state.favorites.length > 0) {
       const justGotFirstFavorite =
         previousCount === 0 && state.favorites.length >= 1;
-      const doneBtn = el(
-        'button',
+      const liveBanner = el(
+        'div',
         {
-          type: 'button',
           class: justGotFirstFavorite
-            ? 'wmata-settings__button wmata-settings__button--primary wmata-settings__button--done wmata-settings__button--attention'
-            : 'wmata-settings__button wmata-settings__button--primary wmata-settings__button--done',
-          'data-testid': 'wmata-settings-done',
-          'aria-label': 'Done. Launch on glasses.',
+            ? 'wmata-settings__status wmata-settings__status--ok wmata-settings__live wmata-settings__live--attention'
+            : 'wmata-settings__status wmata-settings__status--ok wmata-settings__live',
+          'data-testid': 'wmata-settings-live',
+          role: 'status',
+          'aria-live': 'polite',
         },
-        ['Done — launch on glasses'],
+        ['✓ Live on your glasses — edits apply automatically'],
       );
-      doneBtn.addEventListener('click', () => {
-        window.location.reload();
-      });
       favoritesMount.appendChild(
-        el('div', { class: 'wmata-settings__done-row' }, [doneBtn]),
+        el('div', { class: 'wmata-settings__done-row' }, [liveBanner]),
       );
     }
 
@@ -942,10 +1082,577 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     }
   }
 
+  // -----------------------------------------------------------------------
+  // Schedule editor card (WP-H/H1)
+  // -----------------------------------------------------------------------
+  //
+  // Edits the user's `ScheduleRule[]` — a mix of auto-rotate + quiet-
+  // hours windows. Up to MAX_SCHEDULE_RULES rules. Each row in the
+  // list has a kind picker, 7 day toggles, two HH:MM inputs, and
+  // (for auto-rotate) a target picker populated from favorites.
+  //
+  // Persistence pattern: on EVERY field edit, validate the whole
+  // rule set, drop invalid rules from what we persist, and call
+  // `saveSchedule(rules)`. Invalid rules stay in the editor but are
+  // surfaced with an inline error. The runtime never sees a malformed
+  // rule because the storage parser also drops them on load.
+  function renderScheduleCard(): void {
+    scheduleMount.replaceChildren();
+    const gated = !state.keyAccepted || state.apiKey.length === 0;
+    scheduleMount.setAttribute('aria-disabled', gated ? 'true' : 'false');
+
+    scheduleMount.appendChild(
+      el(
+        'h2',
+        {
+          id: 'wmata-settings-schedule-title',
+          class: 'wmata-settings__card-title',
+        },
+        ['Auto-rotate + Quiet hours — optional'],
+      ),
+    );
+    if (gated) {
+      scheduleMount.appendChild(
+        el('p', { class: 'wmata-settings__card-help' }, [
+          'Validate your WMATA API key above to configure schedule rules.',
+        ]),
+      );
+      return;
+    }
+    scheduleMount.appendChild(
+      el('p', { class: 'wmata-settings__card-help' }, [
+        'Auto-rotate boots the glasses straight to a station instead of Home during the window. ' +
+          'Quiet hours hides ALERTS / ACCESS rows so nothing blinks at you.',
+      ]),
+    );
+
+    const persist = (): void => {
+      // Validate each rule before persisting. Invalid rules are
+      // omitted from what `saveSchedule` writes; the runtime never
+      // sees them. The editor still keeps them in `state.schedule`
+      // so the user sees their work.
+      const valid: ScheduleRule[] = [];
+      for (const rule of state.schedule) {
+        const v = validateScheduleRule(rule);
+        if (typeof v !== 'string') valid.push(v);
+      }
+      saveSchedule(valid);
+    };
+
+    const list = el('ul', { class: 'wmata-settings__list' });
+    state.schedule.forEach((rule, idx) => {
+      const row = renderScheduleRuleRow(rule, idx, () => {
+        // Field-edit callback: re-render this card so derived UI
+        // (validation messages, kind-dependent fields) stays in sync.
+        persist();
+        renderScheduleCard();
+      });
+      list.appendChild(row);
+    });
+    scheduleMount.appendChild(list);
+
+    if (state.schedule.length < MAX_SCHEDULE_RULES) {
+      const addBtn = el(
+        'button',
+        {
+          type: 'button',
+          class:
+            'wmata-settings__button wmata-settings__button--small wmata-settings__button--ghost',
+        },
+        ['+ Add rule'],
+      );
+      addBtn.addEventListener('click', () => {
+        state.schedule.push(defaultAutoRotateRule());
+        persist();
+        renderScheduleCard();
+      });
+      scheduleMount.appendChild(
+        el('div', { class: 'wmata-settings__button-row' }, [addBtn]),
+      );
+    }
+  }
+
+  /**
+   * Render a single rule row. The `onChange` callback fires on any
+   * field edit; the parent persists + re-renders to keep validation
+   * messages and kind-dependent fields fresh.
+   */
+  function renderScheduleRuleRow(
+    rule: ScheduleRule,
+    idx: number,
+    onChange: () => void,
+  ): HTMLLIElement {
+    const li = el('li', { class: 'wmata-settings__rule-row' });
+
+    // Kind picker -----------------------------------------------------
+    const kindSelect = el('select', {
+      class: 'wmata-settings__select',
+      'aria-label': 'Rule kind',
+    });
+    for (const k of ['auto-rotate', 'quiet-hours'] as const) {
+      const opt = el('option', { value: k }, [
+        k === 'auto-rotate' ? 'Auto-rotate' : 'Quiet hours',
+      ]);
+      if (rule.kind === k) opt.setAttribute('selected', 'selected');
+      kindSelect.appendChild(opt);
+    }
+    kindSelect.addEventListener('change', () => {
+      const nextKind = kindSelect.value as ScheduleRule['kind'];
+      state.schedule[idx] = changeRuleKind(rule, nextKind);
+      onChange();
+    });
+
+    // Day toggles -----------------------------------------------------
+    const dayRow = el('div', { class: 'wmata-settings__day-row' });
+    WEEKDAYS.forEach((wd, i) => {
+      const on = rule.days.includes(wd);
+      const btn = el(
+        'button',
+        {
+          type: 'button',
+          class:
+            'wmata-settings__day-btn' +
+            (on ? ' wmata-settings__day-btn--on' : ''),
+          'aria-pressed': on ? 'true' : 'false',
+          'aria-label': wd,
+        },
+        [DAY_LABELS[i] ?? '?'],
+      );
+      btn.addEventListener('click', () => {
+        const days = toggleDay(rule.days, wd);
+        state.schedule[idx] = { ...rule, days };
+        onChange();
+      });
+      dayRow.appendChild(btn);
+    });
+
+    // Time pickers ----------------------------------------------------
+    const startInput = el('input', {
+      type: 'time',
+      class: 'wmata-settings__input wmata-settings__input--time',
+      value: rule.startHHMM,
+      'aria-label': 'Start time',
+    });
+    startInput.addEventListener('change', () => {
+      state.schedule[idx] = { ...rule, startHHMM: startInput.value };
+      onChange();
+    });
+    const endInput = el('input', {
+      type: 'time',
+      class: 'wmata-settings__input wmata-settings__input--time',
+      value: rule.endHHMM,
+      'aria-label': 'End time',
+    });
+    endInput.addEventListener('change', () => {
+      state.schedule[idx] = { ...rule, endHHMM: endInput.value };
+      onChange();
+    });
+    const timesRow = el('div', { class: 'wmata-settings__times-row' }, [
+      startInput,
+      el('span', { class: 'wmata-settings__times-sep' }, ['→']),
+      endInput,
+    ]);
+
+    // Target picker (auto-rotate only) -------------------------------
+    const targetWrap = el('div', { class: 'wmata-settings__target-wrap' });
+    if (rule.kind === 'auto-rotate') {
+      const targetSelect = el('select', {
+        class: 'wmata-settings__select',
+        'aria-label': 'Target screen',
+      });
+      const homeOpt = el('option', { value: '__home__' }, ['Home']);
+      if (rule.target.kind === 'home') {
+        homeOpt.setAttribute('selected', 'selected');
+      }
+      targetSelect.appendChild(homeOpt);
+      for (const fav of state.favorites) {
+        const opt = el('option', { value: fav.code }, [
+          `${fav.name} (${fav.code})`,
+        ]);
+        if (
+          rule.target.kind === 'predictions' &&
+          rule.target.stationCode === fav.code
+        ) {
+          opt.setAttribute('selected', 'selected');
+        }
+        targetSelect.appendChild(opt);
+      }
+      targetSelect.addEventListener('change', () => {
+        const v = targetSelect.value;
+        const next: AutoRotateRule = {
+          ...rule,
+          target:
+            v === '__home__'
+              ? { kind: 'home' }
+              : { kind: 'predictions', stationCode: v },
+        };
+        state.schedule[idx] = next;
+        onChange();
+      });
+      targetWrap.appendChild(targetSelect);
+    }
+
+    // Remove ----------------------------------------------------------
+    const removeBtn = el(
+      'button',
+      {
+        type: 'button',
+        class:
+          'wmata-settings__button wmata-settings__button--icon wmata-settings__button--ghost',
+        'aria-label': 'Remove rule',
+        title: 'Remove rule',
+      },
+      ['✕'],
+    );
+    removeBtn.addEventListener('click', () => {
+      state.schedule.splice(idx, 1);
+      onChange();
+    });
+
+    li.appendChild(kindSelect);
+    li.appendChild(dayRow);
+    li.appendChild(timesRow);
+    li.appendChild(targetWrap);
+    li.appendChild(removeBtn);
+
+    // Validation message (inline, below the row) ---------------------
+    const valid = validateScheduleRule(rule);
+    if (typeof valid === 'string') {
+      li.appendChild(
+        el(
+          'div',
+          {
+            class: 'wmata-settings__status wmata-settings__status--bad',
+            role: 'alert',
+          },
+          [valid],
+        ),
+      );
+    }
+    return li;
+  }
+
+  // -----------------------------------------------------------------------
+  // Voice targets card (WP-H/H2)
+  // -----------------------------------------------------------------------
+  function renderVoiceTargetsCard(): void {
+    voiceTargetsMount.replaceChildren();
+    const gated = !state.keyAccepted || state.apiKey.length === 0;
+    voiceTargetsMount.setAttribute('aria-disabled', gated ? 'true' : 'false');
+
+    voiceTargetsMount.appendChild(
+      el(
+        'h2',
+        {
+          id: 'wmata-settings-voice-title',
+          class: 'wmata-settings__card-title',
+        },
+        ['Voice keyword shortcuts — optional'],
+      ),
+    );
+    if (gated) {
+      voiceTargetsMount.appendChild(
+        el('p', { class: 'wmata-settings__card-help' }, [
+          'Validate your WMATA API key above to configure voice shortcuts.',
+        ]),
+      );
+      return;
+    }
+    voiceTargetsMount.appendChild(
+      el('p', { class: 'wmata-settings__card-help' }, [
+        'Say "home" or "work" on the VOICE LOOKUP screen to jump straight to ' +
+          'predictions for the linked station. Empty = keyword falls through to the fuzzy station search.',
+      ]),
+    );
+
+    const dataListId = 'wmata-settings-voice-favs';
+    const dataList = el('datalist', { id: dataListId });
+    for (const fav of state.favorites) {
+      const opt = el('option', { value: fav.code }, [
+        `${fav.code} — ${fav.name}`,
+      ]);
+      dataList.appendChild(opt);
+    }
+    voiceTargetsMount.appendChild(dataList);
+
+    const persist = (): void => {
+      saveVoiceTargets(state.voiceTargets);
+    };
+
+    const makeField = (
+      label: string,
+      key: keyof VoiceTargets,
+    ): HTMLElement => {
+      const id = `wmata-settings-voice-${key}`;
+      const labelEl = el(
+        'label',
+        { class: 'wmata-settings__label', for: id },
+        [label],
+      );
+      const input = el('input', {
+        id,
+        class: 'wmata-settings__input',
+        type: 'text',
+        list: dataListId,
+        placeholder: 'Station code (e.g. C01) — or empty to clear',
+        value: state.voiceTargets[key],
+        autocomplete: 'off',
+        autocapitalize: 'characters',
+        spellcheck: 'false',
+      });
+      input.value = state.voiceTargets[key];
+      input.addEventListener('change', () => {
+        state.voiceTargets = {
+          ...state.voiceTargets,
+          [key]: input.value.trim().toUpperCase(),
+        };
+        persist();
+      });
+      return el('div', { class: 'wmata-settings__field' }, [labelEl, input]);
+    };
+
+    voiceTargetsMount.appendChild(makeField('Home station', 'home'));
+    voiceTargetsMount.appendChild(makeField('Work station', 'work'));
+  }
+
+  // -----------------------------------------------------------------------
+  // Journey plan card (WP-H/H3)
+  // -----------------------------------------------------------------------
+  function renderJourneyCard(): void {
+    journeyMount.replaceChildren();
+    const gated = !state.keyAccepted || state.apiKey.length === 0;
+    journeyMount.setAttribute('aria-disabled', gated ? 'true' : 'false');
+
+    journeyMount.appendChild(
+      el(
+        'h2',
+        {
+          id: 'wmata-settings-journey-title',
+          class: 'wmata-settings__card-title',
+        },
+        ['Journey / Commute — optional'],
+      ),
+    );
+    if (gated) {
+      journeyMount.appendChild(
+        el('p', { class: 'wmata-settings__card-help' }, [
+          'Validate your WMATA API key above to save a commute.',
+        ]),
+      );
+      return;
+    }
+    journeyMount.appendChild(
+      el('p', { class: 'wmata-settings__card-help' }, [
+        'Origin → Destination shows on the Journey screen with a stop count ' +
+          'and estimated travel time. Same-line routes only for v1.2; transfers come later.',
+      ]),
+    );
+
+    const dataListId = 'wmata-settings-journey-favs';
+    const dataList = el('datalist', { id: dataListId });
+    for (const fav of state.favorites) {
+      dataList.appendChild(
+        el('option', { value: fav.code }, [`${fav.code} — ${fav.name}`]),
+      );
+    }
+    journeyMount.appendChild(dataList);
+
+    const previewRow = el(
+      'div',
+      {
+        class: 'wmata-settings__status wmata-settings__status--info',
+        role: 'status',
+        'aria-live': 'polite',
+      },
+      [state.journeyPreviewText || '—'],
+    );
+
+    const refreshPreview = (): void => {
+      const { origin, destination } = state.journeyPlan;
+      if (origin.length === 0 || destination.length === 0) {
+        state.journeyPreviewText = '';
+        previewRow.textContent = '—';
+        return;
+      }
+      // Debounced — give the user a beat to finish typing before
+      // we burn a request on jPath.
+      if (state.journeyPreviewTimer !== null) {
+        clearTimeout(state.journeyPreviewTimer);
+      }
+      state.journeyPreviewTimer = setTimeout(() => {
+        state.journeyPreviewTimer = null;
+        void runJourneyPreview();
+      }, 300);
+    };
+
+    const runJourneyPreview = async (): Promise<void> => {
+      const { origin, destination, transfer } = state.journeyPlan;
+      const transferStr = (transfer ?? '').trim();
+      const client = new WmataClient(state.apiKey);
+      try {
+        if (transferStr.length > 0) {
+          // Two-leg composition: preview each leg and concatenate.
+          const [leg1, leg2] = await Promise.all([
+            client.get<PathResponse>(buildPathUrl(origin, transferStr)),
+            client.get<PathResponse>(buildPathUrl(transferStr, destination)),
+          ]);
+          const p1 = leg1.Path ?? [];
+          const p2 = leg2.Path ?? [];
+          if (p1.length === 0 || p2.length === 0) {
+            state.journeyPreviewText =
+              'One leg is cross-line. Pick a different transfer.';
+          } else {
+            const line1 = p1[0]?.LineCode ?? '?';
+            const line2 = p2[0]?.LineCode ?? '?';
+            const stops =
+              Math.max(0, p1.length - 1) + Math.max(0, p2.length - 1);
+            const mins = estimateTravelMinutes(p1) +
+              estimateTravelMinutes(p2) + 2; // +2 transfer dwell
+            state.journeyPreviewText =
+              `${line1}→${line2} · ${stops} stops · ~${mins} min`;
+          }
+        } else {
+          const data = await client.get<PathResponse>(
+            buildPathUrl(origin, destination),
+          );
+          const path = data.Path ?? [];
+          if (path.length === 0) {
+            state.journeyPreviewText =
+              'Cross-line route — add a transfer station above.';
+          } else {
+            const line = path[0]?.LineCode ?? '?';
+            const stops = Math.max(0, path.length - 1);
+            const mins = estimateTravelMinutes(path);
+            state.journeyPreviewText = `${line} line · ${stops} stops · ~${mins} min`;
+          }
+        }
+      } catch (err) {
+        if (err instanceof WmataError) {
+          state.journeyPreviewText = "Couldn't preview path — check codes.";
+        } else {
+          state.journeyPreviewText = 'Preview failed.';
+        }
+      }
+      previewRow.textContent = state.journeyPreviewText;
+    };
+
+    const persist = (): void => {
+      saveJourneyPlan(state.journeyPlan);
+      refreshPreview();
+    };
+
+    const makeField = (
+      label: string,
+      key: keyof JourneyPlan,
+    ): HTMLElement => {
+      const id = `wmata-settings-journey-${key}`;
+      const labelEl = el(
+        'label',
+        { class: 'wmata-settings__label', for: id },
+        [label],
+      );
+      const initialValue = state.journeyPlan[key] ?? '';
+      const input = el('input', {
+        id,
+        class: 'wmata-settings__input',
+        type: 'text',
+        list: dataListId,
+        placeholder: 'Station code',
+        value: initialValue,
+        autocomplete: 'off',
+        autocapitalize: 'characters',
+        spellcheck: 'false',
+      });
+      input.value = initialValue;
+      input.addEventListener('change', () => {
+        state.journeyPlan = {
+          ...state.journeyPlan,
+          [key]: input.value.trim().toUpperCase(),
+        };
+        persist();
+      });
+      return el('div', { class: 'wmata-settings__field' }, [labelEl, input]);
+    };
+
+    journeyMount.appendChild(makeField('Origin station', 'origin'));
+    journeyMount.appendChild(
+      makeField('Transfer station (optional)', 'transfer'),
+    );
+    journeyMount.appendChild(makeField('Destination station', 'destination'));
+    journeyMount.appendChild(previewRow);
+
+    // Kick off a preview on initial render if both fields are set.
+    refreshPreview();
+  }
+
+  // -----------------------------------------------------------------------
+  // Geofence toggle (WP-H/H4)
+  // -----------------------------------------------------------------------
+  function renderGeofenceCard(): void {
+    geofenceMount.replaceChildren();
+    const gated = !state.keyAccepted || state.apiKey.length === 0;
+    geofenceMount.setAttribute('aria-disabled', gated ? 'true' : 'false');
+
+    geofenceMount.appendChild(
+      el(
+        'h2',
+        {
+          id: 'wmata-settings-geofence-title',
+          class: 'wmata-settings__card-title',
+        },
+        ['Geofence auto-mount — optional'],
+      ),
+    );
+    if (gated) {
+      geofenceMount.appendChild(
+        el('p', { class: 'wmata-settings__card-help' }, [
+          'Validate your WMATA API key above to configure geofencing.',
+        ]),
+      );
+      return;
+    }
+    geofenceMount.appendChild(
+      el('p', { class: 'wmata-settings__card-help' }, [
+        'When enabled, the glasses HUD boots straight to predictions for the nearest ' +
+          'favorite within 250 m of your phone. Requires location permission. ' +
+          'Favorites added before v1.2 need to be re-added once to capture coordinates.',
+      ]),
+    );
+
+    const id = 'wmata-settings-geofence-toggle';
+    const labelEl = el(
+      'label',
+      { class: 'wmata-settings__label', for: id },
+      ['Auto-mount predictions when near a favorite'],
+    );
+    const input = el('input', {
+      id,
+      class: 'wmata-settings__toggle',
+      type: 'checkbox',
+    }) as HTMLInputElement;
+    input.checked = state.geofenceEnabled;
+    input.addEventListener('change', () => {
+      state.geofenceEnabled = input.checked;
+      saveGeofenceEnabled(state.geofenceEnabled);
+    });
+
+    geofenceMount.appendChild(
+      el(
+        'div',
+        { class: 'wmata-settings__field wmata-settings__field--inline' },
+        [input, labelEl],
+      ),
+    );
+  }
+
   // Initial render --------------------------------------------------------
   renderApiKeyCard();
   renderFavoritesCard();
   renderSttCard();
+  renderScheduleCard();
+  renderVoiceTargetsCard();
+  renderJourneyCard();
+  renderGeofenceCard();
 
   // -----------------------------------------------------------------------
   // Unmount
@@ -958,6 +1665,10 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     if (state.favoritesNoticeTimer !== null) {
       clearTimeout(state.favoritesNoticeTimer);
       state.favoritesNoticeTimer = null;
+    }
+    if (state.journeyPreviewTimer !== null) {
+      clearTimeout(state.journeyPreviewTimer);
+      state.journeyPreviewTimer = null;
     }
     // replaceChildren() detaches every node, which also detaches the
     // listeners they own (they live on the elements, not the document),

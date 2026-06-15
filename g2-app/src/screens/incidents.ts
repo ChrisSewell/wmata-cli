@@ -45,11 +45,12 @@
 import {
   ELLIPSIS,
   LINE_WIDTH,
+  SAFE_TEXT_WIDTH,
   USABLE_ROWS,
   scrollWindowWithMarkers,
   truncate,
 } from "../ui/render";
-import { lineGlyph } from "../ui/format";
+import { lineGlyph, lineName } from "../ui/format";
 import { parseLinesAffected } from "../wmata/incidents-cache";
 import type { LineCode, RailIncident } from "../wmata";
 import type {
@@ -59,8 +60,15 @@ import type {
   ReduceResult,
   Screen,
   ScreenEvent,
+  ScreenSections,
   ViewContext,
 } from "./router";
+
+// The canonical HUD clock formatter now lives in `../ui/format` (the host
+// renders it in its own dedicated top-right container). Re-export it here
+// so existing `import { formatClock } from "./incidents"` call sites
+// (notably the test suite) keep resolving.
+export { formatClock } from "../ui/format";
 
 // ---------------------------------------------------------------------------
 // Column / row budgets
@@ -68,8 +76,31 @@ import type {
 
 /** Two-column gutter that precedes every body row (no selection prefix). */
 const INDENT = "  ";
-/** Usable text width inside a body row, after the 2-col gutter. */
-const BODY_TEXT_WIDTH = LINE_WIDTH - INDENT.length; // 22
+
+/**
+ * Real-text width budget for the affected-lines header row. The header
+ * carries the 2-col section gutter only (no inner inset), so it must fit
+ * `SAFE_TEXT_WIDTH - INDENT.length` columns of real text before the
+ * LVGL container hard-wraps at the 576px border.
+ */
+const HEADER_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length; // 56
+
+/**
+ * Inner inset (extra indent) applied to description rows so they read as
+ * detail nested under the affected-lines header.
+ */
+const DESC_INSET = "  ";
+
+/**
+ * Real-text width budget for a wrapped description line. A description
+ * line carries BOTH the 2-col section gutter (added by `flattenBlocks`)
+ * AND the 2-col inner inset (added in `formatIncidentBlock`), so its
+ * total indent is 4 cols. Wrapping at `SAFE_TEXT_WIDTH - 4` keeps the
+ * rendered line (indent + text) at or below `SAFE_TEXT_WIDTH`, which is
+ * the point where the container would otherwise re-wrap and dump orphan
+ * words at column 0.
+ */
+const DESC_TEXT_WIDTH = SAFE_TEXT_WIDTH - INDENT.length - DESC_INSET.length; // 54
 
 /** Maximum number of wrapped description lines per incident. */
 export const MAX_DESC_LINES = 6;
@@ -151,7 +182,7 @@ export function wrap(text: string, width: number): string[] {
   if (width <= 0) return [];
   // Degenerate single-column wraps are not supported: the hard-break
   // branch would do `slice(0, 0)` -> "" and `slice(0)` -> the same
-  // string, looping forever. Callers always pass BODY_TEXT_WIDTH = 22,
+  // string, looping forever. Callers always pass DESC_TEXT_WIDTH = 54,
   // so a safe-return-empty here is the right semantics — throwing
   // would be more disruptive (it'd surface as a render crash).
   if (width <= 1) return [];
@@ -189,21 +220,49 @@ export function wrap(text: string, width: number): string[] {
 }
 
 /**
+ * Strip trailing sentence separators (`, ; .`) plus any whitespace from
+ * a fragment so a wrapped/truncated tail doesn't read as mid-sentence
+ * (e.g. "...disabled train," → "...disabled train"). Only the FINAL
+ * emitted line of a fragment should be passed through this — interior
+ * lines keep their punctuation.
+ */
+export function trimTrailingSeparators(text: string): string {
+  return text.replace(/[\s,;.]+$/, "");
+}
+
+/**
  * Cap a list of wrapped description lines at `MAX_DESC_LINES`. If the
  * input is longer, the final visible line is truncated with `…` so the
  * user can tell that text was cut.
+ *
+ * When the text fits within the cap, the final line gets its dangling
+ * sentence separator trimmed so the description doesn't look cut off
+ * mid-clause. When the text is truncated we append `…` instead (the
+ * ellipsis already signals "more was cut", so no separator-trim there).
  */
 export function capDescription(lines: readonly string[]): string[] {
-  if (lines.length <= MAX_DESC_LINES) return lines.slice();
+  if (lines.length === 0) return [];
+  if (lines.length <= MAX_DESC_LINES) {
+    const out = lines.slice();
+    const lastIdx = out.length - 1;
+    const last = out[lastIdx]!;
+    // Don't disturb a line the wrapper hard-broke (it ends with `…`).
+    if (!last.endsWith(ELLIPSIS)) {
+      out[lastIdx] = trimTrailingSeparators(last);
+    }
+    return out;
+  }
   const out = lines.slice(0, MAX_DESC_LINES);
   const last = out[MAX_DESC_LINES - 1] ?? "";
   // Only append the ellipsis if the line doesn't already end with it
-  // (e.g. when wrap() already hard-broke a long word).
+  // (e.g. when wrap() already hard-broke a long word). Trim any dangling
+  // separator first so we emit "word…" rather than "word,…".
   if (!last.endsWith(ELLIPSIS)) {
-    if (last.length < BODY_TEXT_WIDTH) {
-      out[MAX_DESC_LINES - 1] = last + ELLIPSIS;
+    const trimmed = trimTrailingSeparators(last);
+    if (trimmed.length < DESC_TEXT_WIDTH) {
+      out[MAX_DESC_LINES - 1] = trimmed + ELLIPSIS;
     } else {
-      out[MAX_DESC_LINES - 1] = last.slice(0, BODY_TEXT_WIDTH - 1) + ELLIPSIS;
+      out[MAX_DESC_LINES - 1] = trimmed.slice(0, DESC_TEXT_WIDTH - 1) + ELLIPSIS;
     }
   }
   return out;
@@ -214,29 +273,46 @@ export function capDescription(lines: readonly string[]): string[] {
  *
  *   ["RD","BL","OR"]              -> "! RD BL OR"
  *   ["RD","BL","YL","OR","GR"]    -> "! RD BL YL OR +1"
- *   []                            -> "! --"
+ *   []                            -> "--"
  *
- * The `! ` warning prefix sits inside the 22-column body-text budget
- * (so prefix + indent gutter still = 24 cols).
+ * No leading "! " glyph — the bordered ALERTS section is itself the
+ * "this is an alert" visual signal, and the screen title already
+ * says ALERTS. The affected-lines row reads as a clean header.
  */
 export function renderGlyphRow(lines: readonly LineCode[]): string {
-  const safe = lines.map((l) => lineGlyph(l)).filter((g) => g !== "--");
-  if (safe.length === 0) return "! --";
+  const safe = lines
+    .map((l) => lineGlyph(l))
+    .filter((g) => g !== "--")
+    .map((g) => lineName(g));
+  if (safe.length === 0) return "--";
   if (safe.length <= MAX_VERBATIM_LINES) {
-    return truncate("! " + safe.join(" "), BODY_TEXT_WIDTH);
+    const verbatim = safe.join(" ");
+    if (verbatim.length <= HEADER_TEXT_WIDTH) return verbatim;
   }
-  const head = safe.slice(0, MAX_VERBATIM_LINES).join(" ");
-  const extra = safe.length - MAX_VERBATIM_LINES;
-  return truncate(`! ${head} +${extra}`, BODY_TEXT_WIDTH);
+  // Either we hit the verbatim cap OR the joined names overflow the
+  // body cell. Collapse with `+N`, taking as many full names as fit.
+  for (let take = MAX_VERBATIM_LINES; take >= 1; take--) {
+    const head = safe.slice(0, take).join(" ");
+    const extra = safe.length - take;
+    const candidate = extra > 0 ? `${head} +${extra}` : head;
+    if (candidate.length <= HEADER_TEXT_WIDTH) return candidate;
+  }
+  return truncate(safe[0]!, HEADER_TEXT_WIDTH);
 }
 
 /**
  * Pre-format one incident into the block of body rows it will occupy:
  *
- *   ["! RD BL OR", "Single-tracking", "between Foggy Btm", ...]
+ *   ["RD BL OR", "  Single-tracking between Foggy Bottom and", "  Rosslyn …"]
  *
- * No leading indent — the renderer adds the 2-col gutter at flatten time
- * so the same block can be sliced for scroll math without re-indenting.
+ * The glyph row gets no leading indent (it's the affected-lines
+ * header). Description rows get a 2-char leading indent so they
+ * read as detail nested under the header. `flattenBlocks` adds a
+ * further 2-char gutter at the section edge, so the visual result
+ * is:
+ *
+ *     RD BL OR                       <- header indent 2
+ *       Single-tracking between …    <- description indent 4
  *
  * Empty-description incidents collapse to a single row (the glyphs).
  */
@@ -249,8 +325,13 @@ export function formatIncidentBlock(incident: RailIncident): string[] {
   const glyphRow = renderGlyphRow(lines);
   const desc = (incident.Description ?? "").trim();
   if (desc.length === 0) return [glyphRow];
-  const wrapped = capDescription(wrap(desc, BODY_TEXT_WIDTH));
-  return [glyphRow, ...wrapped];
+  // Wrap the description at DESC_TEXT_WIDTH (= SAFE_TEXT_WIDTH - section
+  // gutter - inner inset) so that, once `flattenBlocks` prepends the
+  // 2-col gutter and we prepend the 2-col inset here, no rendered line
+  // exceeds SAFE_TEXT_WIDTH real chars — the point past which the LVGL
+  // container re-wraps and dumps orphan words at column 0.
+  const wrapped = capDescription(wrap(desc, DESC_TEXT_WIDTH));
+  return [glyphRow, ...wrapped.map((l) => DESC_INSET + l)];
 }
 
 /**
@@ -268,22 +349,6 @@ export function flattenBlocks(blocks: readonly string[][]): string[] {
     if (i < blocks.length - 1) out.push("");
   }
   return out;
-}
-
-/**
- * Format an epoch-ms timestamp as a 12-hour clock string
- * (` 9:05a` / `12:32p`). Identical helper to the Predictions screen's
- * `formatClock`.
- */
-export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
-  const d = new Date(epochMs);
-  const h24 = d.getHours();
-  const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
-  const hh = String(h12).padStart(2, " ");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ap = h24 < 12 ? "a" : "p";
-  return `${hh}:${mm}${ap}`;
 }
 
 /**
@@ -324,31 +389,23 @@ export function stalenessMarker(
 }
 
 /**
- * Render the header row.
+ * Render the header row: the section TITLE ONLY, left-aligned.
  *
- *   "ALERTS (n)             2:32p"   (n > 0)
- *   "ALERTS                 2:32p"   (n === 0, empty state)
+ *   "ALERTS (n)"   (n > 0)
+ *   "ALERTS"       (n === 0, empty state)
  *
- * Adds a 1- or 2-char marker after the clock per `stalenessMarker`.
- * The text on the left collapses to a single "ALERTS" when there are
- * no incidents (we don't want to render "ALERTS (0)" — it looks like
- * a button label).
+ * The host now renders the wall clock + staleness marker in its own
+ * dedicated top-right container (identically on every screen), so the
+ * header no longer embeds the clock or marker. The marker is surfaced
+ * via `view()`'s `clockMarker` field. The title is truncated so it can't
+ * collide with the clock container (which starts at column ≈ 50). The
+ * left text collapses to a bare "ALERTS" when there are no incidents
+ * (we don't render "ALERTS (0)" — it looks like a button label).
  */
-export function renderHeader(
-  snapshot: IncidentsSnapshot,
-  nowMs: number,
-): string {
+export function renderHeader(snapshot: IncidentsSnapshot): string {
   const count = snapshot.incidents.length;
   const left = count > 0 ? `ALERTS (${count})` : "ALERTS";
-  const marker = stalenessMarker(snapshot, nowMs);
-  const clockStr = formatClock(nowMs);
-  const clockCell = clockStr + marker;
-  // total = left + spaces + clockCell == LINE_WIDTH
-  const spaces = Math.max(1, LINE_WIDTH - left.length - clockCell.length);
-  const composed = left + " ".repeat(spaces) + clockCell;
-  // Defensive truncate — a future change that grows the left cell
-  // beyond budget will be cut at the right edge rather than overflowing.
-  return truncate(composed, LINE_WIDTH);
+  return truncate(left, 50);
 }
 
 // ---------------------------------------------------------------------------
@@ -424,9 +481,13 @@ export function makeIncidentsScreen(
   return {
     name: "incidents",
     init: () => initialSnapshot,
-    view(snapshot, nav, ctx: ViewContext): string[] {
-      const lines: string[] = [];
-      lines.push(renderHeader(snapshot, ctx.nowMs));
+    view(snapshot, nav, ctx: ViewContext): ScreenSections {
+      const header: string[] = [renderHeader(snapshot)];
+      const body: string[] = [];
+      // Staleness marker rides in the host's top-right clock container
+      // (via `clockMarker`), no longer the header string. `ctx.nowMs`
+      // drives the time-based stale check on every 1Hz clock re-render.
+      const clockMarker = stalenessMarker(snapshot, ctx.nowMs);
 
       // Empty-data branches:
       //   - first-load fetch error (no successful fetch yet) — surface
@@ -438,19 +499,20 @@ export function makeIncidentsScreen(
         snapshot.fetchedAt === 0 &&
         snapshot.fetchError !== null
       ) {
-        lines.push(truncate("Couldn't reach WMATA.", LINE_WIDTH));
-        lines.push(truncate("Will retry shortly.", LINE_WIDTH));
-        lines.push("");
-        lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-        return lines;
+        body.push(truncate("Couldn't reach WMATA.", LINE_WIDTH));
+        body.push("");
+        body.push(truncate("Tap to retry · double-tap to return", LINE_WIDTH));
+        return { header, body, clockMarker };
       }
 
       if (snapshot.incidents.length === 0) {
-        lines.push(truncate("No active alerts on", LINE_WIDTH));
-        lines.push(truncate("your lines.", LINE_WIDTH));
-        lines.push("");
-        lines.push(truncate("(double-tap to return)", LINE_WIDTH));
-        return lines;
+        // All-clear copy: a positive statement reads better than
+        // "No active alerts on your lines.". The wider 60-col grid
+        // lets the whole sentence sit on one line.
+        body.push(truncate("All your lines running normally.", LINE_WIDTH));
+        body.push("");
+        body.push(truncate("(double-tap to return)", LINE_WIDTH));
+        return { header, body, clockMarker };
       }
 
       // Body: flatten the pre-formatted blocks and scroll within the
@@ -458,11 +520,11 @@ export function makeIncidentsScreen(
       // budget; `scrollWindowWithMarkers` resolves the circularity
       // (markers shrink the window which can then need fewer markers)
       // with a tiny fixed-point so we don't reinvent it per-screen.
-      const body = flattenBlocks(snapshot.preformatted);
-      const offset = clamp(nav.highlightedIndex, Math.max(0, body.length - 1));
-      const decorated = scrollWindowWithMarkers(body, offset, USABLE_ROWS);
-      for (const r of decorated) lines.push(truncate(r, LINE_WIDTH));
-      return lines;
+      const flat = flattenBlocks(snapshot.preformatted);
+      const offset = clamp(nav.highlightedIndex, Math.max(0, flat.length - 1));
+      const decorated = scrollWindowWithMarkers(flat, offset, USABLE_ROWS);
+      for (const r of decorated) body.push(truncate(r, LINE_WIDTH));
+      return { header, body, clockMarker };
     },
     reduce(snapshot, nav, event: ScreenEvent): ReduceResult<IncidentsSnapshot> {
       const body = flattenBlocks(snapshot.preformatted);
@@ -473,9 +535,21 @@ export function makeIncidentsScreen(
           return { nav: { highlightedIndex: clamp(offset - 1, maxOffset) } };
         case "SCROLL_DOWN":
           return { nav: { highlightedIndex: clamp(offset + 1, maxOffset) } };
-        case "TAP":
-          // Read-only screen — no per-row tappable actions.
-          return { nav: { highlightedIndex: offset } };
+        case "TAP": {
+          // Read-only screen — no per-row tappable actions. But in the
+          // first-load error state (couldn't reach WMATA, nothing to
+          // show) TAP is the "tap to retry" affordance: ask the host to
+          // refetch immediately (single-flight-guarded, so it's safe even
+          // mid-fetch). In every other state TAP stays a pure no-op.
+          const firstLoadError =
+            snapshot.incidents.length === 0 &&
+            snapshot.fetchedAt === 0 &&
+            snapshot.fetchError !== null;
+          return {
+            nav: { highlightedIndex: offset },
+            requestTick: firstLoadError ? true : undefined,
+          };
+        }
         case "DOUBLE_TAP":
           return {
             nav: { highlightedIndex: offset },

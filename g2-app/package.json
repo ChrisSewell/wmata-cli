@@ -1,19 +1,21 @@
 {
   "name": "evenhub-minimal",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "pack": "evenhub pack",
+    "qr": "evenhub qr --http -p 5173 --path /",
+    "pack": "evenhub pack app.json dist -o wmata-transit.ehpk",
     "simulate": "evenhub-simulator http://localhost:5173",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "^0.0.10"
+    "@evenrealities/even_hub_sdk": "^0.0.10",
+    "@evenrealities/pretext": "^0.1.4"
   },
   "devDependencies": {
     "@evenrealities/evenhub-cli": "^0.1.12",
