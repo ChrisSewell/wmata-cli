@@ -79,6 +79,9 @@ export interface Layout {
   body: Body;
   /** Gesture hints shown on entry, dismissed on first input. */
   hints?: Hint[];
+  /** The image accent (hero screens only): a short token drawn big (e.g. the
+   *  soonest ETA). The host renders it to the one ≤288×144 image container. */
+  hero?: { numeral: string };
 }
 
 /** Per-render context the host supplies. `nowMs` is stamped on EVERY render
@@ -113,6 +116,9 @@ export interface Screen<Snapshot> {
    * with no value column.
    */
   readonly valueReserve?: readonly string[];
+  /** When true, the host uses the hero layout (image-accent numeral on the
+   *  left, body list on the right) and renders `Layout.hero`. */
+  readonly hero?: boolean;
   init(): Snapshot;
   view(snapshot: Snapshot, nav: NavState, ctx: ViewContext): Layout;
   reduce(snapshot: Snapshot, nav: NavState, event: ScreenEvent): ReduceResult<Snapshot>;

@@ -47,6 +47,13 @@ export function trainRow(t: Train): Row {
   return { left: code === "--" ? dest : `${code} ${dest}`, value: formatEtaValue(t.Min) };
 }
 
+/** The big hero token for the soonest train: digits for a numeric ETA, the word
+ *  for ARR/BRD, "" otherwise (blank accent). */
+export function heroNumeral(min: string): string {
+  if (min === "ARR" || min === "BRD") return min;
+  return /^\d+$/.test(min) ? min : "";
+}
+
 /** Build the initial snapshot (pre-first-fetch loading state). */
 export function makeInitialPredictionsSnapshot(
   stationCode: string,
@@ -62,6 +69,7 @@ export function makePredictionsScreen(
   return {
     name: "predictions",
     mode: "text",
+    hero: true,
     valueReserve: ["12 min"],
     init: () => initial,
     view(s: PredictionsSnapshot, _nav: NavState, ctx: ViewContext): Layout {
@@ -71,22 +79,30 @@ export function makePredictionsScreen(
         STALE_MS,
       );
       const header = { title: s.stationName || s.stationCode, marker };
+      const sorted = sortTrains(s.trains);
+      const numeral = sorted[0] ? heroNumeral(sorted[0].Min) : "";
       const firstLoadError = s.trains.length === 0 && s.fetchedAt === 0 && s.fetchError !== null;
       if (firstLoadError) {
         return {
           header,
-          body: { kind: "message", lines: ["Couldn't reach WMATA.", "", "Tap to retry."] },
+          body: { kind: "message", lines: ["Couldn't reach", "WMATA.", "", "Tap to retry."] },
           hints: [HINTS.retry, HINTS.back],
+          hero: { numeral: "" },
         };
       }
       if (s.trains.length === 0 && s.fetchedAt === 0) {
-        return { header, body: { kind: "message", lines: ["Loading…"] }, hints: [HINTS.back] };
+        return { header, body: { kind: "message", lines: ["Loading…"] }, hints: [HINTS.back], hero: { numeral: "" } };
       }
       if (s.trains.length === 0) {
-        return { header, body: { kind: "message", lines: ["No upcoming trains."] }, hints: [HINTS.back] };
+        return { header, body: { kind: "message", lines: ["No upcoming", "trains."] }, hints: [HINTS.back], hero: { numeral: "" } };
       }
-      const rows = sortTrains(s.trains).slice(0, MAX_ROWS).map(trainRow);
-      return { header, body: { kind: "rows", rows, selectedIndex: 0, selectable: false }, hints: [HINTS.back] };
+      const rows = sorted.slice(0, MAX_ROWS).map(trainRow);
+      return {
+        header,
+        body: { kind: "rows", rows, selectedIndex: 0, selectable: false },
+        hints: [HINTS.back],
+        hero: { numeral },
+      };
     },
     reduce(s: PredictionsSnapshot, nav: NavState, event): ReduceResult<PredictionsSnapshot> {
       const firstLoadError = s.trains.length === 0 && s.fetchedAt === 0 && s.fetchError !== null;

@@ -4,6 +4,7 @@ import {
   makeInitialPredictionsSnapshot,
   sortTrains,
   trainRow,
+  heroNumeral,
   type PredictionsSnapshot,
 } from "./predictions";
 import type { Train } from "../data/wmata";
@@ -58,7 +59,7 @@ describe("view states", () => {
   });
   it("empty after a successful fetch", () => {
     const v = screen.view(snap({ fetchedAt: ctx.nowMs }), { selectedIndex: 0 }, ctx);
-    expect((v.body as { lines: string[] }).lines[0]).toBe("No upcoming trains.");
+    expect((v.body as { lines: string[] }).lines.join(" ")).toBe("No upcoming trains.");
   });
   it("renders a read-only sorted board, capped at 6", () => {
     const many = Array.from({ length: 9 }, (_, i) => t("RD", `Dest${i}`, String(i + 1)));
@@ -67,6 +68,26 @@ describe("view states", () => {
     const body = v.body as { rows: unknown[]; selectable?: boolean };
     expect(body.rows.length).toBe(6);
     expect(body.selectable).toBe(false);
+  });
+});
+
+describe("heroNumeral", () => {
+  it("is the word for ARR/BRD, digits for numeric, empty otherwise", () => {
+    expect(heroNumeral("ARR")).toBe("ARR");
+    expect(heroNumeral("BRD")).toBe("BRD");
+    expect(heroNumeral("7")).toBe("7");
+    expect(heroNumeral("---")).toBe("");
+  });
+});
+
+describe("hero accent", () => {
+  it("exposes the soonest train's ETA as the hero numeral", () => {
+    const loaded = snap({ fetchedAt: ctx.nowMs, trains: [t("RD", "x", "9"), t("RD", "y", "ARR")] });
+    // ARR sorts first → hero shows ARR
+    expect(screen.view(loaded, { selectedIndex: 0 }, ctx).hero?.numeral).toBe("ARR");
+  });
+  it("blanks the numeral while loading", () => {
+    expect(screen.view(snap(), { selectedIndex: 0 }, ctx).hero?.numeral).toBe("");
   });
 });
 

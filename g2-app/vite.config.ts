@@ -6,15 +6,15 @@ export default defineConfig({
   server: { host: true, port: 5173 },
   build: {
     target: 'esnext',
-    // Two entries: the production `index.html` (companion + glasses host)
-    // and `glasses-preview.html` (the real-container verification harness
-    // that boots the host against fixture data for simulator review).
-    // The preview is dead code in a packed `.ehpk` but available during
-    // `npm run dev` and lands as a sibling artifact in `dist/`.
+    // The production build (→ dist → packed .ehpk) ships ONLY index.html.
+    // `glasses-preview.html` is a DEV-ONLY harness: `vite dev` still serves it
+    // on demand, but it is deliberately NOT a build input because it reads
+    // `import.meta.env.VITE_WMATA_KEY` (live-test key) — which Vite would
+    // statically inline into the bundle, leaking the key into the shipped
+    // artifact. Keeping it out of the build keeps the .ehpk key-free.
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
-        preview: resolve(__dirname, 'glasses-preview.html'),
       },
     },
   },

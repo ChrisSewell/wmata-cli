@@ -1,23 +1,27 @@
-// Preview/verification entry (glasses-preview.html). Boots the REAL host +
-// REAL screens against deterministic fixture data (no network), so the
-// simulator renders actual SDK containers for the review loop. Screens not yet
-// built render as a labelled placeholder. Drive via the simulator automation
-// API: swipe = move, click = open, double-click = back/exit.
-//
-// `?screen=unconfigured` mounts that screen first (default: home).
+/// <reference types="vite/client" />
+
+// Preview/verification entry (glasses-preview.html). Two modes:
+//   - LIVE: if VITE_WMATA_KEY is set (.env.local), boots a real Session and the
+//     production `buildScreen` wiring against the live WMATA API — real ETAs /
+//     alerts in the simulator.
+//   - FIXTURE: otherwise, deterministic fixture data (no network / no key).
+// Either way it boots the REAL host + screens, so the simulator renders actual
+// SDK containers. `?screen=unconfigured` mounts that state first.
 
 import { waitForEvenAppBridge } from "@evenrealities/even_hub_sdk";
 import { mountGlassesScreen } from "../host/glasses-host";
-import { makeHomeScreen, type HomeSnapshot } from "../screens/home";
+import { Session, buildScreen } from "../host/wiring";
 import { makeUnconfiguredScreen } from "../screens/unconfigured";
+import { makeHomeScreen, type HomeSnapshot } from "../screens/home";
 import { makePredictionsScreen, makeInitialPredictionsSnapshot } from "../screens/predictions";
 import { makeAlertsScreen, makeInitialAlertsSnapshot } from "../screens/alerts";
 import { makeAlertDetailScreen } from "../screens/alert-detail";
 import { buildAlertItems } from "../data/domain/alerts";
-import type { NavIntent, Router } from "../screens/router";
+import type { NavIntent, Router, Screen } from "../screens/router";
 import type { FavoriteStation } from "../data/domain/lines";
 import type { Train, RailIncident, ElevatorIncident } from "../data/wmata";
 
+// Real WMATA station codes, so LIVE mode returns real data.
 const FAVORITES: FavoriteStation[] = [
   { code: "A01", name: "Metro Center", lines: ["RD", "BL", "OR", "SV"] },
   { code: "C04", name: "Foggy Bottom-GWU", lines: ["BL", "OR", "SV"] },
@@ -25,10 +29,13 @@ const FAVORITES: FavoriteStation[] = [
   { code: "D02", name: "Smithsonian", lines: ["BL", "OR", "SV"] },
   { code: "K08", name: "Wiehle-Reston East", lines: ["SV"] },
 ];
+
+const KEY = (import.meta.env.VITE_WMATA_KEY as string | undefined) ?? "";
+const LIVE = KEY.length > 0;
+
+// --- Fixtures (no-key fallback) -------------------------------------------
+
 const ETAS: Record<string, string | null> = { A01: "4", C04: "ARR", B35: "12", D02: "BRD", K08: "9" };
-
-const homeSnapshot = (): HomeSnapshot => ({ favorites: FAVORITES, favoriteEtas: ETAS, alertCount: 2 });
-
 const train = (Line: string, dest: string, Min: string): Train => ({
   Car: "6",
   Destination: dest,
@@ -40,7 +47,6 @@ const train = (Line: string, dest: string, Min: string): Train => ({
   LocationName: "Metro Center",
   Min,
 });
-
 const FIXTURE_TRAINS: Train[] = [
   train("OR", "Vienna", "ARR"),
   train("RD", "Glenmont", "BRD"),
@@ -49,9 +55,6 @@ const FIXTURE_TRAINS: Train[] = [
   train("BL", "Franconia-Springfield", "9"),
   train("OR", "New Carrollton", "12"),
 ];
-
-const stationName = (code: string): string => FAVORITES.find((f) => f.code === code)?.name ?? code;
-
 const INCIDENTS: RailIncident[] = [
   {
     IncidentID: "1",
@@ -83,12 +86,36 @@ const OUTAGES: ElevatorIncident[] = [
   },
 ];
 const ALERT_ITEMS = buildAlertItems(INCIDENTS, OUTAGES);
+const stationName = (code: string): string => FAVORITES.find((f) => f.code === code)?.name ?? code;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function fixtureScreen(intent: NavIntent): Screen<any> | null {
+  switch (intent.to) {
+    case "home":
+      return makeHomeScreen((): HomeSnapshot => ({ favorites: FAVORITES, favoriteEtas: ETAS, alertCount: ALERT_ITEMS.length }));
+    case "predictions":
+      return makePredictionsScreen(
+        async () => ({ trains: FIXTURE_TRAINS, fetchedAt: Date.now(), fetchError: null }),
+        makeInitialPredictionsSnapshot(intent.stationCode, stationName(intent.stationCode)),
+      );
+    case "alerts":
+      return makeAlertsScreen(async () => ({ items: ALERT_ITEMS, fetchedAt: Date.now(), fetchError: null }), makeInitialAlertsSnapshot());
+    case "alertDetail":
+      return makeAlertDetailScreen(ALERT_ITEMS[intent.index] ?? { title: "Alert", detail: "Not found." });
+    case "unconfigured":
+    case "exit":
+      return null;
+  }
+}
+
+// --- Boot ------------------------------------------------------------------
 
 async function main(): Promise<void> {
   const root = document.getElementById("app");
-  if (root) root.textContent = "WMATA G2 preview harness — drive via the simulator automation API.";
+  if (root) root.textContent = `WMATA G2 preview harness — ${LIVE ? "LIVE data" : "fixtures"}.`;
 
   const bridge = await waitForEvenAppBridge();
+  const session = LIVE ? new Session(KEY) : null;
   let unmount: (() => Promise<void>) | null = null;
 
   const router: Router = {
@@ -103,31 +130,15 @@ async function main(): Promise<void> {
         return;
       }
       router.current = intent.to;
-      switch (intent.to) {
-        case "home":
-          unmount = await mountGlassesScreen(makeHomeScreen(homeSnapshot), bridge, router);
-          break;
-        case "unconfigured":
-          unmount = await mountGlassesScreen(makeUnconfiguredScreen(), bridge, router);
-          break;
-        case "predictions": {
-          const initial = makeInitialPredictionsSnapshot(intent.stationCode, stationName(intent.stationCode));
-          const fetcher = async () => ({ trains: FIXTURE_TRAINS, fetchedAt: Date.now(), fetchError: null });
-          unmount = await mountGlassesScreen(makePredictionsScreen(fetcher, initial), bridge, router);
-          break;
-        }
-        case "alerts": {
-          const fetcher = async () => ({ items: ALERT_ITEMS, fetchedAt: Date.now(), fetchError: null });
-          unmount = await mountGlassesScreen(makeAlertsScreen(fetcher, makeInitialAlertsSnapshot()), bridge, router);
-          break;
-        }
-        case "alertDetail": {
-          const item = ALERT_ITEMS[intent.index] ?? { title: "Alert", detail: "Not found." };
-          unmount = await mountGlassesScreen(makeAlertDetailScreen(item), bridge, router);
-          break;
-        }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let screen: Screen<any> | null;
+      if (intent.to === "unconfigured") screen = makeUnconfiguredScreen();
+      else if (LIVE && session) screen = await buildScreen(session, intent, () => FAVORITES);
+      else screen = fixtureScreen(intent);
+      if (screen) {
+        unmount = await mountGlassesScreen(screen, bridge, router);
+        console.log(`[preview] mounted: ${intent.to}`);
       }
-      console.log(`[preview] mounted: ${intent.to}`);
     },
   };
 

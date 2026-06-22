@@ -56,6 +56,22 @@ export function pageRects(): PageRects {
   };
 }
 
+/** Hero layout (Predictions): a big image-accent numeral on the left, the train
+ *  list (body) on the right. The accent is capped at ≤144px tall (image-
+ *  container limit) and vertically centered in the left zone. */
+export function heroRects(): { accent: Rect; body: Rect } {
+  const { header } = pageRects();
+  const top = header.y + header.h + GAP;
+  const bottom = HEIGHT - MARGIN - HINT_H - GAP;
+  const zoneH = bottom - top;
+  const accentW = 156;
+  const accentH = Math.min(140, zoneH);
+  return {
+    accent: { x: MARGIN, y: top + Math.round((zoneH - accentH) / 2), w: accentW, h: accentH },
+    body: { x: MARGIN + accentW + GAP, y: top, w: WIDTH - MARGIN - (MARGIN + accentW + GAP), h: zoneH },
+  };
+}
+
 /** The body box's text area (width/height), for pagination. */
 export function bodyInnerBox(): { width: number; height: number } {
   const { body } = pageRects();

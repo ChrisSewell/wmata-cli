@@ -10,6 +10,7 @@ import {
   BODY_INSET,
   HEADER_INSET,
   CLOCK_RESERVE_PX,
+  type Rect,
 } from "../ui/layout";
 import { truncateToPx } from "../ui/measure";
 import { formatClock } from "../ui/format";
@@ -29,9 +30,10 @@ export interface ColumnGeom {
 }
 
 /** Compute the value column + left budget for a text-mode screen — fixed at
- *  mount from the screen's worst-case `valueReserve`. */
-export function columnGeom(valueReserve: readonly string[] | undefined): ColumnGeom {
-  const { body } = pageRects();
+ *  mount from the screen's worst-case `valueReserve`. `bodyRect` defaults to the
+ *  standard body; hero screens pass their narrower body. */
+export function columnGeom(valueReserve: readonly string[] | undefined, bodyRect?: Rect): ColumnGeom {
+  const body = bodyRect ?? pageRects().body;
   const innerLeft = body.x + BODY_INSET;
   const innerRight = body.x + body.w - BODY_INSET;
   if (!valueReserve || valueReserve.length === 0) {
@@ -48,6 +50,8 @@ export interface TextRender {
   /** "" when the screen has no value column or the body isn't rows. */
   valueContent: string;
   hint: string;
+  /** Hero accent token to draw big (hero screens only); "" otherwise. */
+  numeral: string;
 }
 
 /** Resolve a Layout into per-container content for the given column geometry. */
@@ -89,5 +93,5 @@ export function composeText(
   }
   // 'list' bodies are handled by the list-mode host path, not here.
 
-  return { title, clock, bodyContent, valueContent, hint };
+  return { title, clock, bodyContent, valueContent, hint, numeral: layout.hero?.numeral ?? "" };
 }

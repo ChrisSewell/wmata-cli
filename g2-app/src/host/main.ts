@@ -11,54 +11,19 @@ import { mountSettingsScreen } from "../companion/settings";
 import { loadSettings, setStorageMirror } from "../storage/settings";
 import { hydrateSettingsFromBridge, mirrorToBridge } from "../storage/bridge-sync";
 
-import { Session } from "../data/session";
-import { computeUserLines } from "../data/domain/lines";
-import { buildFavoriteEtaMap } from "../data/domain/eta";
-import { buildAlertItems } from "../data/domain/alerts";
-import { buildRailPredictionsUrl, type PredictionsResponse } from "../data/wmata";
-
+import { Session, buildScreen } from "./wiring";
 import { mountGlassesScreen } from "./glasses-host";
 import { makeUnconfiguredScreen } from "../screens/unconfigured";
-import { makeHomeScreen, type HomeSnapshot } from "../screens/home";
-import { makePredictionsScreen, makeInitialPredictionsSnapshot } from "../screens/predictions";
-import { makeAlertsScreen, makeInitialAlertsSnapshot } from "../screens/alerts";
-import { makeAlertDetailScreen } from "../screens/alert-detail";
 import type { NavIntent, Router } from "../screens/router";
 
 const BRIDGE_TIMEOUT_MS = 2_000;
 const CONFIG_WATCH_INTERVAL_MS = 1_500;
-const HOME_TICK_MS = 30_000;
 
-// --- Home data wiring -----------------------------------------------------
-
-function homeLoader(session: Session): HomeSnapshot {
-  const favorites = loadSettings().favorites;
-  const alertCount =
-    session.readCachedIncidents().incidents.length +
-    session.readCachedElevatorIncidents().incidents.length;
-  return { favorites, favoriteEtas: {}, alertCount };
-}
-
-async function homeRefresh(session: Session): Promise<HomeSnapshot> {
-  const favorites = loadSettings().favorites;
-  const codes = favorites.map((f) => f.code);
-  const userLines = computeUserLines(favorites);
-  // One batched predictions call for ETAs + the two alert caches, in parallel.
-  const [etas] = await Promise.all([
-    buildFavoriteEtaMap(session.client, codes).catch(() => ({}) as Record<string, string | null>),
-    session.refreshIncidents(userLines),
-    session.refreshElevatorIncidents(codes),
-  ]);
-  const alertCount =
-    session.readCachedIncidents().incidents.length +
-    session.readCachedElevatorIncidents().incidents.length;
-  return { favorites, favoriteEtas: etas, alertCount };
-}
-
-// --- Configured app (one per API key) -------------------------------------
+// --- Configured app (one Session per API key) -----------------------------
 
 async function bootConfiguredApp(bridge: EvenAppBridge): Promise<() => Promise<void>> {
   const session = new Session(loadSettings().apiKey);
+  const getFavorites = () => loadSettings().favorites;
   let unmount: (() => Promise<void>) | null = null;
 
   const router: Router = {
@@ -69,74 +34,12 @@ async function bootConfiguredApp(bridge: EvenAppBridge): Promise<() => Promise<v
         unmount = null;
       }
       router.current = intent.to;
-      switch (intent.to) {
-        case "home":
-          unmount = await mountGlassesScreen(
-            makeHomeScreen(() => homeLoader(session), () => homeRefresh(session), HOME_TICK_MS),
-            bridge,
-            router,
-          );
-          return;
-        case "predictions": {
-          let name = intent.stationCode;
-          try {
-            const station = await session.resolveStationCode(intent.stationCode);
-            if (station) name = station.Name;
-          } catch (err) {
-            console.warn(`[host] resolveStationCode(${intent.stationCode}) failed:`, err);
-          }
-          const fetcher = async () => {
-            const data = await session.client.get<PredictionsResponse>(
-              buildRailPredictionsUrl(intent.stationCode),
-            );
-            return { trains: data.Trains ?? [], fetchedAt: Date.now(), fetchError: null };
-          };
-          unmount = await mountGlassesScreen(
-            makePredictionsScreen(fetcher, makeInitialPredictionsSnapshot(intent.stationCode, name)),
-            bridge,
-            router,
-          );
-          return;
-        }
-        case "alerts": {
-          const fetcher = async () => {
-            const codes = loadSettings().favorites.map((f) => f.code);
-            const userLines = computeUserLines(loadSettings().favorites);
-            const [inc, elev] = await Promise.all([
-              session.refreshIncidents(userLines),
-              session.refreshElevatorIncidents(codes),
-            ]);
-            return {
-              items: buildAlertItems(inc.incidents, elev.incidents),
-              fetchedAt: Math.max(inc.fetchedAt, elev.fetchedAt) || Date.now(),
-              fetchError: inc.fetchError ?? elev.fetchError,
-            };
-          };
-          unmount = await mountGlassesScreen(makeAlertsScreen(fetcher, makeInitialAlertsSnapshot()), bridge, router);
-          return;
-        }
-        case "alertDetail": {
-          // Rebuild the same combined list from the (just-fetched) caches and
-          // index into it — same order as the Alerts screen used.
-          const items = buildAlertItems(
-            session.readCachedIncidents().incidents,
-            session.readCachedElevatorIncidents().incidents,
-          );
-          const item = items[intent.index] ?? { title: "Alert", detail: "This alert is no longer available." };
-          unmount = await mountGlassesScreen(makeAlertDetailScreen(item), bridge, router);
-          return;
-        }
-        case "unconfigured":
-        case "exit":
-          // `exit` is handled by the host (app exit); `unconfigured` by the
-          // reconcile watcher. Nothing to mount here.
-          return;
-      }
+      const screen = await buildScreen(session, intent, getFavorites);
+      if (screen) unmount = await mountGlassesScreen(screen, bridge, router);
     },
   };
 
   await router.navigate({ to: "home" });
-
   return async (): Promise<void> => {
     if (unmount) {
       await unmount();
@@ -175,9 +78,8 @@ async function bootGlasses(bridge: EvenAppBridge): Promise<void> {
     activeSignature = null;
   };
 
-  // The unconfigured placeholder's only intent is `exit` (handled by the host);
-  // double-press there leaves the app, so we stop watching to avoid a zombie
-  // poll against a shut-down page.
+  // Double-press on the unconfigured placeholder exits the app; stop the
+  // watcher so it doesn't poll against a shut-down page.
   const placeholderRouter: Router = {
     current: "unconfigured",
     navigate: async (intent: NavIntent): Promise<void> => {

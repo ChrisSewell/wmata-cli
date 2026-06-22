@@ -21,20 +21,25 @@ import {
   StartUpPageCreateResult,
   TextContainerProperty,
   TextContainerUpgrade,
+  ImageContainerProperty,
+  ImageRawDataUpdate,
   type EvenAppBridge,
   type EvenHubEvent,
 } from "@evenrealities/even_hub_sdk";
 
 import {
   pageRects,
+  heroRects,
   BODY_PAD,
   HEADER_PAD,
   BODY_INSET,
   CLOCK_RESERVE_PX,
+  type Rect,
 } from "../ui/layout";
 import { RADIUS, BORDER_W } from "../ui/geometry";
 import { TIER } from "../ui/tokens";
 import { columnGeom, composeText, type ColumnGeom } from "./compose";
+import { encodeHero } from "./accent";
 import { createSerial } from "./serial";
 import { initialNav, type NavState, type Router, type Screen, type ScreenEvent, type ViewContext } from "../screens/router";
 
@@ -44,6 +49,7 @@ const ID_BODY = 2;
 const ID_CLOCK = 3;
 const ID_VALUE = 4;
 const ID_HINT = 5;
+const ID_ACCENT = 6; // hero screens only — the one image accent
 
 const CLOCK_TICK_MS = 1000;
 
@@ -153,8 +159,7 @@ function clockRect() {
 }
 
 /** Geometry for the value-overlay column (aligned to the body text). */
-function valueRect(geom: ColumnGeom) {
-  const { body } = pageRects();
+function valueRect(geom: ColumnGeom, body: Rect) {
   const x = geom.valueX ?? 0;
   return {
     x,
@@ -181,10 +186,12 @@ export async function mountGlassesScreen<S>(
   let active = true;
   let hintsVisible = true;
 
-  const geom = columnGeom(screen.valueReserve);
+  const hero = screen.hero === true;
+  const rects = pageRects();
+  const bodyRect = hero ? heroRects().body : rects.body;
+  const geom = columnGeom(screen.valueReserve, bodyRect);
   const hasValue = geom.valueX !== null;
   const serial = createSerial();
-  const rects = pageRects();
 
   let tickTimer: ReturnType<typeof setInterval> | null = null;
   let clockTimer: ReturnType<typeof setInterval> | null = null;
@@ -200,8 +207,41 @@ export async function mountGlassesScreen<S>(
   let lastClock: string | null = null;
   let lastValue: string | null = null;
   let lastHint: string | null = null;
+  // Hero image accent: cache the encoded PNG so a rebuild / FOREGROUND_ENTER
+  // can re-push it without re-encoding (image buffers don't survive lock/sleep).
+  let lastNumeral: string | null = null;
+  let accentBytes: Uint8Array | null = null;
 
   const makeCtx = (): ViewContext => ({ nowMs: Date.now() });
+
+  const pushAccent = async (numeral: string): Promise<void> => {
+    if (!hero || numeral === lastNumeral) return;
+    try {
+      const a = heroRects().accent;
+      accentBytes = await encodeHero(numeral, a.w, a.h);
+      await serial(() =>
+        bridge.updateImageRawData(
+          new ImageRawDataUpdate({ containerID: ID_ACCENT, containerName: "wmata.accent", imageData: accentBytes! }),
+        ),
+      );
+      lastNumeral = numeral;
+    } catch (err) {
+      console.warn("[host] accent push failed:", err);
+    }
+  };
+
+  const repushAccent = async (): Promise<void> => {
+    if (!hero || !accentBytes) return;
+    try {
+      await serial(() =>
+        bridge.updateImageRawData(
+          new ImageRawDataUpdate({ containerID: ID_ACCENT, containerName: "wmata.accent", imageData: accentBytes! }),
+        ),
+      );
+    } catch (err) {
+      console.warn("[host] accent re-push failed:", err);
+    }
+  };
 
   const pushIfChanged = async (id: number, content: string, last: string | null): Promise<string | null> => {
     if (content === last) return last;
@@ -231,6 +271,7 @@ export async function mountGlassesScreen<S>(
         lastClock = await pushIfChanged(ID_CLOCK, r.clock, lastClock);
         if (hasValue) lastValue = await pushIfChanged(ID_VALUE, r.valueContent, lastValue);
         lastHint = await pushIfChanged(ID_HINT, r.hint, lastHint);
+        if (hero) await pushAccent(r.numeral);
       } while (renderPending && active);
     } finally {
       renderInFlight = false;
@@ -241,10 +282,10 @@ export async function mountGlassesScreen<S>(
   const initial = composeText(screen.view(snapshot, nav, makeCtx()), geom, Date.now(), hintsVisible);
   const containers: TextContainerProperty[] = [
     box(ID_HEADER, "wmata.header", rects.header, TIER.STRONG, HEADER_PAD, initial.title, false),
-    box(ID_BODY, "wmata.body", rects.body, TIER.MUTED, BODY_PAD, initial.bodyContent, true),
+    box(ID_BODY, "wmata.body", bodyRect, TIER.MUTED, BODY_PAD, initial.bodyContent, true),
     borderless(ID_CLOCK, "wmata.clock", clockRect(), initial.clock),
   ];
-  if (hasValue) containers.push(borderless(ID_VALUE, "wmata.value", valueRect(geom), initial.valueContent));
+  if (hasValue) containers.push(borderless(ID_VALUE, "wmata.value", valueRect(geom, bodyRect), initial.valueContent));
   containers.push(borderless(ID_HINT, "wmata.hint", rects.hint, initial.hint));
   lastHeader = initial.title;
   lastBody = initial.bodyContent;
@@ -252,10 +293,31 @@ export async function mountGlassesScreen<S>(
   lastValue = hasValue ? initial.valueContent : null;
   lastHint = initial.hint;
 
+  // The image accent can't be sent during page creation — create an empty
+  // placeholder, then push pixels with updateImageRawData once the page is up.
+  const imageObject: ImageContainerProperty[] = [];
+  if (hero) {
+    const a = heroRects().accent;
+    imageObject.push(
+      new ImageContainerProperty({
+        xPosition: a.x,
+        yPosition: a.y,
+        width: a.w,
+        height: a.h,
+        containerID: ID_ACCENT,
+        containerName: "wmata.accent",
+      }),
+    );
+  }
+
   try {
     const result = await serial(() =>
       bridge.createStartUpPageContainer(
-        new CreateStartUpPageContainer({ containerTotalNum: containers.length, textObject: containers }),
+        new CreateStartUpPageContainer({
+          containerTotalNum: containers.length + imageObject.length,
+          textObject: containers,
+          imageObject: hero ? imageObject : undefined,
+        }),
       ),
     );
     if (result !== StartUpPageCreateResult.success) {
@@ -264,6 +326,9 @@ export async function mountGlassesScreen<S>(
   } catch (err) {
     console.warn(`[host] createStartUpPageContainer threw:`, err);
   }
+
+  // Push the accent now that the page exists.
+  if (hero) await pushAccent(initial.numeral);
 
   if (screen.onMount) {
     try {
@@ -356,6 +421,7 @@ export async function mountGlassesScreen<S>(
         paused = false;
         startTimers();
         void render();
+        void repushAccent(); // image buffers drop on lock/sleep — re-push from cache
         if (fetchEnabled) void runTick();
       }
       return;
