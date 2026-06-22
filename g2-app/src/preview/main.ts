@@ -30,8 +30,10 @@ const FAVORITES: FavoriteStation[] = [
   { code: "K08", name: "Wiehle-Reston East", lines: ["SV"] },
 ];
 
+const PARAMS = new URLSearchParams(location.search);
 const KEY = (import.meta.env.VITE_WMATA_KEY as string | undefined) ?? "";
-const LIVE = KEY.length > 0;
+// `?fixtures` forces fixture mode even with a key (deterministic accent tests).
+const LIVE = KEY.length > 0 && !PARAMS.has("fixtures");
 
 // --- Fixtures (no-key fallback) -------------------------------------------
 
@@ -142,7 +144,7 @@ async function main(): Promise<void> {
     },
   };
 
-  const start = new URLSearchParams(location.search).get("screen");
+  const start = PARAMS.get("screen");
   await router.navigate(start === "unconfigured" ? { to: "unconfigured" } : { to: "home" });
   console.log("[preview] ready");
 }

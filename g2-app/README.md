@@ -11,7 +11,9 @@ escalator outages).
 containers, all text is laid out with **pixel-accurate measurement**
 (`@evenrealities/pretext`) — never character counting or space-padding — and
 value columns align by *position*. No fake monospace grid, no overflow-scroll
-lists.
+lists. Predictions adds the one allowed **image accent** — the soonest train's
+minutes as a big dot-matrix hero numeral. The companion phone UI follows the
+official **Even Realities app design language** (ER-Black + Accent-Yellow).
 
 ## Prerequisites
 
@@ -67,7 +69,9 @@ Screens:
   an aligned value column, plus a "Service alerts" row. Press a favorite →
   Predictions; press alerts → Alerts.
 - **Predictions** — per-station departure board, trains sorted soonest-first,
-  20s auto-refresh, staleness marker + loading/empty/error states.
+  20s auto-refresh, staleness marker + loading/empty/error states. The soonest
+  train's minutes render as a big dot-matrix **hero numeral** (the image accent;
+  `ARR`/`BRD` as a bold word).
 - **Alerts** — rail incidents + elevator/escalator outages in one selectable
   list; press a row → the full text, paginated.
 
@@ -82,9 +86,10 @@ unit-tested.
 src/
   data/        WMATA client (+429 backoff) · session caches · domain logic (eta, lines, alerts, staleness)
   ui/          tokens · geometry · pretext measurement · layout (value column, pagination)
+  accent/      dot-matrix font for the image accent
   screens/     pure Screen<S> contract: init/view/reduce; one file per screen
   nav/         gesture-hint affordances
-  host/        the only SDK consumer — compose (content) + glasses-host (containers, events, lifecycle) + serial + main (boot)
+  host/        the only SDK consumer — compose (content) + accent (canvas→PNG) + glasses-host (containers, events, image accent, lifecycle) + wiring (intent→screen) + serial + main (boot)
   companion/   phone settings UI (API key + favorites)
   storage/     durable localStorage <-> Even Hub bridge mirror
   preview/     fixture-driven verification harness
@@ -116,16 +121,24 @@ node scripts/sim.mjs shot <name>        # save .sim-shots/<name>.png
 The sim is not pixel-perfect for greyscale vs hardware — use it for
 layout/copy/event logic; do final visual QA on-device.
 
+**Live data in the preview:** put `VITE_WMATA_KEY=<key>` in `g2-app/.env.local`
+(gitignored) and the preview harness boots a real `Session` against the live
+WMATA API. `glasses-preview.html?fixtures` forces deterministic fixtures even
+with a key (for stable accent/state screenshots). The live key is **never**
+bundled — the production build ships only `index.html`, so it stays out of the
+packed `.ehpk`.
+
 ## Status
 
-| Feature                         | State              |
-|---------------------------------|--------------------|
-| Home favorites board            | Production-ready   |
-| Predictions board               | Production-ready   |
-| Service alerts + detail         | Production-ready   |
-| Elevator / escalator outages    | Folded into Alerts |
-| Companion settings (key + favs) | Production-ready   |
-| Durable settings (bridge mirror)| Production-ready   |
+| Feature                          | State              |
+|----------------------------------|--------------------|
+| Home favorites board             | Production-ready   |
+| Predictions board + hero accent  | Production-ready   |
+| Service alerts + detail          | Production-ready   |
+| Elevator / escalator outages     | Folded into Alerts |
+| Companion (ER design language)   | Production-ready   |
+| Durable settings (bridge mirror) | Production-ready   |
 
-On-device validation pending: the live-data configured flow (real WMATA key) and
-the 5-minute locked-phone state test require hardware / a real key.
+On-device validation pending: the configured `index.html` flow with a key
+entered in the companion form, the `FOREGROUND_ENTER` accent re-push, and the
+5-minute locked-phone state test — all require hardware / a real key.
