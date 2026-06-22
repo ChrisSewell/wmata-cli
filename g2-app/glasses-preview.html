@@ -3,15 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
-    <title>G2 Glasses Preview Harness</title>
+    <title>WMATA G2 Preview Harness</title>
     <style>
       html, body { margin: 0; height: 100%; background: #232323; color: #E5E5E5;
-        font: 14px/1.4 -apple-system, system-ui, sans-serif; }
-      #app { display: flex; height: 100%; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; text-align: center; }
+        font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+      #app { box-sizing: border-box; min-height: 100%; padding: 16px; }
     </style>
   </head>
   <body>
-    <div id="app">G2 preview harness — drive via the simulator automation API (each gesture advances one card).</div>
-    <script type="module" src="/src/glasses-preview.ts"></script>
+    <div id="app">WMATA G2 preview harness — boots the glasses host against fixture data; drive via the simulator automation API.</div>
+    <script type="module" src="/src/preview/main.ts"></script>
   </body>
 </html>

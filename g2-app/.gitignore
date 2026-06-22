@@ -4,3 +4,8 @@ dist/
 *.log
 *.ehpk
 .DS_Store
+.sim-shots/
+src-legacy/
+.env
+.env.local
+.env*.local

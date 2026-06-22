@@ -1,153 +1,26 @@
-// Typed settings + favorites store for the G2 companion app.
+// Typed settings + favorites store for the companion app. Synchronous and
+// SDK-free so it can be called from anywhere (including before the bridge is
+// ready, and from tests); the durable bridge mirror is bolted on via
+// `setStorageMirror` (see `storage/bridge-sync.ts`).
 //
-// Persists two pieces of user state to the browser's `localStorage`:
+// Persists two pieces of state to `localStorage`, each wrapped in a
+// schema-versioned envelope:
 //   1. The WMATA developer API key (`wmata.g2.apiKey`).
 //   2. An ordered list of up to MAX_FAVORITES pinned stations
 //      (`wmata.g2.favorites`).
 //
-// Why localStorage and not the SDK bridge?
-//   The Even Realities SDK does expose `bridge.setLocalStorage` /
-//   `bridge.getLocalStorage` (see
-//   node_modules/@evenrealities/even_hub_sdk/dist/index.d.ts lines 1132-1157),
-//   but those calls are async (`Promise<...>`) and require waiting for
-//   `appBridgeReady`. This module is required by the spec to be pure
-//   (no SDK imports) and fully synchronous so it can be called from
-//   anywhere — including before the bridge is ready, and from tests.
-//   The companion settings screen runs inside the host phone app's WebView
-//   where `window.localStorage` is reliable, so we use it directly here.
-//
-// Schema
-//   Every stored object is stamped with `schemaVersion: 1`. On load, a
-//   mismatched (or missing) version causes us to return defaults rather
-//   than attempt to interpret unknown shapes. This gives us a clean upgrade
-//   path: bump the constant, add a migration branch, done.
-//
-// Failure modes
-//   `localStorage` can throw synchronously in two real-world cases we care
-//   about:
-//     - SecurityError when the WebView is in a cross-origin iframe or the
-//       user has disabled site data (some private-browsing modes).
-//     - QuotaExceededError on writes when storage is full.
-//   Both are caught and logged via `console.warn`. Reads degrade to
-//   defaults; writes degrade to a no-op. The app continues to function,
-//   it just won't remember anything across reloads. We do NOT keep an
-//   in-memory fallback — callers that need that should layer it on top.
+// Reads degrade to defaults; writes degrade to a no-op (localStorage can throw
+// SecurityError in private mode / QuotaExceededError when full). Never throws.
 
-import type { LineCode } from "../wmata";
-import type {
-  AutoRotateRule,
-  QuietHoursRule,
-  ScheduleRule,
-  Weekday,
-} from "../schedule/rules";
-import { WEEKDAYS } from "../schedule/rules";
-import { clearHistory } from "./history";
+import type { LineCode } from "../data/wmata";
+import type { FavoriteStation } from "../data/domain/lines";
 
-// ---------------------------------------------------------------------------
-// Types & constants
-// ---------------------------------------------------------------------------
-
-/** A station the user pinned to their glasses Home screen. */
-export type FavoriteStation = {
-  code: string;
-  name: string;
-  lines: LineCode[];
-  /**
-   * Geocoded coordinates of the station entrance. Optional —
-   * v1.1 favorites stored before WP-G don't carry these fields,
-   * and the parser tolerates their absence. Populated by the
-   * companion when adding new favorites (lat/lon come from
-   * WMATA's `jStations` response). Used only by the WP-G
-   * geofence boot path.
-   */
-  lat?: number;
-  lon?: number;
-};
+export type { FavoriteStation };
 
 /** Public shape returned by `loadSettings`. */
 export interface Settings {
   apiKey: string;
   favorites: FavoriteStation[];
-  /**
-   * Deepgram streaming-STT API key. Empty string is the documented
-   * "no STT" state (same convention as `apiKey`). With no key the
-   * VOICE LOOKUP row on the glasses will fail with a clear error and
-   * bounce back to Home.
-   */
-  sttApiKey: string;
-  /**
-   * True once the user has seen the first-launch gesture cheat sheet.
-   *
-   * Migration rule (rather than bumping SCHEMA_VERSION, which would
-   * invalidate every v1 user's stored value): when the
-   * `wmata.g2.tutorialSeen` key is absent, infer `true` if the user
-   * has any prior stored state (an `apiKey` was set) and `false`
-   * otherwise. Net effect: existing v1.1 users do NOT see the
-   * tutorial on upgrade (they're already configured), and only
-   * genuine first-launchers do.
-   */
-  tutorialSeen: boolean;
-  /**
-   * User's schedule rules (auto-rotate + quiet hours). Empty array
-   * is the default — no auto-rotate, no quiet hours; the app boots
-   * straight to Home. Evaluated by `evaluateSchedule` in
-   * `src/schedule/rules.ts`.
-   */
-  schedule: ScheduleRule[];
-  /**
-   * Labelled station codes for voice-intent commands. Empty strings
-   * mean "not configured" — the corresponding voice keyword falls
-   * through to the fuzzy station match instead of a direct nav.
-   *
-   * "home" and "work" are the canonical labels; more can be added
-   * later without a schema change (the parser drops unknown keys).
-   */
-  voiceTargets: VoiceTargets;
-  /**
-   * Saved origin→destination pair for the Journey screen (WP-C).
-   * Both fields empty hides the Journey screen entirely. Setting
-   * either or both enables the screen.
-   */
-  journeyPlan: JourneyPlan;
-  /**
-   * Boot-time geofence enable flag (WP-G). When true AND the
-   * runtime exposes `navigator.geolocation` AND favorites carry
-   * lat/lon, `bootGlasses` checks the user's current position and
-   * auto-mounts predictions for the nearest in-range favorite
-   * instead of Home. Default: false.
-   */
-  geofenceEnabled: boolean;
-}
-
-/** Labelled station codes for voice navigation keywords. */
-export interface VoiceTargets {
-  /** Station code, e.g. "C01". Empty means unset. */
-  home: string;
-  work: string;
-}
-
-/**
- * Saved origin→destination pair for the Journey / Commute screen.
- * Both fields empty (the default) → the Journey screen is hidden.
- *
- * Per the WMATA jPath endpoint, both stations must be on the SAME
- * line for the path lookup to return data. WP-K adds an optional
- * `transfer` station code that lets the user compose a two-leg
- * cross-line journey (origin → transfer → destination); the screen
- * concatenates two jPath responses.
- */
-export interface JourneyPlan {
-  /** Origin station code, e.g. "C01". Empty = unset. */
-  origin: string;
-  /** Destination station code, e.g. "C04". Empty = unset. */
-  destination: string;
-  /**
-   * Optional transfer station. When non-empty, the Journey screen
-   * fetches `origin → transfer` and `transfer → destination` and
-   * renders as a two-leg composition (`OR→YL via Lenfant`).
-   * Empty = same-line route.
-   */
-  transfer?: string;
 }
 
 /** Maximum number of favorite stations a user can pin. */
@@ -156,90 +29,40 @@ export const MAX_FAVORITES = 5;
 /** Bumped whenever the on-disk schema changes incompatibly. */
 const SCHEMA_VERSION = 1;
 
-/** Namespaced storage keys so we don't collide with the host app. */
 const KEY_API_KEY = "wmata.g2.apiKey";
 const KEY_FAVORITES = "wmata.g2.favorites";
-const KEY_STT_API_KEY = "wmata.g2.sttApiKey";
-const KEY_TUTORIAL_SEEN = "wmata.g2.tutorialSeen";
-const KEY_SCHEDULE = "wmata.g2.schedule";
-const KEY_VOICE_TARGETS = "wmata.g2.voiceTargets";
-const KEY_JOURNEY_PLAN = "wmata.g2.journeyPlan";
-const KEY_GEOFENCE_ENABLED = "wmata.g2.geofenceEnabled";
 
 /**
- * Every namespaced settings key, in one place, for the bridge-storage
- * sync layer (`storage/bridge-sync.ts`) to hydrate from / mirror to the
- * Even Hub durable store. Keep in sync with the `KEY_*` consts above —
- * a key missing here simply won't survive an app restart on hardware.
+ * Every namespaced settings key, for the bridge-sync layer to hydrate from /
+ * mirror to the Even Hub durable store. A key missing here won't survive an
+ * app restart on hardware.
  */
-export const STORAGE_KEYS: readonly string[] = [
-  KEY_API_KEY,
-  KEY_FAVORITES,
-  KEY_STT_API_KEY,
-  KEY_TUTORIAL_SEEN,
-  KEY_SCHEDULE,
-  KEY_VOICE_TARGETS,
-  KEY_JOURNEY_PLAN,
-  KEY_GEOFENCE_ENABLED,
-];
+export const STORAGE_KEYS: readonly string[] = [KEY_API_KEY, KEY_FAVORITES];
 
-/** Set of valid LineCode literals, for runtime narrowing of parsed JSON. */
-const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>([
-  "RD",
-  "BL",
-  "YL",
-  "OR",
-  "GR",
-  "SV",
-]);
+const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>(["RD", "BL", "YL", "OR", "GR", "SV"]);
 
-/** Envelope written to localStorage. Strings & arrays are stored wrapped. */
+/** Envelope written to localStorage. */
 interface Envelope<T> {
   schemaVersion: number;
   value: T;
 }
 
-// ---------------------------------------------------------------------------
-// Durable-store mirror (Even Hub bridge)
-// ---------------------------------------------------------------------------
+// --- Durable-store mirror (Even Hub bridge) -------------------------------
 
-/**
- * Optional sink that mirrors every settings write to a durable store —
- * the Even Hub bridge's `setLocalStorage` (see `storage/bridge-sync.ts`).
- * Registered at boot by `main.ts` once the bridge is ready; stays `null`
- * in tests and browser-only mode (writes then live only in
- * `window.localStorage`).
- *
- * Why this matters: per the Even Hub SDK, WebView `localStorage` "may be
- * cleared on app restart" — only the bridge store reliably persists
- * across the packed app being closed and reopened. We keep `localStorage`
- * as the fast synchronous working copy (so this module stays pure +
- * sync, and all callers/tests are untouched) and mirror writes to the
- * bridge so settings actually survive between sessions on hardware.
- *
- * The signature is deliberately SDK-free (`(key, value) => void`) so this
- * module keeps its "no SDK imports" contract. An empty `value` means
- * "unset" (the bridge store has no delete; an empty string reads back as
- * absent — matching the hydrate side in `bridge-sync.ts`).
- */
 let storageMirror: ((key: string, value: string) => void) | null = null;
 
-/** Register (or clear, with `null`) the durable-store mirror. */
-export function setStorageMirror(
-  fn: ((key: string, value: string) => void) | null,
-): void {
+/**
+ * Register (or clear, with `null`) a sink that mirrors every settings write to
+ * the durable Even Hub store. WebView `localStorage` may be cleared on app
+ * restart; the bridge store is the cross-session source of truth. SDK-free
+ * signature keeps this module pure.
+ */
+export function setStorageMirror(fn: ((key: string, value: string) => void) | null): void {
   storageMirror = fn;
 }
 
-// ---------------------------------------------------------------------------
-// Safe localStorage wrappers
-// ---------------------------------------------------------------------------
+// --- Safe localStorage wrappers -------------------------------------------
 
-/**
- * Read a raw string from localStorage. Returns `null` on any error
- * (SecurityError in private browsing, no `window`, etc.) so the caller
- * can fall through to defaults.
- */
 function safeGet(key: string): string | null {
   try {
     if (typeof localStorage === "undefined") return null;
@@ -250,47 +73,33 @@ function safeGet(key: string): string | null {
   }
 }
 
-/**
- * Write a raw string to localStorage. Swallows QuotaExceededError and
- * SecurityError — the app stays alive, but the value isn't persisted.
- */
 function safeSet(key: string, value: string): void {
   try {
     if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
   } catch (err) {
     console.warn(`[settings] localStorage.setItem(${key}) failed:`, err);
   }
-  // Mirror to the durable bridge store (best-effort, fire-and-forget).
-  // Runs even if the localStorage write above threw — the bridge store
-  // is the copy that survives an app restart on hardware.
+  // Mirror to the durable bridge store (best-effort). Runs even if the
+  // localStorage write threw — the bridge copy survives an app restart.
   storageMirror?.(key, value);
 }
 
-/** Remove a key. Same swallow-and-warn semantics as `safeSet`. */
 function safeRemove(key: string): void {
   try {
     if (typeof localStorage !== "undefined") localStorage.removeItem(key);
   } catch (err) {
     console.warn(`[settings] localStorage.removeItem(${key}) failed:`, err);
   }
-  // Mirror the removal: an empty string is the bridge store's "unset".
-  storageMirror?.(key, "");
+  storageMirror?.(key, ""); // empty string is the bridge store's "unset"
 }
 
-// ---------------------------------------------------------------------------
-// JSON parsing helpers (operate on `unknown`, never `any`)
-// ---------------------------------------------------------------------------
+// --- JSON parsing helpers (operate on `unknown`) --------------------------
 
-/** Type guard: is this a non-null object we can index into? */
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null;
 }
 
-/**
- * Parse a localStorage string into an envelope of the expected version.
- * Returns `null` if anything is off: missing string, bad JSON, missing
- * schemaVersion, mismatched schemaVersion, or wrong-shaped envelope.
- */
+/** Unwrap a schema-versioned envelope, or null on any mismatch / corruption. */
 function parseEnvelope(raw: string | null): unknown {
   if (raw === null) return null;
   let parsed: unknown;
@@ -305,17 +114,10 @@ function parseEnvelope(raw: string | null): unknown {
   return parsed["value"];
 }
 
-/** Narrow an unknown value to a `LineCode`, or return null. */
 function asLineCode(x: unknown): LineCode | null {
   return typeof x === "string" && VALID_LINE_CODES.has(x) ? (x as LineCode) : null;
 }
 
-/**
- * Narrow an unknown value to a `FavoriteStation`, dropping any malformed
- * `lines` entries. Returns null if `code`/`name` are missing. The
- * optional `lat` / `lon` fields are tolerated when present and ignored
- * when malformed — v1.1 entries (no coords) keep working untouched.
- */
 function asFavorite(x: unknown): FavoriteStation | null {
   if (!isRecord(x)) return null;
   const code = x["code"];
@@ -328,15 +130,9 @@ function asFavorite(x: unknown): FavoriteStation | null {
     const lc = asLineCode(line);
     if (lc !== null) cleanedLines.push(lc);
   }
-  const out: FavoriteStation = { code, name, lines: cleanedLines };
-  const lat = x["lat"];
-  const lon = x["lon"];
-  if (typeof lat === "number" && Number.isFinite(lat)) out.lat = lat;
-  if (typeof lon === "number" && Number.isFinite(lon)) out.lon = lon;
-  return out;
+  return { code, name, lines: cleanedLines };
 }
 
-/** Narrow an unknown value to a `FavoriteStation[]`, dropping malformed rows. */
 function asFavoritesArray(x: unknown): FavoriteStation[] {
   if (!Array.isArray(x)) return [];
   const out: FavoriteStation[] = [];
@@ -347,312 +143,41 @@ function asFavoritesArray(x: unknown): FavoriteStation[] {
   return out.slice(0, MAX_FAVORITES);
 }
 
-// ---------------------------------------------------------------------------
-// Read helpers (split so each key can fail independently)
-// ---------------------------------------------------------------------------
+function writeEnvelope<T>(key: string, value: T): void {
+  const envelope: Envelope<T> = { schemaVersion: SCHEMA_VERSION, value };
+  safeSet(key, JSON.stringify(envelope));
+}
+
+// --- Read helpers (each key fails independently) --------------------------
 
 function readApiKey(): string {
   const value = parseEnvelope(safeGet(KEY_API_KEY));
   return typeof value === "string" ? value : "";
 }
 
-function readSttApiKey(): string {
-  const value = parseEnvelope(safeGet(KEY_STT_API_KEY));
-  return typeof value === "string" ? value : "";
-}
-
 function readFavorites(): FavoriteStation[] {
-  const value = parseEnvelope(safeGet(KEY_FAVORITES));
-  return asFavoritesArray(value);
-}
-
-/**
- * Narrow an unknown value to a `Weekday`, or return null.
- */
-function asWeekday(x: unknown): Weekday | null {
-  if (typeof x !== "string") return null;
-  return (WEEKDAYS as readonly string[]).includes(x) ? (x as Weekday) : null;
-}
-
-/**
- * Narrow an unknown value to a `Weekday[]`, dropping anything that
- * isn't a valid weekday code.
- */
-function asWeekdayArray(x: unknown): Weekday[] {
-  if (!Array.isArray(x)) return [];
-  const out: Weekday[] = [];
-  for (const v of x) {
-    const wd = asWeekday(v);
-    if (wd && !out.includes(wd)) out.push(wd);
-  }
-  return out;
-}
-
-/**
- * Narrow an unknown value to one of the auto-rotate `target`
- * variants. Returns null on malformed input.
- */
-function asAutoRotateTarget(
-  x: unknown,
-): AutoRotateRule["target"] | null {
-  if (!isRecord(x)) return null;
-  const kind = x["kind"];
-  if (kind === "home") return { kind: "home" };
-  if (kind === "predictions") {
-    const stationCode = x["stationCode"];
-    if (typeof stationCode !== "string" || stationCode.length === 0) {
-      return null;
-    }
-    return { kind: "predictions", stationCode };
-  }
-  return null;
-}
-
-/**
- * Narrow an unknown value to a `ScheduleRule`. Drops any rule whose
- * required fields are missing or malformed. The day-list is
- * normalised through `asWeekdayArray` (unknown weekdays dropped).
- */
-function asScheduleRule(x: unknown): ScheduleRule | null {
-  if (!isRecord(x)) return null;
-  const kind = x["kind"];
-  const days = asWeekdayArray(x["days"]);
-  const start = x["startHHMM"];
-  const end = x["endHHMM"];
-  if (typeof start !== "string" || typeof end !== "string") return null;
-  if (days.length === 0) return null;
-  if (kind === "auto-rotate") {
-    const target = asAutoRotateTarget(x["target"]);
-    if (!target) return null;
-    const rule: AutoRotateRule = {
-      kind: "auto-rotate",
-      days,
-      startHHMM: start,
-      endHHMM: end,
-      target,
-    };
-    return rule;
-  }
-  if (kind === "quiet-hours") {
-    const rule: QuietHoursRule = {
-      kind: "quiet-hours",
-      days,
-      startHHMM: start,
-      endHHMM: end,
-    };
-    return rule;
-  }
-  return null;
-}
-
-/** Narrow an unknown value to a `ScheduleRule[]`, dropping malformed entries. */
-function asScheduleArray(x: unknown): ScheduleRule[] {
-  if (!Array.isArray(x)) return [];
-  const out: ScheduleRule[] = [];
-  for (const item of x) {
-    const rule = asScheduleRule(item);
-    if (rule !== null) out.push(rule);
-  }
-  return out;
-}
-
-function readSchedule(): ScheduleRule[] {
-  const value = parseEnvelope(safeGet(KEY_SCHEDULE));
-  return asScheduleArray(value);
-}
-
-function writeSchedule(rules: ScheduleRule[]): void {
-  const envelope: Envelope<ScheduleRule[]> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: rules,
-  };
-  safeSet(KEY_SCHEDULE, JSON.stringify(envelope));
-}
-
-function readVoiceTargets(): VoiceTargets {
-  const value = parseEnvelope(safeGet(KEY_VOICE_TARGETS));
-  if (!isRecord(value)) return { home: "", work: "" };
-  const home = value["home"];
-  const work = value["work"];
-  return {
-    home: typeof home === "string" ? home : "",
-    work: typeof work === "string" ? work : "",
-  };
-}
-
-function writeVoiceTargets(targets: VoiceTargets): void {
-  const envelope: Envelope<VoiceTargets> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: targets,
-  };
-  safeSet(KEY_VOICE_TARGETS, JSON.stringify(envelope));
-}
-
-function readJourneyPlan(): JourneyPlan {
-  const value = parseEnvelope(safeGet(KEY_JOURNEY_PLAN));
-  if (!isRecord(value)) return { origin: "", destination: "", transfer: "" };
-  const origin = value["origin"];
-  const destination = value["destination"];
-  const transfer = value["transfer"];
-  return {
-    origin: typeof origin === "string" ? origin : "",
-    destination: typeof destination === "string" ? destination : "",
-    transfer: typeof transfer === "string" ? transfer : "",
-  };
-}
-
-function readGeofenceEnabled(): boolean {
-  const value = parseEnvelope(safeGet(KEY_GEOFENCE_ENABLED));
-  return typeof value === "boolean" ? value : false;
-}
-
-function writeGeofenceEnabled(enabled: boolean): void {
-  const envelope: Envelope<boolean> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: enabled,
-  };
-  safeSet(KEY_GEOFENCE_ENABLED, JSON.stringify(envelope));
-}
-
-function writeJourneyPlan(plan: JourneyPlan): void {
-  const envelope: Envelope<JourneyPlan> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: plan,
-  };
-  safeSet(KEY_JOURNEY_PLAN, JSON.stringify(envelope));
-}
-
-/**
- * Read the tutorial-seen flag.
- *
- *   - Explicit `true` / `false` stored under `KEY_TUTORIAL_SEEN`
- *     (schema-versioned envelope) wins.
- *   - Absent: infer `true` for existing users (any non-empty
- *     `KEY_API_KEY`), `false` for clean installs. This avoids
- *     bumping `SCHEMA_VERSION` (which would discard every v1 user's
- *     favorites + key on upgrade — see RISK #1 in the WP-A plan).
- */
-function readTutorialSeen(): boolean {
-  const raw = safeGet(KEY_TUTORIAL_SEEN);
-  if (raw !== null) {
-    const value = parseEnvelope(raw);
-    if (typeof value === "boolean") return value;
-  }
-  // Inference path. `parseEnvelope` returns null for missing /
-  // corrupt / version-mismatched envelopes; in any of those cases
-  // we fall back to "existing user → seen, fresh install → unseen".
-  const apiKey = parseEnvelope(safeGet(KEY_API_KEY));
-  return typeof apiKey === "string" && apiKey.length > 0;
+  return asFavoritesArray(parseEnvelope(safeGet(KEY_FAVORITES)));
 }
 
 function writeFavorites(favorites: FavoriteStation[]): void {
-  const envelope: Envelope<FavoriteStation[]> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: favorites,
-  };
-  safeSet(KEY_FAVORITES, JSON.stringify(envelope));
+  writeEnvelope(KEY_FAVORITES, favorites);
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+// --- Public API -----------------------------------------------------------
 
-/**
- * Read the current settings. Returns defaults (empty key, empty list) if
- * nothing is stored, the schema version doesn't match, or the stored JSON
- * is corrupt. Never throws.
- */
+/** Read the current settings. Returns defaults on missing / corrupt / version-mismatched storage. Never throws. */
 export function loadSettings(): Settings {
-  return {
-    apiKey: readApiKey(),
-    favorites: readFavorites(),
-    sttApiKey: readSttApiKey(),
-    tutorialSeen: readTutorialSeen(),
-    schedule: readSchedule(),
-    voiceTargets: readVoiceTargets(),
-    journeyPlan: readJourneyPlan(),
-    geofenceEnabled: readGeofenceEnabled(),
-  };
+  return { apiKey: readApiKey(), favorites: readFavorites() };
 }
 
-/** Persist the geofence enable flag (WP-G). */
-export function saveGeofenceEnabled(enabled: boolean): void {
-  writeGeofenceEnabled(enabled);
-}
-
-/** Persist the user's saved journey plan. Pass empty strings to clear. */
-export function saveJourneyPlan(plan: JourneyPlan): void {
-  writeJourneyPlan({
-    origin: plan.origin.trim().toUpperCase(),
-    destination: plan.destination.trim().toUpperCase(),
-    transfer: (plan.transfer ?? "").trim().toUpperCase(),
-  });
-}
-
-/** Persist the user's schedule rules. Pass `[]` to clear. */
-export function saveSchedule(rules: ScheduleRule[]): void {
-  writeSchedule(rules);
-}
-
-/**
- * Persist the user's labelled voice-target stations. Pass either
- * field as `""` to clear that label (the corresponding voice keyword
- * will fall through to the fuzzy station match).
- */
-export function saveVoiceTargets(targets: VoiceTargets): void {
-  writeVoiceTargets({
-    home: targets.home.trim(),
-    work: targets.work.trim(),
-  });
-}
-
-/**
- * Mark the first-launch gesture cheat sheet as seen. Called by the
- * Tutorial screen's `onUnmount` exactly once.
- */
-export function markTutorialSeen(): void {
-  const envelope: Envelope<boolean> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: true,
-  };
-  safeSet(KEY_TUTORIAL_SEEN, JSON.stringify(envelope));
-}
-
-/**
- * Persist a new API key. Whitespace is trimmed. Passing `""` is allowed
- * and is the documented way to clear a previously saved key.
- */
+/** Persist a new API key (trimmed). `""` clears it. */
 export function saveApiKey(key: string): void {
-  const trimmed = key.trim();
-  const envelope: Envelope<string> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: trimmed,
-  };
-  safeSet(KEY_API_KEY, JSON.stringify(envelope));
+  writeEnvelope(KEY_API_KEY, key.trim());
 }
 
 /**
- * Persist the Deepgram STT API key. Whitespace is trimmed. Passing
- * `""` is allowed and is the documented "no STT" state — the Voice
- * screen will then fail with a clear error and bounce back to Home,
- * matching the `saveApiKey("")` convention.
- */
-export function saveSttApiKey(key: string): void {
-  const trimmed = key.trim();
-  const envelope: Envelope<string> = {
-    schemaVersion: SCHEMA_VERSION,
-    value: trimmed,
-  };
-  safeSet(KEY_STT_API_KEY, JSON.stringify(envelope));
-}
-
-/**
- * Append a favorite. No-op if a station with the same `code` is already
- * present. Enforces the `MAX_FAVORITES` cap by silently refusing to add
- * once the list is full (this lets the caller compare lengths before/after
- * to detect the cap was hit, without us throwing).
- *
- * Returns the updated list.
+ * Append a favorite. No-op if a station with the same `code` exists or the
+ * list is full (`MAX_FAVORITES`). Returns the updated list.
  */
 export function addFavorite(station: FavoriteStation): FavoriteStation[] {
   const current = readFavorites();
@@ -672,41 +197,18 @@ export function removeFavorite(code: string): FavoriteStation[] {
   return next;
 }
 
-/**
- * Replace the favorites list with a new ordering. Throws if the supplied
- * list exceeds `MAX_FAVORITES`.
- *
- * The caller is trusted: codes that are not currently in storage are
- * accepted and written through as-is. (The settings screen builds this
- * list by reordering the existing array, so a foreign code would only
- * appear if the caller is intentionally seeding favorites — which is
- * a legitimate use, e.g. for an import/restore flow.)
- */
+/** Replace the favorites list with a new ordering. Throws if it exceeds the cap. */
 export function reorderFavorites(newOrder: FavoriteStation[]): FavoriteStation[] {
   if (newOrder.length > MAX_FAVORITES) {
-    throw new Error(
-      `reorderFavorites: ${newOrder.length} entries exceeds MAX_FAVORITES (${MAX_FAVORITES})`,
-    );
+    throw new Error(`reorderFavorites: ${newOrder.length} exceeds MAX_FAVORITES (${MAX_FAVORITES})`);
   }
-  // Defensive copy so external mutations don't change what we wrote.
-  const snapshot = newOrder.map((f) => ({
-    code: f.code,
-    name: f.name,
-    lines: [...f.lines],
-  }));
+  const snapshot = newOrder.map((f) => ({ code: f.code, name: f.name, lines: [...f.lines] }));
   writeFavorites(snapshot);
   return snapshot;
 }
 
-/** Wipe all stored settings. Useful for tests and the "reset" flow. */
+/** Wipe all stored settings. */
 export function clearSettings(): void {
   safeRemove(KEY_API_KEY);
   safeRemove(KEY_FAVORITES);
-  safeRemove(KEY_STT_API_KEY);
-  safeRemove(KEY_TUTORIAL_SEEN);
-  safeRemove(KEY_SCHEDULE);
-  safeRemove(KEY_VOICE_TARGETS);
-  safeRemove(KEY_JOURNEY_PLAN);
-  safeRemove(KEY_GEOFENCE_ENABLED);
-  clearHistory();
 }

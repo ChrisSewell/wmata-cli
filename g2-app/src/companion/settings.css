@@ -1,0 +1,329 @@
+/* Companion settings — Even Realities app design language.
+ *
+ * Official tokens (figma-extract/tokens.md): ER-Black #232323 surface,
+ * Accent-Yellow #FEF991 (the brand primary), Signal-Red #FF453A (errors /
+ * destructive), gray hierarchy #919191 / #7B7B7B. Pill primary action, 12px
+ * cards, FK-Grotesk-scale type (we substitute the system sans — FK Grotesk Neue
+ * isn't licensed here — but match the size/weight/tight-tracking scale).
+ */
+
+:root {
+  --er-black: #232323;
+  --er-surface: #2a2a2a;
+  --er-inset: #1e1e1e;
+  --er-stroke: #383838;
+  --er-white: #ffffff;
+  --er-gray: #919191;
+  --er-gray-2: #7b7b7b;
+  --er-accent: #fef991;
+  --er-accent-press: #f4ec74;
+  --er-red: #ff453a;
+  --er-green: #4bb956;
+}
+
+.wmata-settings {
+  box-sizing: border-box;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 20px 16px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  color: var(--er-white);
+  font: 15px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  letter-spacing: -0.2px;
+  text-align: left;
+  align-items: stretch;
+  width: 100%;
+  min-height: 100%;
+}
+
+.wmata-settings *,
+.wmata-settings *::before,
+.wmata-settings *::after {
+  box-sizing: border-box;
+}
+
+/* Header */
+.wmata-settings__header {
+  padding: 4px 4px 2px;
+}
+.wmata-settings__title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.72px;
+}
+.wmata-settings__tagline {
+  margin: 5px 0 0;
+  font-size: 13px;
+  letter-spacing: -0.13px;
+  color: var(--er-gray);
+}
+
+/* Banner (storage warning) — signal red */
+.wmata-settings__banner {
+  background: rgba(255, 69, 58, 0.1);
+  border: 1px solid rgba(255, 69, 58, 0.4);
+  color: var(--er-red);
+  padding: 11px 14px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* Cards */
+.wmata-settings__card {
+  background: var(--er-surface);
+  border: 1px solid var(--er-stroke);
+  border-radius: 12px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+.wmata-settings__card[aria-disabled="true"] {
+  opacity: 0.5;
+  pointer-events: none;
+}
+.wmata-settings__card-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+}
+.wmata-settings__card-help {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: -0.13px;
+  color: var(--er-gray);
+}
+
+/* Forms */
+.wmata-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.wmata-settings__label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--er-gray-2);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.wmata-settings__input-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.wmata-settings__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--er-inset);
+  border: 1px solid var(--er-stroke);
+  color: var(--er-white);
+  border-radius: 10px;
+  padding: 13px 14px;
+  font-size: 16px; /* 16px stops iOS Safari from auto-zooming on focus */
+  font-family: inherit;
+  letter-spacing: -0.2px;
+  outline: none;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.wmata-settings__input::placeholder {
+  color: #6a6a6a;
+}
+.wmata-settings__input:focus {
+  border-color: var(--er-accent);
+  box-shadow: 0 0 0 3px rgba(254, 249, 145, 0.18);
+}
+.wmata-settings__button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Buttons — pill primary, ≥44px tap target */
+.wmata-settings__button {
+  background: transparent;
+  border: 1px solid var(--er-stroke);
+  color: var(--er-white);
+  border-radius: 999px;
+  padding: 11px 18px;
+  min-height: 44px;
+  font: inherit;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background-color 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+.wmata-settings__button:active:not(:disabled) {
+  opacity: 0.7;
+}
+.wmata-settings__button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.wmata-settings__button--primary {
+  background: var(--er-accent);
+  border-color: var(--er-accent);
+  color: var(--er-black);
+}
+.wmata-settings__button--primary:hover:not(:disabled) {
+  background: var(--er-accent-press);
+  border-color: var(--er-accent-press);
+}
+.wmata-settings__button--ghost {
+  background: transparent;
+  border-color: #4a4a4a;
+  color: var(--er-white);
+}
+.wmata-settings__button--ghost:hover:not(:disabled) {
+  border-color: #6a6a6a;
+}
+.wmata-settings__button--small {
+  min-height: 38px;
+  padding: 8px 14px;
+  font-size: 13px;
+}
+.wmata-settings__button--icon {
+  min-width: 38px;
+  min-height: 38px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+}
+.wmata-settings__button--danger {
+  color: var(--er-red);
+  border-color: rgba(255, 69, 58, 0.4);
+  background: transparent;
+}
+.wmata-settings__button--danger:hover:not(:disabled) {
+  border-color: var(--er-red);
+}
+
+/* Validation status */
+.wmata-settings__status {
+  font-size: 13px;
+  letter-spacing: -0.13px;
+  min-height: 18px;
+}
+.wmata-settings__status--ok {
+  color: var(--er-green);
+}
+.wmata-settings__status--bad {
+  color: var(--er-red);
+}
+.wmata-settings__status--info {
+  color: var(--er-gray);
+}
+
+/* Station rows (search results + favorites) */
+.wmata-settings__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.wmata-settings__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 13px;
+  background: var(--er-inset);
+  border: 1px solid var(--er-stroke);
+  border-radius: 12px;
+}
+.wmata-settings__row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.wmata-settings__row-name {
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wmata-settings__row-meta {
+  font-size: 12px;
+  color: var(--er-gray);
+}
+.wmata-settings__row-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--er-gray-2);
+}
+.wmata-settings__row-actions {
+  display: flex;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.wmata-settings__empty {
+  font-size: 13px;
+  color: var(--er-gray);
+  font-style: italic;
+  padding: 6px 4px;
+}
+
+/* Toast */
+.wmata-settings__toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  background: var(--er-inset);
+  border: 1px solid rgba(255, 69, 58, 0.5);
+  color: var(--er-red);
+  padding: 11px 16px;
+  border-radius: 12px;
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 1000;
+  pointer-events: none;
+}
+
+/* Live-on-glasses confirmation — accent-tinted */
+.wmata-settings__done-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 6px;
+}
+@keyframes wmata-settings-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(254, 249, 145, 0.4);
+  }
+  60% {
+    box-shadow: 0 0 0 10px rgba(254, 249, 145, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(254, 249, 145, 0);
+  }
+}
+.wmata-settings__live {
+  text-align: center;
+  padding: 11px 14px;
+  border-radius: 12px;
+  background: rgba(254, 249, 145, 0.1);
+  border: 1px solid rgba(254, 249, 145, 0.35);
+  color: var(--er-accent);
+  font-weight: 500;
+}
+.wmata-settings__live--attention {
+  animation: wmata-settings-pulse 1.4s ease-out 2;
+}
+
+/* Footer */
+.wmata-settings__footer {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 8px;
+}

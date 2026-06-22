@@ -9,3 +9,4 @@ env/
 dist/
 build/
 .pytest_cache/
+logs/

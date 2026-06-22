@@ -1,27 +1,20 @@
 // Bridge-backed durable persistence for settings.
 //
-// The Even Hub SDK warns that WebView `window.localStorage` "may be
-// cleared on app restart" — only `bridge.getLocalStorage` /
-// `bridge.setLocalStorage` reliably persist across the packed app being
-// closed and reopened (the same pattern the FlightAware_G2 app uses).
+// WebView `localStorage` "may be cleared on app restart" (Even Hub SDK); only
+// `bridge.getLocalStorage` / `bridge.setLocalStorage` reliably persist across
+// the packed app closing and reopening. Rather than make `storage/settings.ts`
+// async, we keep `localStorage` as the fast working copy and bolt a thin sync
+// layer onto the boundaries:
 //
-// Rather than rewrite the (synchronous, SDK-free, heavily-tested)
-// `storage/settings.ts` into an async API, we keep `localStorage` as the
-// fast working copy and bolt a thin sync layer onto the boundaries:
+//   - `hydrateSettingsFromBridge` runs ONCE at boot (before anything reads
+//     settings): copies every persisted key from the durable store into
+//     localStorage, repopulating a freshly-cleared WebView.
+//   - `mirrorToBridge` is wired via `setStorageMirror` so every settings write
+//     echoes to the durable store.
 //
-//   - `hydrateSettingsFromBridge(bridge)` runs ONCE at boot, before
-//     anything reads settings: it copies every persisted key from the
-//     durable bridge store into `localStorage`, so a fresh WebView
-//     (whose `localStorage` was cleared) is repopulated from the store.
-//   - `setStorageMirror` (in settings.ts) is wired to `mirrorToBridge`
-//     so every subsequent settings write is echoed to the bridge store.
-//
-// Net effect: the bridge store is the cross-session source of truth;
-// `localStorage` is a per-session cache rehydrated from it on launch.
-//
-// All bridge calls are wrapped in a short timeout and swallow errors —
-// a slow or missing bridge degrades to "localStorage only" rather than
-// blocking the boot path.
+// All bridge calls are timeout-wrapped and swallow errors — a slow/missing
+// bridge degrades to "localStorage only" rather than blocking boot. This is
+// what passes the 5-minute locked-phone test.
 
 import type { EvenAppBridge } from "@evenrealities/even_hub_sdk";
 
@@ -30,15 +23,9 @@ import { STORAGE_KEYS } from "./settings";
 /** Only the storage methods are needed; accept anything bridge-shaped. */
 type StorageBridge = Pick<EvenAppBridge, "getLocalStorage" | "setLocalStorage">;
 
-/** Max wait for any single bridge storage call before giving up. */
 const BRIDGE_STORAGE_TIMEOUT_MS = 2_000;
 
-/**
- * Reject `p` if it hasn't settled within `ms`. Unlike a naive
- * `Promise.race([p, timeout])`, this clears the timer as soon as `p`
- * settles, so a fast bridge call doesn't leave a dangling 2s timeout
- * firing later (these run per-key at boot and on every settings write).
- */
+/** Reject if `p` hasn't settled within `ms`, clearing the timer on settle. */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -66,56 +53,37 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 /**
  * Copy every persisted settings key from the durable bridge store into
- * `localStorage`. Run once at boot, before `loadSettings()` /
- * `mountSettingsScreen` / `bootGlasses` read anything.
- *
- * A bridge value of `""` (the store's "unset") is skipped so we never
- * stomp a present `localStorage` value with an empty one. All keys are
- * fetched in parallel; an individual key that errors or times out is
- * silently skipped (that key just falls back to whatever `localStorage`
- * already holds, or defaults).
+ * `localStorage`. Run once at boot, before anything reads settings. A bridge
+ * value of `""` (the store's "unset") is skipped so we never stomp a present
+ * localStorage value. Keys fetched in parallel; an erroring/timed-out key is
+ * silently skipped.
  */
-export async function hydrateSettingsFromBridge(
-  bridge: StorageBridge,
-): Promise<void> {
+export async function hydrateSettingsFromBridge(bridge: StorageBridge): Promise<void> {
   await Promise.all(
     STORAGE_KEYS.map(async (key) => {
       try {
-        const value = await withTimeout(
-          bridge.getLocalStorage(key),
-          BRIDGE_STORAGE_TIMEOUT_MS,
-        );
+        const value = await withTimeout(bridge.getLocalStorage(key), BRIDGE_STORAGE_TIMEOUT_MS);
         if (typeof value === "string" && value.length > 0) {
           try {
             localStorage.setItem(key, value);
           } catch {
-            // localStorage unavailable (private mode / sandbox) — the
-            // in-memory defaults path in settings.ts handles this.
+            // localStorage unavailable — settings.ts defaults path handles it.
           }
         }
       } catch {
-        // Bridge read failed/timed out for this key — leave localStorage
-        // (or defaults) in place.
+        // Bridge read failed/timed out — leave localStorage (or defaults).
       }
     }),
   );
 }
 
 /**
- * Mirror a single settings write to the durable bridge store. Wired into
- * `settings.ts` via `setStorageMirror`. Best-effort and fire-and-forget:
- * the caller does not await it, and any failure is swallowed (the
- * `localStorage` working copy already holds the value for this session).
+ * Mirror a single settings write to the durable bridge store. Best-effort and
+ * fire-and-forget — the localStorage working copy already holds the value for
+ * this session.
  */
-export function mirrorToBridge(
-  bridge: StorageBridge,
-  key: string,
-  value: string,
-): void {
-  void withTimeout(
-    bridge.setLocalStorage(key, value),
-    BRIDGE_STORAGE_TIMEOUT_MS,
-  ).catch(() => {
+export function mirrorToBridge(bridge: StorageBridge, key: string, value: string): void {
+  void withTimeout(bridge.setLocalStorage(key, value), BRIDGE_STORAGE_TIMEOUT_MS).catch(() => {
     // ignore — durable mirror is best-effort
   });
 }
