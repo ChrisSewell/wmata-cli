@@ -1,0 +1,290 @@
+/* Scoped styles for the companion settings screen. Namespaced under
+ * .wmata-settings so the screen can drop into any host page. The host
+ * index.html sets the dark background + light text at the body level. */
+
+.wmata-settings {
+  box-sizing: border-box;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  color: #e5e5e5;
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  text-align: left;
+  align-items: stretch;
+  justify-content: flex-start;
+  width: 100%;
+  min-height: 100%;
+  overflow-y: auto;
+}
+
+.wmata-settings *,
+.wmata-settings *::before,
+.wmata-settings *::after {
+  box-sizing: border-box;
+}
+
+/* Header */
+.wmata-settings__header {
+  padding: 8px 4px 0;
+}
+.wmata-settings__title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.wmata-settings__tagline {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: #9a9a9a;
+}
+
+/* Banner */
+.wmata-settings__banner {
+  background: #3a3320;
+  border: 1px solid #6b5a1f;
+  color: #f4d88a;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+/* Cards */
+.wmata-settings__card {
+  background: #2c2c2c;
+  border: 1px solid #3a3a3a;
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.wmata-settings__card[aria-disabled="true"] {
+  opacity: 0.55;
+  pointer-events: none;
+}
+.wmata-settings__card-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+.wmata-settings__card-help {
+  margin: 0;
+  font-size: 12px;
+  color: #9a9a9a;
+}
+
+/* Forms */
+.wmata-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wmata-settings__label {
+  font-size: 12px;
+  color: #b5b5b5;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.wmata-settings__input-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.wmata-settings__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: #1b1b1b;
+  border: 1px solid #444;
+  color: #e5e5e5;
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 16px; /* 16px keeps iOS Safari from auto-zooming on focus. */
+  font-family: inherit;
+  outline: none;
+}
+.wmata-settings__input:focus {
+  border-color: #7aa8ff;
+  box-shadow: 0 0 0 2px rgba(122, 168, 255, 0.25);
+}
+.wmata-settings__button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Buttons — large tap targets (44px min on mobile). */
+.wmata-settings__button {
+  background: #3a3a3a;
+  border: 1px solid #4a4a4a;
+  color: #e5e5e5;
+  border-radius: 8px;
+  padding: 10px 14px;
+  min-height: 44px;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.wmata-settings__button:hover:not(:disabled) {
+  background: #444;
+}
+.wmata-settings__button:active:not(:disabled) {
+  background: #2e2e2e;
+}
+.wmata-settings__button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.wmata-settings__button--primary {
+  background: #2c5bd0;
+  border-color: #2c5bd0;
+}
+.wmata-settings__button--primary:hover:not(:disabled) {
+  background: #3a6ce0;
+}
+.wmata-settings__button--primary:active:not(:disabled) {
+  background: #244bb0;
+}
+.wmata-settings__button--ghost {
+  background: transparent;
+  border-color: #444;
+}
+.wmata-settings__button--small {
+  min-height: 36px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.wmata-settings__button--icon {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 6px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+}
+.wmata-settings__button--danger {
+  color: #ff8888;
+  border-color: #5a2828;
+  background: transparent;
+}
+
+/* Validation status */
+.wmata-settings__status {
+  font-size: 13px;
+  min-height: 18px;
+}
+.wmata-settings__status--ok {
+  color: #67d08a;
+}
+.wmata-settings__status--bad {
+  color: #ff7a7a;
+}
+.wmata-settings__status--info {
+  color: #b5b5b5;
+}
+
+/* Station rows (search results + favorites list) */
+.wmata-settings__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wmata-settings__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #1f1f1f;
+  border: 1px solid #333;
+  border-radius: 8px;
+}
+.wmata-settings__row-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.wmata-settings__row-name {
+  font-size: 14px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wmata-settings__row-meta {
+  font-size: 12px;
+  color: #9a9a9a;
+}
+.wmata-settings__row-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #b5b5b5;
+}
+.wmata-settings__row-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.wmata-settings__empty {
+  font-size: 13px;
+  color: #9a9a9a;
+  font-style: italic;
+  padding: 6px 4px;
+}
+
+/* Toast */
+.wmata-settings__toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  background: #1b1b1b;
+  border: 1px solid #5a2828;
+  color: #ff8888;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  z-index: 1000;
+  pointer-events: none;
+}
+
+/* Live-on-glasses confirmation */
+.wmata-settings__done-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 8px;
+}
+@keyframes wmata-settings-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(122, 168, 255, 0.45);
+  }
+  50% {
+    box-shadow: 0 0 0 10px rgba(122, 168, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(122, 168, 255, 0);
+  }
+}
+.wmata-settings__live {
+  text-align: center;
+  padding: 10px 14px;
+  border-radius: 8px;
+}
+.wmata-settings__live--attention {
+  animation: wmata-settings-pulse 1.4s ease-out 2;
+}
+
+/* Footer */
+.wmata-settings__footer {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 24px;
+}

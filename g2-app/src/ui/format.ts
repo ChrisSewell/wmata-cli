@@ -1,98 +1,38 @@
-// Field-level formatters that turn WMATA wire values into glanceable
-// strings for the G2 HUD. Pure functions; no SDK, no I/O.
-//
-// These are the TypeScript counterparts to wmata/utils/formatting.py
-// `format_min` and similar helpers used by rail_predictions.py. The
-// glasses surface has even tighter width constraints than the CLI, so
-// `abbreviateStation` is also defined here.
-//
-// Abbreviation length budget (per WP6 Reviewer):
-//
-//   Every value in `STATION_ABBREVIATIONS` must be ≤ NAME_WIDTH (10)
-//   columns. Anything longer is invisibly truncated with `…` at render
-//   time, which defeats the purpose of having a hand-tuned abbreviation.
-//   The fix-up pass shortened these entries:
-//
-//     "Federal Triangle"  "Fed Triangle" (12) -> "Fed Tri"    (7)
-//     "Morgan Boulevard"  "Morgan Blvd"  (11) -> "Morgan Bv"  (9)
-//     "Virginia Sq-GMU"   "Virginia Sq"  (11) -> "Virgnia Sq" (10)
-//     "Eastern Market"    "Eastern Mkt"  (11) -> "Eastern Mk" (10)
-//     "Smithsonian"       "Smithsonian"  (11) -> "Smithson"   (8)
-//
-//   The "Federal Center SW" entry was left as "Fed Center" (10) because
-//   it already fits within budget. A guard test in `format.test.ts`
-//   asserts the ≤ 10-char invariant so future entries can't drift.
+// Field-level formatters: WMATA wire values → glanceable HUD strings. Pure, no
+// SDK/DOM. Where width matters, fit decisions use pixel measurement
+// (`./measure`), never character counts.
 
-import type { LineCode } from "../wmata";
-import { ELLIPSIS, truncate } from "./render";
+import { truncateToPx } from "./measure";
 
 /**
- * Map a WMATA `Min` string to its glasses-ready form.
- *
- *   ""    -> "—"     (no data)
- *   "---" -> "—"     (no prediction)
- *   "ARR" -> "ARR"
- *   "BRD" -> "BRD"
- *   "1"   -> "1 min"
- *   "12"  -> "12 min"
- *   else  -> the raw value (defensive — WMATA has surprised us before)
+ * Format a soonest-train `Min` token for the value column:
+ *   null / "" / "---" → ""        (no value — blank cell, kept aligned)
+ *   "ARR" / "BRD"     → verbatim
+ *   numeric           → "N min"
  */
-export function formatEta(min: string): string {
-  if (min === "" || min === "---") return "—";
+export function formatEtaValue(min: string | null): string {
+  if (min === null || min === "" || min === "---") return "";
   if (min === "ARR" || min === "BRD") return min;
   if (/^\d+$/.test(min)) return `${min} min`;
-  return min;
+  return "";
 }
 
-/**
- * Format an epoch-millis wall clock as a 12-hour HUD label. Always
- * exactly 6 chars: 2-char hour (space-padded), ":", 2-char minute, and
- * a 1-char `a`/`p` suffix — e.g. " 2:32p", "12:05a". An invalid /
- * non-positive input renders " --:--" (also 6 chars) so the clock cell
- * stays a fixed width.
- *
- * This is the single source of truth for the HUD clock. The host
- * (`glasses-host.ts`) renders it into a dedicated top-right clock
- * container on every screen; screens no longer embed the clock in their
- * header string. The 12-hour convention matches `formatEta` and the
- * predictions/journey time labels.
- */
+/** 12-hour wall clock, e.g. "2:32p" / "12:05a". Invalid input → "--:--". */
 export function formatClock(epochMs: number): string {
-  if (!Number.isFinite(epochMs) || epochMs <= 0) return " --:--";
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return "--:--";
   const d = new Date(epochMs);
   const h24 = d.getHours();
   const h12 = h24 === 0 ? 12 : h24 > 12 ? h24 - 12 : h24;
-  const hh = String(h12).padStart(2, " ");
   const mm = String(d.getMinutes()).padStart(2, "0");
-  const ap = h24 < 12 ? "a" : "p";
-  return `${hh}:${mm}${ap}`;
+  return `${h12}:${mm}${h24 < 12 ? "a" : "p"}`;
 }
 
-/**
- * Render a line code as a fixed-width 2-character glyph. Unknown,
- * blank, or non-revenue line codes collapse to `--` so the column stays
- * aligned in a `row(...)` composition.
- */
+/** 2-char line code, or `--` for unknown/non-revenue. */
 export function lineGlyph(line: string): string {
-  const known: ReadonlySet<LineCode> = new Set<LineCode>([
-    "RD",
-    "BL",
-    "YL",
-    "OR",
-    "GR",
-    "SV",
-  ]);
-  if (known.has(line as LineCode)) return line;
-  return "--";
+  return new Set(["RD", "BL", "YL", "OR", "GR", "SV"]).has(line) ? line : "--";
 }
 
-/**
- * Map a WMATA line code (`RD` / `BL` / …) to its spelled-out
- * line name (`RED` / `BLUE` / …). Used wherever the glasses panel
- * has room for the full word — which, at LINE_WIDTH≥48, is most
- * places. Unknown codes collapse to the original input (so the
- * caller can fall back to truncation rather than getting "--").
- */
+/** Spelled-out line name (`RD` → `RED`); unknown codes pass through. */
 export function lineName(line: string): string {
   switch (line) {
     case "RD":
@@ -112,173 +52,85 @@ export function lineName(line: string): string {
   }
 }
 
-/**
- * Hand-tuned abbreviations for stations whose canonical names overflow
- * any reasonable column budget on the glasses. Exact-string match only.
- * The map is the first lookup; truncation (via `truncate`) is the
- * fallback.
- *
- * Keep entries short enough to fit the *narrowest* expected column —
- * roughly 10-12 columns for the next-train list — but otherwise we let
- * `abbreviateStation`'s caller decide the column width.
- */
+/** Hand-tuned short forms for stations whose names overflow tight columns. */
 export const STATION_ABBREVIATIONS: Record<string, string> = {
   "L'Enfant Plaza": "L'Enfant",
-  "Branch Ave": "Branch",
   "Largo Town Center": "Largo TC",
   "Vienna/Fairfax-GMU": "Vienna",
   "West Falls Church-VT/UVA": "W Falls Ch",
   "East Falls Church": "E Falls Ch",
-  "Franconia-Springfield": "Franc-Spr",
-  "New Carrollton": "New Carr",
+  "Franconia-Springfield": "Franconia",
+  "New Carrollton": "New Carrollton",
   "Gallery Pl-Chinatown": "Gallery Pl",
-  "Mt Vernon Sq 7th St-Convention Center": "Mt Vernon",
+  "Mt Vernon Sq 7th St-Convention Center": "Mt Vernon Sq",
   "U Street/African-Amer Civil War Memorial/Cardozo": "U Street",
-  "Dupont Circle": "Dupont",
-  "Foggy Bottom-GWU": "Foggy Btm",
-  "Federal Triangle": "Fed Tri",
-  "Federal Center SW": "Fed Center",
-  "Capitol South": "Capitol S",
-  "Eastern Market": "Eastern Mk",
-  "Stadium-Armory": "Stadium",
-  Smithsonian: "Smithson",
-  "McPherson Sq": "McPherson",
-  "Metro Center": "Metro Ctr",
-  "Judiciary Sq": "Judiciary",
+  "Foggy Bottom-GWU": "Foggy Bottom",
+  "Federal Triangle": "Fed Triangle",
+  "Federal Center SW": "Fed Center SW",
+  "Eastern Market": "Eastern Mkt",
+  "Metro Center": "Metro Center",
   "Union Station": "Union Stn",
-  "Rhode Island Ave-Brentwood": "Rhode Is",
-  "Brookland-CUA": "Brookland",
-  "Fort Totten": "Ft Totten",
-  Takoma: "Takoma",
-  "Silver Spring": "Silver Spr",
-  "Forest Glen": "Forest Gln",
-  Wheaton: "Wheaton",
-  Glenmont: "Glenmont",
-  "Shady Grove": "Shady Grv",
-  Rockville: "Rockville",
-  Twinbrook: "Twinbrook",
-  "White Flint": "White Flnt",
+  "Rhode Island Ave-Brentwood": "Rhode Island",
+  "Fort Totten": "Fort Totten",
+  "Silver Spring": "Silver Spring",
+  "Shady Grove": "Shady Grove",
   "Grosvenor-Strathmore": "Grosvenor",
-  "Medical Center": "Med Ctr",
-  Bethesda: "Bethesda",
-  "Friendship Heights": "Friend Hts",
+  "Medical Center": "Medical Ctr",
+  "Friendship Heights": "Friendship Hts",
   "Tenleytown-AU": "Tenleytown",
   "Van Ness-UDC": "Van Ness",
-  "Cleveland Park": "Cleveland",
-  "Woodley Park-Zoo/Adams Morgan": "Woodley Pk",
-  "Wiehle-Reston East": "Wiehle",
-  "Spring Hill": "Spring Hl",
-  Greensboro: "Greensboro",
+  "Woodley Park-Zoo/Adams Morgan": "Woodley Park",
+  "Wiehle-Reston East": "Wiehle-Reston",
   "Tysons Corner": "Tysons",
-  McLean: "McLean",
-  "Court House": "Court Hse",
-  Clarendon: "Clarendon",
-  "Virginia Sq-GMU": "Virgnia Sq",
+  "Court House": "Court House",
+  "Virginia Sq-GMU": "Virginia Sq",
   "Ballston-MU": "Ballston",
-  Rosslyn: "Rosslyn",
-  "Arlington Cemetery": "Arlington",
-  Pentagon: "Pentagon",
-  "Pentagon City": "Pentagon C",
-  "Crystal City": "Crystal C",
-  "Ronald Reagan Washington National Airport": "DCA",
-  "Braddock Rd": "Braddock",
+  "Arlington Cemetery": "Arlington Cem",
+  "Pentagon City": "Pentagon City",
+  "Crystal City": "Crystal City",
+  "Ronald Reagan Washington National Airport": "Reagan Airport",
   "King St-Old Town": "King St",
   "Eisenhower Ave": "Eisenhower",
-  Huntington: "Huntington",
   "Van Dorn St": "Van Dorn",
-  Suitland: "Suitland",
-  "Naylor Rd": "Naylor",
-  "Southern Ave": "Southern",
-  "Congress Heights": "Congress H",
-  Anacostia: "Anacostia",
+  "Naylor Rd": "Naylor Rd",
+  "Southern Ave": "Southern Ave",
+  "Congress Heights": "Congress Hts",
   "Navy Yard-Ballpark": "Navy Yard",
-  Waterfront: "Waterfront",
   "Archives-Navy Memorial-Penn Quarter": "Archives",
-  Cheverly: "Cheverly",
-  Landover: "Landover",
-  Deanwood: "Deanwood",
   "Minnesota Ave": "Minnesota",
-  "Benning Rd": "Benning",
-  "Capitol Heights": "Capitol H",
+  "Capitol Heights": "Capitol Hts",
   "Addison Rd-Seat Pleasant": "Addison Rd",
-  "Morgan Boulevard": "Morgan Bv",
-  Greenbelt: "Greenbelt",
-  "College Park-U of Md": "College Pk",
-  "Prince George's Plaza": "Prince Geo",
-  "West Hyattsville": "W Hyatts",
+  "Morgan Boulevard": "Morgan Blvd",
+  "College Park-U of Md": "College Park",
+  "Prince George's Plaza": "Prince George's",
+  "West Hyattsville": "W Hyattsville",
   "NoMa-Gallaudet U": "NoMa",
-  "Shaw-Howard U": "Shaw",
-  "Columbia Heights": "Columbia H",
-  Petworth: "Petworth",
-  "Georgia Ave-Petworth": "Georgia Av",
+  "Shaw-Howard U": "Shaw-Howard",
+  "Columbia Heights": "Columbia Hts",
+  "Georgia Ave-Petworth": "Georgia Ave",
 };
 
 /**
- * Abbreviate a station name to fit `maxLen` columns.
- *
- * Strategy:
- *   1. If the canonical name fits, return it unchanged.
- *   2. If the name has a hand-tuned abbreviation that fits, use it.
- *   3. Otherwise, truncate with an ellipsis.
- *
- * The map is consulted whether or not the canonical name fits, because
- * a known short form is almost always more readable than a truncated
- * long one (e.g., "Vienna" beats "Vienna/Fai…" at 11 cols).
+ * Fit a station name into a pixel budget: return it if it fits; else the
+ * hand-tuned short form if THAT fits; else a pixel-truncated form (preferring
+ * the short form as the truncation source — less information lost).
  */
-export function abbreviateStation(name: string, maxLen: number): string {
-  if (!name) return "";
-  if (maxLen <= 0) return "";
+export function abbreviateStation(name: string, maxPx: number): string {
+  if (!name || maxPx <= 0) return "";
+  if (truncateToPx(name, maxPx) === name) return name; // fits whole
   const abbr = STATION_ABBREVIATIONS[name];
-  // Prefer the canonical name when it already fits AND there's no
-  // shorter abbrev that would be tidier. Practically: if the abbrev
-  // fits, use it for names longer than maxLen; otherwise keep the full
-  // name.
-  if (name.length <= maxLen) return name;
-  if (abbr && abbr.length <= maxLen) return abbr;
-  // Fall back to truncation. If even the abbrev is too long, prefer
-  // truncating the abbrev (shorter source = less information loss).
-  const source = abbr ?? name;
-  return source.length <= maxLen ? source : truncate(source, maxLen);
+  if (abbr && truncateToPx(abbr, maxPx) === abbr) return abbr; // short form fits
+  return truncateToPx(abbr ?? name, maxPx);
 }
 
-/**
- * Title-case a strict-uppercase string. Used to normalise WMATA's
- * all-caps destination strings ("SHADY GROVE") into readable Title
- * Case ("Shady Grove") without mangling mixed-case input.
- *
- * Behaviour:
- *   - Input containing any lowercase letter is returned unchanged —
- *     "Vienna/Fairfax-GMU", "Foggy Bottom-GWU", "L'Enfant Plaza" all
- *     pass through verbatim. This is the typical case for the
- *     `DestinationName` field.
- *   - Input that is entirely uppercase (or has no letters at all)
- *     gets first-letter-of-each-word capitalisation — "SHADY
- *     GROVE" → "Shady Grove".
- *   - Word boundaries are whitespace only; in-word punctuation like
- *     `-` and `/` is preserved (so "WIEHLE-RESTON EAST" becomes
- *     "Wiehle-reston East" — the inner-token capitalisation is
- *     left to the caller / fixture data).
- *   - Empty or null-ish input returns "".
- */
+/** Title-case a strict-uppercase string ("SHADY GROVE" → "Shady Grove"); pass
+ *  through anything already mixed-case, and short codes/hyphenated tokens. */
 export function toTitleCase(text: string): string {
   if (!text) return "";
-  // Already has lowercase → trust the source casing and pass through.
   if (/[a-z]/.test(text)) return text;
-  // A single all-caps token that's either short (≤3 chars) or
-  // contains a hyphen reads as a status code or abbreviation
-  // ("VN", "ARR", "T-BRD"). Preserve verbatim.
-  if (!/\s/.test(text) && (text.length <= 3 || text.includes("-"))) {
-    return text;
-  }
+  if (!/\s/.test(text) && (text.length <= 3 || text.includes("-"))) return text;
   return text
     .split(/(\s+)/)
-    .map((token) => {
-      if (token.length === 0 || /^\s+$/.test(token)) return token;
-      return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase();
-    })
+    .map((tok) => (tok.length === 0 || /^\s+$/.test(tok) ? tok : tok[0]!.toUpperCase() + tok.slice(1).toLowerCase()))
     .join("");
 }
-
-// Re-export ELLIPSIS so screens can match the rendering layer without a
-// second import.
-export { ELLIPSIS };
