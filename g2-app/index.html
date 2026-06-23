@@ -5,14 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
     <title>WMATA Transit</title>
     <style>
-      html, body {
-        margin: 0;
+      /* ER brand dark-theme surface (#232323) + Neutral-200 text (#E5E5E5). */
+      html {
         height: 100%;
-        /* ER brand dark-theme surface (#232323) + Neutral-200 text (#E5E5E5). */
+        background: #232323;
+      }
+      body {
+        margin: 0;
+        /* min-height (NOT height:100%) so the page GROWS with its content and
+         * the normal document scroller works. A viewport-height-locked body
+         * can't be scrolled in iOS WKWebView — which left the companion stuck,
+         * unable to scroll once content overflowed (notably right after the
+         * soft keyboard dismissed). */
+        min-height: 100%;
         background: #232323;
         color: #E5E5E5;
         font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-        /* Kill WebView zoom + iOS auto-sizing + rubber-band scroll. */
+        /* Kill WebView double-tap zoom + iOS text auto-sizing + scroll-chaining
+         * rubber-band — none of which block in-page scrolling. */
         touch-action: manipulation;
         -webkit-text-size-adjust: 100%;
         overscroll-behavior: none;
