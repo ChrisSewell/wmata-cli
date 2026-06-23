@@ -64,18 +64,15 @@ export async function buildScreen(
         HOME_TICK_MS,
       );
     case "predictions": {
-      let name = intent.stationCode;
-      try {
-        const station = await session.resolveStationCode(intent.stationCode);
-        if (station) name = station.Name;
-      } catch (err) {
-        console.warn(`[wiring] resolveStationCode(${intent.stationCode}) failed:`, err);
-      }
+      // The station name rides in the intent (the favorite already has it), so
+      // we mount synchronously — no pre-mount network fetch. That pre-mount
+      // `await` was a race window: a stray click could land on the newly-
+      // mounted screen and bounce it straight back.
       const fetcher = async () => {
         const data = await session.client.get<PredictionsResponse>(buildRailPredictionsUrl(intent.stationCode));
         return { trains: data.Trains ?? [], fetchedAt: Date.now(), fetchError: null };
       };
-      return makePredictionsScreen(fetcher, makeInitialPredictionsSnapshot(intent.stationCode, name));
+      return makePredictionsScreen(fetcher, makeInitialPredictionsSnapshot(intent.stationCode, intent.stationName));
     }
     case "alerts": {
       const fetcher = async () => {

@@ -28,7 +28,7 @@ export function initialNav(): NavState {
 /** Where the user is heading next; the host maps each to a mount/unmount. */
 export type NavIntent =
   | { to: "home" }
-  | { to: "predictions"; stationCode: string }
+  | { to: "predictions"; stationCode: string; stationName: string }
   | { to: "alerts" }
   | { to: "alertDetail"; index: number }
   | { to: "unconfigured" }

@@ -89,7 +89,10 @@ export function makeHomeScreen(
           if (idx === n - 1) return { nav: { selectedIndex: idx }, navigate: { to: "alerts" } };
           const fav = s.favorites[idx];
           return fav
-            ? { nav: { selectedIndex: idx }, navigate: { to: "predictions", stationCode: fav.code } }
+            ? {
+                nav: { selectedIndex: idx },
+                navigate: { to: "predictions", stationCode: fav.code, stationName: fav.name },
+              }
             : { nav: { selectedIndex: idx } };
         }
         case "DOUBLE_TAP":

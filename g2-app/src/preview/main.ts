@@ -88,7 +88,6 @@ const OUTAGES: ElevatorIncident[] = [
   },
 ];
 const ALERT_ITEMS = buildAlertItems(INCIDENTS, OUTAGES);
-const stationName = (code: string): string => FAVORITES.find((f) => f.code === code)?.name ?? code;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function fixtureScreen(intent: NavIntent): Screen<any> | null {
@@ -98,7 +97,7 @@ function fixtureScreen(intent: NavIntent): Screen<any> | null {
     case "predictions":
       return makePredictionsScreen(
         async () => ({ trains: FIXTURE_TRAINS, fetchedAt: Date.now(), fetchError: null }),
-        makeInitialPredictionsSnapshot(intent.stationCode, stationName(intent.stationCode)),
+        makeInitialPredictionsSnapshot(intent.stationCode, intent.stationName),
       );
     case "alerts":
       return makeAlertsScreen(async () => ({ items: ALERT_ITEMS, fetchedAt: Date.now(), fetchError: null }), makeInitialAlertsSnapshot());

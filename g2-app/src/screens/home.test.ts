@@ -36,9 +36,9 @@ describe("home reduce", () => {
     expect(screen.reduce(snap(), { selectedIndex: 2 }, { type: "SCROLL_DOWN" }).nav.selectedIndex).toBe(2);
   });
 
-  it("opens predictions for a tapped favorite", () => {
+  it("opens predictions for a tapped favorite (carrying its name)", () => {
     const r = screen.reduce(snap(), { selectedIndex: 0 }, { type: "TAP" });
-    expect(r.navigate).toEqual({ to: "predictions", stationCode: "A01" });
+    expect(r.navigate).toEqual({ to: "predictions", stationCode: "A01", stationName: "Metro Center" });
   });
 
   it("opens alerts when the alerts row is tapped", () => {

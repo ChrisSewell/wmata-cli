@@ -52,6 +52,12 @@ const ID_HINT = 5;
 const ID_ACCENT = 6; // hero screens only — the one image accent
 
 const CLOCK_TICK_MS = 1000;
+// Ignore gestures for a beat right after a screen mounts. A navigation
+// unsubscribes the old screen and (a)synchronously mounts + subscribes the new
+// one; the simulator/firmware can route the still-pending click to whichever
+// container just became the active capturer, which would otherwise bounce the
+// new screen straight back. Imperceptible after a deliberate navigation.
+const INPUT_COOLDOWN_MS = 250;
 
 // --- Event normalization (exported for tests) -----------------------------
 
@@ -185,6 +191,7 @@ export async function mountGlassesScreen<S>(
   let nav: NavState = initialNav();
   let active = true;
   let hintsVisible = true;
+  let mountedAtMs = 0; // set when the event subscription goes live
 
   const hero = screen.hero === true;
   const rects = pageRects();
@@ -402,6 +409,7 @@ export async function mountGlassesScreen<S>(
     if (result.requestTick) void runTick();
   };
 
+  mountedAtMs = Date.now();
   const unsubscribe = bridge.onEvenHubEvent((event: EvenHubEvent) => {
     if (!active) return;
     const lifecycle = lifecycleEvent(event);
@@ -427,7 +435,10 @@ export async function mountGlassesScreen<S>(
       return;
     }
     const gesture = eventToScreenEvent(event);
-    if (gesture) dispatch(gesture);
+    if (!gesture) return;
+    // Swallow a stray input that lands in the mount cooldown (see above).
+    if (Date.now() - mountedAtMs < INPUT_COOLDOWN_MS) return;
+    dispatch(gesture);
   });
 
   if (fetchEnabled) void runTick();
