@@ -6,6 +6,7 @@ dist/
 .DS_Store
 .sim-shots/
 src-legacy/
+glasses_*.png
 .env
 .env.local
 .env*.local
