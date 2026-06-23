@@ -1,8 +1,17 @@
 /// <reference types="vitest/config" />
 import { defineConfig } from 'vitest/config';
 import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+
+// Build version, sourced from package.json so it can never drift. Surfaced in
+// the companion UI (and handy for confirming which build is actually loaded on
+// the glasses after a re-sideload).
+const { version } = JSON.parse(
+  readFileSync(resolve(__dirname, 'package.json'), 'utf8'),
+) as { version: string };
 
 export default defineConfig({
+  define: { __APP_VERSION__: JSON.stringify(version) },
   server: { host: true, port: 5173 },
   build: {
     target: 'esnext',

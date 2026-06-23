@@ -25,7 +25,7 @@ import type { Train, RailIncident, ElevatorIncident } from "../data/wmata";
 const FAVORITES: FavoriteStation[] = [
   { code: "A01", name: "Metro Center", lines: ["RD", "BL", "OR", "SV"] },
   { code: "C04", name: "Foggy Bottom-GWU", lines: ["BL", "OR", "SV"] },
-  { code: "B35", name: "NoMa-Gallaudet U", lines: ["RD"] },
+  { code: "B11", name: "Glenmont", lines: ["RD"] },
   { code: "D02", name: "Smithsonian", lines: ["BL", "OR", "SV"] },
   { code: "K08", name: "Wiehle-Reston East", lines: ["SV"] },
 ];

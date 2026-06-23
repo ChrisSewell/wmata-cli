@@ -109,6 +109,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     el("header", { class: "wmata-settings__header" }, [
       el("h1", { class: "wmata-settings__title" }, ["WMATA Transit"]),
       el("p", { class: "wmata-settings__tagline" }, ["Real-time DC Metro on your G2 glasses."]),
+      el("p", { class: "wmata-settings__version" }, [`v${__APP_VERSION__}`]),
     ]),
   );
 

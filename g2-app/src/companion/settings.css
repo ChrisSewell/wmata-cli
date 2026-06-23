@@ -61,6 +61,13 @@
   color: var(--er-gray);
 }
 
+.wmata-settings__version {
+  margin: 8px 0 0;
+  font-size: 11px;
+  letter-spacing: 0.2px;
+  color: var(--er-gray-2);
+}
+
 /* Banner (storage warning) — signal red */
 .wmata-settings__banner {
   background: rgba(255, 69, 58, 0.1);
