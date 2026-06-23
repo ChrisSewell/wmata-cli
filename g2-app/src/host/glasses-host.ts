@@ -17,6 +17,7 @@
 
 import {
   CreateStartUpPageContainer,
+  RebuildPageContainer,
   OsEventTypeList,
   StartUpPageCreateResult,
   TextContainerProperty,
@@ -50,6 +51,20 @@ const ID_CLOCK = 3;
 const ID_VALUE = 4;
 const ID_HINT = 5;
 const ID_ACCENT = 6; // hero screens only — the one image accent
+
+// Root app-exit argument for shutDownPageContainer. Every shipped G2 app uses
+// `1` (and only `1`); `0` is a submission auto-reject. shutDownPageContainer
+// CLOSES THE WHOLE APP — it is NOT a per-page teardown, so it is called ONLY on
+// a deliberate root exit, never for screen-to-screen navigation.
+const EXIT_MODE = 1;
+
+// The glasses page is a single persistent surface for the app's lifetime. Per
+// the SDK ("createStartUpPageContainer MUST be called when launching the app;
+// subsequently use rebuildPageContainer to rebuild the page"), we create it
+// exactly once and REBUILD it for every navigation. Module-scoped because there
+// is exactly one page and navigations mount sequentially (router awaits the old
+// teardown before the new mount), so there is no race.
+let pageCreated = false;
 
 const CLOCK_TICK_MS = 1000;
 // Ignore gestures for a beat right after a screen mounts. A navigation
@@ -317,24 +332,43 @@ export async function mountGlassesScreen<S>(
     );
   }
 
+  const totalNum = containers.length + imageObject.length;
   try {
-    const result = await serial(() =>
-      bridge.createStartUpPageContainer(
-        new CreateStartUpPageContainer({
-          containerTotalNum: containers.length + imageObject.length,
-          textObject: containers,
-          imageObject: hero ? imageObject : undefined,
-        }),
-      ),
-    );
-    if (result !== StartUpPageCreateResult.success) {
-      console.warn(`[host] createStartUpPageContainer non-success: ${String(result)}`);
+    if (!pageCreated) {
+      // First screen of the app session: create the page once.
+      const result = await serial(() =>
+        bridge.createStartUpPageContainer(
+          new CreateStartUpPageContainer({
+            containerTotalNum: totalNum,
+            textObject: containers,
+            imageObject: hero ? imageObject : undefined,
+          }),
+        ),
+      );
+      if (result !== StartUpPageCreateResult.success) {
+        console.warn(`[host] createStartUpPageContainer non-success: ${String(result)}`);
+      }
+      pageCreated = true;
+    } else {
+      // Every subsequent screen REBUILDS the existing page in place. We never
+      // shutDown+recreate for navigation — shutDownPageContainer closes the
+      // whole app on real hardware (the sim tolerates it, hence it looked fine).
+      const ok = await serial(() =>
+        bridge.rebuildPageContainer(
+          new RebuildPageContainer({
+            containerTotalNum: totalNum,
+            textObject: containers,
+            imageObject: hero ? imageObject : undefined,
+          }),
+        ),
+      );
+      if (!ok) console.warn(`[host] rebuildPageContainer returned false`);
     }
   } catch (err) {
-    console.warn(`[host] createStartUpPageContainer threw:`, err);
+    console.warn(`[host] page build threw:`, err);
   }
 
-  // Push the accent now that the page exists.
+  // Push the accent now that the page exists (a rebuild also wipes images).
   if (hero) await pushAccent(initial.numeral);
 
   if (screen.onMount) {
@@ -392,9 +426,8 @@ export async function mountGlassesScreen<S>(
     nav = result.nav;
     if (result.snapshot !== undefined) snapshot = result.snapshot;
     if (result.navigate) {
-      // Root exit: the OS app-exit (system dialog). Distinct from a page
-      // teardown for navigation (shutDown 0); using 0 at root is a
-      // submission auto-reject.
+      // Root exit closes the whole app (shutDownPageContainer). All other
+      // navigations keep the page alive and rebuild it for the next screen.
       if (result.navigate.to === "exit") {
         void exitApp();
         // Let the owning router clean up too (e.g. the reconcile watcher stops
@@ -444,9 +477,12 @@ export async function mountGlassesScreen<S>(
   if (fetchEnabled) void runTick();
   startTimers();
 
-  // Shared teardown (timers, subscription, onUnmount). `exitMode` selects the
-  // shutDown semantics: 0 = page teardown for navigation; 1 = OS app exit.
-  const teardown = async (exitMode: 0 | 1): Promise<void> => {
+  // Shared teardown of THIS screen's runtime (timers, subscription, onUnmount).
+  // `shutDown` controls whether the underlying glasses PAGE is also closed:
+  //   - navigation/reconcile: false — the page persists; the next screen
+  //     rebuilds it in place. (Closing it here would exit the whole app.)
+  //   - root exit: true — shutDownPageContainer(EXIT_MODE) closes the app.
+  const teardown = async (shutDown: boolean): Promise<void> => {
     if (!active) return;
     active = false;
     tickGeneration += 1;
@@ -464,17 +500,20 @@ export async function mountGlassesScreen<S>(
         console.warn(`[host] onUnmount threw:`, err);
       }
     }
-    try {
-      await serial(() => bridge.shutDownPageContainer(exitMode));
-    } catch (err) {
-      console.warn(`[host] shutDownPageContainer threw:`, err);
+    if (shutDown) {
+      pageCreated = false; // the page is gone; a future launch re-creates it
+      try {
+        await serial(() => bridge.shutDownPageContainer(EXIT_MODE));
+      } catch (err) {
+        console.warn(`[host] shutDownPageContainer threw:`, err);
+      }
     }
   };
 
-  // Page teardown for screen-to-screen navigation (the router calls this).
-  const unmount = (): Promise<void> => teardown(0);
-  // Root app exit (double-press at root) — the required system exit dialog.
-  const exitApp = (): Promise<void> => teardown(1);
+  // Screen-to-screen navigation (the router calls this): page stays alive.
+  const unmount = (): Promise<void> => teardown(false);
+  // Root app exit (double-press at root): close the page / exit the app.
+  const exitApp = (): Promise<void> => teardown(true);
 
   return unmount;
 }
