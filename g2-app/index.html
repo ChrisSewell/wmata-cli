@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>WMATA Transit</title>
     <style>
       /* ER brand dark-theme surface (#232323) + Neutral-200 text (#E5E5E5). */
@@ -31,6 +31,14 @@
         box-sizing: border-box;
         min-height: 100%;
         padding: 24px 18px;
+      }
+      /* The Even App webview overlays the soft keyboard WITHOUT reliably
+       * shrinking the viewport, so viewport tricks alone don't free the scroll.
+       * While a field is focused, reserve a screenful of bottom scroll room so
+       * the page can always scroll the field clear of the keyboard (see the
+       * focusin/focusout handler in companion/settings.ts). Mirrors FlightAware. */
+      body.kbd-open {
+        padding-bottom: 80vh;
       }
     </style>
   </head>

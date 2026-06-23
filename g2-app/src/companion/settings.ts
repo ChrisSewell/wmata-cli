@@ -590,12 +590,43 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     state.favoritesCountAtLastRender = state.favorites.length;
   }
 
+  // iOS / Even WebView keyboard handling (mirrors the proven FlightAware_G2
+  // approach): the webview overlays the soft keyboard WITHOUT reliably shrinking
+  // the visual viewport, so viewport tricks alone leave the page stuck/unable to
+  // scroll (notably after the keyboard dismisses). The dependable fix is
+  // JS-driven: while a field is focused, reserve a screenful of bottom scroll
+  // room (body.kbd-open → CSS) and lift the field to ~16px from the top, clear
+  // of the keyboard; release on blur once no field is focused.
+  const onFocusIn = (e: FocusEvent): void => {
+    if (!(e.target instanceof HTMLInputElement)) return;
+    const input = e.target;
+    document.body.classList.add("kbd-open");
+    // Let the keyboard finish animating in, then lift the field near the top.
+    setTimeout(() => {
+      const top = input.getBoundingClientRect().top + window.scrollY - 16;
+      window.scrollTo({ top: Math.max(0, top) });
+    }, 300);
+  };
+  const onFocusOut = (): void => {
+    // Defer so moving between fields doesn't flash the spacer off and on.
+    setTimeout(() => {
+      if (!(document.activeElement instanceof HTMLInputElement)) {
+        document.body.classList.remove("kbd-open");
+      }
+    }, 150);
+  };
+  document.addEventListener("focusin", onFocusIn);
+  document.addEventListener("focusout", onFocusOut);
+
   renderApiKeyCard();
   renderFavoritesCard();
 
   return function unmount(): void {
     if (state.searchTimer !== null) clearTimeout(state.searchTimer);
     if (state.favoritesNoticeTimer !== null) clearTimeout(state.favoritesNoticeTimer);
+    document.removeEventListener("focusin", onFocusIn);
+    document.removeEventListener("focusout", onFocusOut);
+    document.body.classList.remove("kbd-open");
     root.replaceChildren();
   };
 }
