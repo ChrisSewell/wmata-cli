@@ -80,17 +80,6 @@ describe("heroNumeral", () => {
   });
 });
 
-describe("hero accent", () => {
-  it("exposes the soonest train's ETA as the hero numeral", () => {
-    const loaded = snap({ fetchedAt: ctx.nowMs, trains: [t("RD", "x", "9"), t("RD", "y", "ARR")] });
-    // ARR sorts first → hero shows ARR
-    expect(screen.view(loaded, { selectedIndex: 0 }, ctx).hero?.numeral).toBe("ARR");
-  });
-  it("blanks the numeral while loading", () => {
-    expect(screen.view(snap(), { selectedIndex: 0 }, ctx).hero?.numeral).toBe("");
-  });
-});
-
 describe("reduce", () => {
   it("press and double-press go back to home", () => {
     const loaded = snap({ fetchedAt: ctx.nowMs, trains: [t("RD", "x", "3")] });

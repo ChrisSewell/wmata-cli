@@ -69,7 +69,12 @@ export function makePredictionsScreen(
   return {
     name: "predictions",
     mode: "text",
-    hero: true,
+    // NOTE: the image-accent hero (a big dot-matrix numeral) was removed — it
+    // crashed the app on real G2 hardware when this screen mounted (likely the
+    // image container exceeding the firmware width cap / a bad gray4 convert;
+    // it rendered fine in the simulator). The native board below is fully
+    // on-spec. Re-introduce the accent only after verifying on-device that the
+    // image stays within the real ≤144px width limit.
     valueReserve: ["12 min"],
     init: () => initial,
     view(s: PredictionsSnapshot, _nav: NavState, ctx: ViewContext): Layout {
@@ -79,29 +84,25 @@ export function makePredictionsScreen(
         STALE_MS,
       );
       const header = { title: s.stationName || s.stationCode, marker };
-      const sorted = sortTrains(s.trains);
-      const numeral = sorted[0] ? heroNumeral(sorted[0].Min) : "";
       const firstLoadError = s.trains.length === 0 && s.fetchedAt === 0 && s.fetchError !== null;
       if (firstLoadError) {
         return {
           header,
-          body: { kind: "message", lines: ["Couldn't reach", "WMATA.", "", "Tap to retry."] },
+          body: { kind: "message", lines: ["Couldn't reach WMATA.", "", "Tap to retry."] },
           hints: [HINTS.retry, HINTS.back],
-          hero: { numeral: "" },
         };
       }
       if (s.trains.length === 0 && s.fetchedAt === 0) {
-        return { header, body: { kind: "message", lines: ["Loading…"] }, hints: [HINTS.back], hero: { numeral: "" } };
+        return { header, body: { kind: "message", lines: ["Loading…"] }, hints: [HINTS.back] };
       }
       if (s.trains.length === 0) {
-        return { header, body: { kind: "message", lines: ["No upcoming", "trains."] }, hints: [HINTS.back], hero: { numeral: "" } };
+        return { header, body: { kind: "message", lines: ["No upcoming trains."] }, hints: [HINTS.back] };
       }
-      const rows = sorted.slice(0, MAX_ROWS).map(trainRow);
+      const rows = sortTrains(s.trains).slice(0, MAX_ROWS).map(trainRow);
       return {
         header,
         body: { kind: "rows", rows, selectedIndex: 0, selectable: false },
         hints: [HINTS.back],
-        hero: { numeral },
       };
     },
     reduce(s: PredictionsSnapshot, nav: NavState, event): ReduceResult<PredictionsSnapshot> {
