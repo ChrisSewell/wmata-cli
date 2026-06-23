@@ -18,6 +18,8 @@
 import {
   CreateStartUpPageContainer,
   RebuildPageContainer,
+  ListContainerProperty,
+  ListItemContainerProperty,
   OsEventTypeList,
   StartUpPageCreateResult,
   TextContainerProperty,
@@ -37,12 +39,12 @@ import {
   CLOCK_RESERVE_PX,
   type Rect,
 } from "../ui/layout";
-import { RADIUS, BORDER_W } from "../ui/geometry";
+import { RADIUS, BORDER_W, LIST_INSET_Y } from "../ui/geometry";
 import { TIER } from "../ui/tokens";
 import { columnGeom, composeText, type ColumnGeom } from "./compose";
 import { encodeHero } from "./accent";
 import { createSerial } from "./serial";
-import { initialNav, type NavState, type Router, type Screen, type ScreenEvent, type ViewContext } from "../screens/router";
+import { initialNav, type Layout, type NavState, type Router, type Screen, type ScreenEvent, type ViewContext } from "../screens/router";
 
 // Container IDs (text mode).
 const ID_HEADER = 1;
@@ -73,6 +75,10 @@ const CLOCK_TICK_MS = 1000;
 // container just became the active capturer, which would otherwise bounce the
 // new screen straight back. Imperceptible after a deliberate navigation.
 const INPUT_COOLDOWN_MS = 250;
+
+// Native list item cap. The firmware/SDK supports up to 20 items; we slice to
+// this and surface any overflow count in the header.
+const LIST_ITEM_CAP = 20;
 
 // --- Event normalization (exported for tests) -----------------------------
 
@@ -197,10 +203,10 @@ export async function mountGlassesScreen<S>(
   bridge: EvenAppBridge,
   router: Router,
 ): Promise<() => Promise<void>> {
-  if (screen.mode !== "text") {
-    // List-mode lands in M5; no list screen exists yet.
-    console.error(`[host] screen "${screen.name}" mode "${screen.mode}" not yet supported`);
-  }
+  // `list` screens render a native firmware ListContainer (the firmware owns
+  // scroll + the selection highlight — only the highlight moves, so the body
+  // never re-paints/bounces on scroll). `text` screens render text containers.
+  const isList = screen.mode === "list";
 
   let snapshot = screen.init();
   let nav: NavState = initialNav();
@@ -229,6 +235,11 @@ export async function mountGlassesScreen<S>(
   let lastClock: string | null = null;
   let lastValue: string | null = null;
   let lastHint: string | null = null;
+  // List-mode body de-dup: the joined item strings last painted. The list has
+  // no per-item update API, so a content change requires a full rebuildPage —
+  // gating on this keeps the 1Hz clock tick from rebuilding (and re-zeroing the
+  // firmware's scroll focus) when only the clock changed.
+  let lastItems: string | null = null;
   // Hero image accent: cache the encoded PNG so a rebuild / FOREGROUND_ENTER
   // can re-push it without re-encoding (image buffers don't survive lock/sleep).
   let lastNumeral: string | null = null;
@@ -276,6 +287,41 @@ export async function mountGlassesScreen<S>(
     }
   };
 
+  // --- List-mode container builders (closure over rects/bodyRect) ----------
+  const listItemsOf = (layout: Layout): string[] =>
+    layout.body.kind === "list" ? layout.body.items.slice(0, LIST_ITEM_CAP) : [];
+
+  /** The header / clock / hint text frame, shared by text and list modes. */
+  const frameContainers = (title: string, clock: string, hint: string): TextContainerProperty[] => [
+    box(ID_HEADER, "wmata.header", rects.header, TIER.STRONG, HEADER_PAD, title, false),
+    borderless(ID_CLOCK, "wmata.clock", clockRect(), clock),
+    borderless(ID_HINT, "wmata.hint", rects.hint, hint),
+  ];
+
+  /** The native list body. It is the sole event capturer on a list screen; the
+   *  firmware draws + moves the selection border (isItemSelectBorderEn) and
+   *  owns scroll, so no per-scroll repaint — the anti-bounce property. */
+  const listContainer = (items: string[]): ListContainerProperty =>
+    new ListContainerProperty({
+      xPosition: bodyRect.x,
+      yPosition: bodyRect.y,
+      width: bodyRect.w,
+      height: bodyRect.h,
+      borderWidth: BORDER_W,
+      borderColor: TIER.MUTED,
+      borderRadius: RADIUS,
+      paddingLength: LIST_INSET_Y,
+      containerID: ID_BODY,
+      containerName: "wmata.list",
+      isEventCapture: 1,
+      itemContainer: new ListItemContainerProperty({
+        itemCount: items.length,
+        itemWidth: 0,
+        isItemSelectBorderEn: 1,
+        itemName: items,
+      }),
+    });
+
   const render = async (): Promise<void> => {
     if (!active) return;
     if (renderInFlight) {
@@ -287,32 +333,77 @@ export async function mountGlassesScreen<S>(
       do {
         renderPending = false;
         if (!active) break;
-        const r = composeText(screen.view(snapshot, nav, makeCtx()), geom, Date.now(), hintsVisible);
-        lastHeader = await pushIfChanged(ID_HEADER, r.title, lastHeader);
-        lastBody = await pushIfChanged(ID_BODY, r.bodyContent, lastBody);
-        lastClock = await pushIfChanged(ID_CLOCK, r.clock, lastClock);
-        if (hasValue) lastValue = await pushIfChanged(ID_VALUE, r.valueContent, lastValue);
-        lastHint = await pushIfChanged(ID_HINT, r.hint, lastHint);
-        if (hero) await pushAccent(r.numeral);
+        const layout = screen.view(snapshot, nav, makeCtx());
+        const r = composeText(layout, geom, Date.now(), hintsVisible);
+        if (isList) {
+          const items = listItemsOf(layout);
+          const joined = items.join("");
+          if (joined !== lastItems) {
+            // Items changed (a data tick) — no per-item update API exists, so
+            // rebuild the whole page. The firmware resets list focus to 0 on
+            // rebuild, so mirror that into nav.
+            try {
+              await serial(() =>
+                bridge.rebuildPageContainer(
+                  new RebuildPageContainer({
+                    containerTotalNum: 4,
+                    textObject: frameContainers(r.title, r.clock, r.hint),
+                    listObject: [listContainer(items)],
+                  }),
+                ),
+              );
+            } catch (err) {
+              console.warn(`[host] list rebuild failed:`, err);
+            }
+            lastItems = joined;
+            lastHeader = r.title;
+            lastClock = r.clock;
+            lastHint = r.hint;
+            nav = { selectedIndex: 0 };
+          } else {
+            // Unchanged items: only the cheap frame text (clock / staleness
+            // marker / hint) may have moved — upgrade in place, never rebuild.
+            lastHeader = await pushIfChanged(ID_HEADER, r.title, lastHeader);
+            lastClock = await pushIfChanged(ID_CLOCK, r.clock, lastClock);
+            lastHint = await pushIfChanged(ID_HINT, r.hint, lastHint);
+          }
+        } else {
+          lastHeader = await pushIfChanged(ID_HEADER, r.title, lastHeader);
+          lastBody = await pushIfChanged(ID_BODY, r.bodyContent, lastBody);
+          lastClock = await pushIfChanged(ID_CLOCK, r.clock, lastClock);
+          if (hasValue) lastValue = await pushIfChanged(ID_VALUE, r.valueContent, lastValue);
+          lastHint = await pushIfChanged(ID_HINT, r.hint, lastHint);
+          if (hero) await pushAccent(r.numeral);
+        }
       } while (renderPending && active);
     } finally {
       renderInFlight = false;
     }
   };
 
-  // Build the initial page.
-  const initial = composeText(screen.view(snapshot, nav, makeCtx()), geom, Date.now(), hintsVisible);
-  const containers: TextContainerProperty[] = [
+  // Build the initial page. List screens carry a native list body; text screens
+  // a text body (+ optional value-overlay column). Header/clock/hint are shared.
+  const initialLayout = screen.view(snapshot, nav, makeCtx());
+  const initial = composeText(initialLayout, geom, Date.now(), hintsVisible);
+
+  const textContainers: TextContainerProperty[] = [
     box(ID_HEADER, "wmata.header", rects.header, TIER.STRONG, HEADER_PAD, initial.title, false),
-    box(ID_BODY, "wmata.body", bodyRect, TIER.MUTED, BODY_PAD, initial.bodyContent, true),
     borderless(ID_CLOCK, "wmata.clock", clockRect(), initial.clock),
   ];
-  if (hasValue) containers.push(borderless(ID_VALUE, "wmata.value", valueRect(geom, bodyRect), initial.valueContent));
-  containers.push(borderless(ID_HINT, "wmata.hint", rects.hint, initial.hint));
+  const listObject: ListContainerProperty[] = [];
+  if (isList) {
+    const items = listItemsOf(initialLayout);
+    listObject.push(listContainer(items));
+    lastItems = items.join("");
+  } else {
+    textContainers.push(box(ID_BODY, "wmata.body", bodyRect, TIER.MUTED, BODY_PAD, initial.bodyContent, true));
+    if (hasValue) textContainers.push(borderless(ID_VALUE, "wmata.value", valueRect(geom, bodyRect), initial.valueContent));
+    lastBody = initial.bodyContent;
+    lastValue = hasValue ? initial.valueContent : null;
+  }
+  textContainers.push(borderless(ID_HINT, "wmata.hint", rects.hint, initial.hint));
   lastHeader = initial.title;
-  lastBody = initial.bodyContent;
   lastClock = initial.clock;
-  lastValue = hasValue ? initial.valueContent : null;
   lastHint = initial.hint;
 
   // The image accent can't be sent during page creation — create an empty
@@ -332,7 +423,7 @@ export async function mountGlassesScreen<S>(
     );
   }
 
-  const totalNum = containers.length + imageObject.length;
+  const totalNum = textContainers.length + listObject.length + imageObject.length;
   try {
     if (!pageCreated) {
       // First screen of the app session: create the page once.
@@ -340,7 +431,8 @@ export async function mountGlassesScreen<S>(
         bridge.createStartUpPageContainer(
           new CreateStartUpPageContainer({
             containerTotalNum: totalNum,
-            textObject: containers,
+            textObject: textContainers,
+            listObject: isList ? listObject : undefined,
             imageObject: hero ? imageObject : undefined,
           }),
         ),
@@ -357,7 +449,8 @@ export async function mountGlassesScreen<S>(
         bridge.rebuildPageContainer(
           new RebuildPageContainer({
             containerTotalNum: totalNum,
-            textObject: containers,
+            textObject: textContainers,
+            listObject: isList ? listObject : undefined,
             imageObject: hero ? imageObject : undefined,
           }),
         ),
@@ -467,10 +560,32 @@ export async function mountGlassesScreen<S>(
       }
       return;
     }
+    const cooled = (): boolean => Date.now() - mountedAtMs >= INPUT_COOLDOWN_MS;
+
+    // List screens: the firmware owns scroll + the selection highlight, so it
+    // emits NO event per scroll step (no repaint, no bounce). It reports the
+    // focused row via listEvent.currentSelectItemIndex; a single press fires a
+    // listEvent (the SELECT), and scroll-edge events (if any) only carry the
+    // new index. Mirror the index into nav so the screen's TAP reduce reads the
+    // firmware-chosen row.
+    if (isList && event.listEvent) {
+      const le = event.listEvent;
+      nav = { selectedIndex: le.currentSelectItemIndex ?? 0 }; // protobuf drops the zero index
+      const t = le.eventType;
+      if (t === OsEventTypeList.SCROLL_TOP_EVENT || t === OsEventTypeList.SCROLL_BOTTOM_EVENT) return;
+      if (!cooled()) return;
+      dispatch(t === OsEventTypeList.DOUBLE_CLICK_EVENT ? { type: "DOUBLE_TAP" } : { type: "TAP" });
+      return;
+    }
+
     const gesture = eventToScreenEvent(event);
     if (!gesture) return;
+    // On a list screen the single-press SELECT arrives via listEvent (above);
+    // ignore a coalesced sysEvent CLICK so we don't double-fire. Still honor the
+    // double-press (back / root-exit), which arrives as a sysEvent.
+    if (isList && gesture.type !== "DOUBLE_TAP") return;
     // Swallow a stray input that lands in the mount cooldown (see above).
-    if (Date.now() - mountedAtMs < INPUT_COOLDOWN_MS) return;
+    if (!cooled()) return;
     dispatch(gesture);
   });
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { makeHomeScreen, homeRows, type HomeSnapshot } from "./home";
+import { makeHomeScreen, homeItems, type HomeSnapshot } from "./home";
 import type { FavoriteStation } from "../data/domain/lines";
 
 const FAVS: FavoriteStation[] = [
@@ -13,16 +13,18 @@ const snap = (over: Partial<HomeSnapshot> = {}): HomeSnapshot => ({
   ...over,
 });
 
-describe("homeRows", () => {
-  it("builds favorite rows (ETA value) then a Service alerts row (count value)", () => {
-    const rows = homeRows(snap());
-    expect(rows.length).toBe(3);
-    expect(rows[0]).toEqual({ left: "Metro Center · RD BL", value: "4 min" });
-    expect(rows[1]!.value).toBe("ARR");
-    expect(rows[2]).toEqual({ left: "Service alerts", value: "3" });
+describe("homeItems", () => {
+  it("packs each favorite's ETA into the row, then a Service alerts (N) entry", () => {
+    const list = homeItems(snap());
+    expect(list.length).toBe(3);
+    expect(list[0]).toBe("Metro Center · RD BL · 4 min");
+    expect(list[1]).toBe("Foggy Bottom · BL OR · ARR");
+    expect(list[2]).toBe("Service alerts (3)");
   });
-  it("blanks the alerts value when there are none", () => {
-    expect(homeRows(snap({ alertCount: 0 }))[2]!.value).toBe("");
+  it("omits the ETA suffix when none and the count when zero", () => {
+    const list = homeItems(snap({ favoriteEtas: {}, alertCount: 0 }));
+    expect(list[0]).toBe("Metro Center · RD BL");
+    expect(list[2]).toBe("Service alerts");
   });
 });
 
@@ -54,12 +56,13 @@ describe("home reduce", () => {
 describe("home view", () => {
   const screen = makeHomeScreen(() => snap());
   const ctx = { nowMs: 1_000_000 };
-  it("shows a rows body when configured", () => {
-    expect(screen.view(snap(), { selectedIndex: 0 }, ctx).body.kind).toBe("rows");
+  it("shows a native list body when configured", () => {
+    expect(screen.view(snap(), { selectedIndex: 0 }, ctx).body.kind).toBe("list");
   });
-  it("shows a message when there are no favorites", () => {
+  it("shows a single-item list when there are no favorites", () => {
     const empty = snap({ favorites: [], favoriteEtas: {}, alertCount: 0 });
     const v = screen.view(empty, { selectedIndex: 0 }, ctx);
-    expect(v.body.kind).toBe("message");
+    expect(v.body.kind).toBe("list");
+    expect((v.body as { items: string[] }).items.length).toBe(1);
   });
 });

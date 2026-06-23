@@ -1,18 +1,16 @@
 // Alerts — rail service incidents + elevator/escalator outages folded into one
-// selectable list (reached from Home). Hand-rolled WINDOWED rows: the screen
-// slices the visible window around the cursor so the body never overflows
-// (anti-bounce — no text-overflow free-scroll), with a position marker. Press
-// opens the paginated detail. Pure: the `fetcher` is injected.
+// selectable list (reached from Home), rendered as a NATIVE list: the firmware
+// owns scroll, windowing, and the selection highlight, so nothing re-paints as
+// you move (no bounce — the old hand-rolled windowed rows did). Press opens the
+// paginated detail. Pure: the `fetcher` is injected.
 
 import type { AlertItem } from "../data/domain/alerts";
 import { stalenessMarker } from "../data/domain/staleness";
 import { HINTS } from "../nav/affordances";
-import type { Layout, NavState, ReduceResult, Row, Screen, ViewContext } from "./router";
+import type { Layout, NavState, ReduceResult, Screen, ViewContext } from "./router";
 
 export const ALERTS_TICK_MS = 60_000;
 const STALE_MS = 120_000;
-/** Rows that fit the body without overflow. */
-const VISIBLE = 6;
 
 export interface AlertsFetch {
   items: AlertItem[];
@@ -32,14 +30,6 @@ function clamp(idx: number, count: number): number {
   return Math.max(0, Math.min(idx, count - 1));
 }
 
-/** Visible window [start, start+VISIBLE) keeping `selected` in view. */
-export function windowRange(selected: number, total: number, visible = VISIBLE): { start: number; end: number } {
-  if (total <= visible) return { start: 0, end: total };
-  let start = selected - Math.floor(visible / 2);
-  start = Math.max(0, Math.min(start, total - visible));
-  return { start, end: start + visible };
-}
-
 export function makeInitialAlertsSnapshot(items: AlertItem[] = []): AlertsSnapshot {
   return { items, fetchedAt: 0, fetchError: null, consecutiveFailures: 0 };
 }
@@ -53,7 +43,7 @@ export function makeAlertsScreen(
 
   return {
     name: "alerts",
-    mode: "text",
+    mode: "list",
     init: () => initial,
     view(s: AlertsSnapshot, nav: NavState, ctx: ViewContext): Layout {
       const marker = stalenessMarker(
@@ -63,21 +53,21 @@ export function makeAlertsScreen(
       );
       const total = s.items.length;
       if (total === 0) {
-        const lines = firstLoadError(s)
-          ? ["Couldn't reach WMATA.", "", "Tap to retry."]
+        // Empty / loading / error: a single non-actionable item keeps the page
+        // in list-mode (no risky text↔list composition switch on data change).
+        const item = firstLoadError(s)
+          ? "Couldn't reach WMATA — tap to retry"
           : s.fetchedAt === 0
-            ? ["Loading…"]
-            : ["All lines running normally."];
+            ? "Loading…"
+            : "All lines running normally.";
         const hints = firstLoadError(s) ? [HINTS.retry, HINTS.back] : [HINTS.back];
-        return { header: { title: "Alerts", marker }, body: { kind: "message", lines }, hints };
+        return { header: { title: "Alerts", marker }, body: { kind: "list", items: [item], selectedIndex: 0 }, hints };
       }
       const selected = clamp(nav.selectedIndex, total);
-      const { start, end } = windowRange(selected, total);
-      const rows: Row[] = s.items.slice(start, end).map((it) => ({ left: it.headline }));
-      const posMarker = total > VISIBLE ? `${selected + 1}/${total}` : marker;
+      const items = s.items.map((it) => it.headline);
       return {
-        header: { title: "Alerts", marker: posMarker || undefined },
-        body: { kind: "rows", rows, selectedIndex: selected - start },
+        header: { title: "Alerts", marker: marker || undefined },
+        body: { kind: "list", items, selectedIndex: selected },
         hints: [HINTS.open, HINTS.back],
       };
     },
@@ -85,6 +75,7 @@ export function makeAlertsScreen(
       const total = s.items.length;
       const idx = clamp(nav.selectedIndex, total);
       switch (event.type) {
+        // SCROLL_* are unreachable on a native-list screen (firmware owns it).
         case "SCROLL_UP":
           return { nav: { selectedIndex: clamp(idx - 1, total) } };
         case "SCROLL_DOWN":

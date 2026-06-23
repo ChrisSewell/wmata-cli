@@ -1,8 +1,10 @@
-// Home — the root screen: a glanceable favorites board with each station's
-// soonest next-train ETA in a right-anchored value column, plus a "Service
-// alerts" entry. Hand-rolled selectable rows (caret focus + value overlay) —
-// the native LIST can't carry a per-row live ETA value, so this is the
-// sanctioned hand-roll. ≤ MAX_FAVORITES + 1 rows, so it never scrolls.
+// Home — the root screen: a glanceable favorites board, each row showing the
+// station name, its lines, and the soonest next-train ETA, plus a "Service
+// alerts" entry. Rendered as a NATIVE list: the firmware owns scroll and the
+// selection highlight, so the body never re-paints/bounces as you move. A
+// native list item is a single string, so the ETA is packed into the row text
+// (a glyph-separated suffix — never a space-padded column). ≤ MAX_FAVORITES + 1
+// items, so it never needs to scroll.
 //
 // Pure: no SDK, no I/O. The host injects data via `loader` / `refresh`.
 
@@ -10,7 +12,7 @@ import { MAX_FAVORITES } from "../storage/settings";
 import type { FavoriteStation } from "../data/domain/lines";
 import { formatEtaValue, lineGlyph } from "../ui/format";
 import { HINTS } from "../nav/affordances";
-import type { Layout, NavState, ReduceResult, Row, Screen } from "./router";
+import type { Layout, NavState, ReduceResult, Screen } from "./router";
 
 export interface HomeSnapshot {
   favorites: FavoriteStation[];
@@ -23,9 +25,6 @@ export interface HomeSnapshot {
 const ALERTS_LABEL = "Service alerts";
 const SEP = " · ";
 
-/** Worst-case value strings, for the fixed-x value column. */
-export const HOME_VALUE_RESERVE = ["12 min"] as const;
-
 function clamp(idx: number, count: number): number {
   if (count <= 0) return 0;
   return Math.max(0, Math.min(idx, count - 1));
@@ -37,14 +36,15 @@ function favoriteLeft(fav: FavoriteStation): string {
   return codes.length ? `${fav.name}${SEP}${codes.join(" ")}` : fav.name;
 }
 
-/** The selectable rows: favorites (ETA value) then the alerts entry (count value). */
-export function homeRows(s: HomeSnapshot): Row[] {
-  const rows: Row[] = s.favorites.slice(0, MAX_FAVORITES).map((f) => ({
-    left: favoriteLeft(f),
-    value: formatEtaValue(s.favoriteEtas[f.code] ?? null),
-  }));
-  rows.push({ left: ALERTS_LABEL, value: s.alertCount > 0 ? String(s.alertCount) : "" });
-  return rows;
+/** The list items: each favorite with its soonest ETA packed in, then the
+ *  "Service alerts (N)" entry. One string per row — no value column. */
+export function homeItems(s: HomeSnapshot): string[] {
+  const items = s.favorites.slice(0, MAX_FAVORITES).map((f) => {
+    const eta = formatEtaValue(s.favoriteEtas[f.code] ?? null);
+    return eta ? `${favoriteLeft(f)}${SEP}${eta}` : favoriteLeft(f);
+  });
+  items.push(s.alertCount > 0 ? `${ALERTS_LABEL} (${s.alertCount})` : ALERTS_LABEL);
+  return items;
 }
 
 export function makeHomeScreen(
@@ -54,32 +54,29 @@ export function makeHomeScreen(
 ): Screen<HomeSnapshot> {
   const screen: Screen<HomeSnapshot> = {
     name: "home",
-    mode: "text",
-    valueReserve: HOME_VALUE_RESERVE,
+    mode: "list",
     init: loader,
     view(s: HomeSnapshot, nav: NavState): Layout {
       if (s.favorites.length === 0) {
         return {
           header: { title: "WMATA" },
-          body: {
-            kind: "message",
-            lines: ["No favorites yet.", "Add stations in the phone app."],
-          },
+          body: { kind: "list", items: ["No favorites — add stations in the phone app"], selectedIndex: 0 },
           hints: [HINTS.exit],
         };
       }
-      const rows = homeRows(s);
+      const items = homeItems(s);
       return {
         header: { title: "WMATA" },
-        body: { kind: "rows", rows, selectedIndex: clamp(nav.selectedIndex, rows.length) },
+        body: { kind: "list", items, selectedIndex: clamp(nav.selectedIndex, items.length) },
         hints: [HINTS.move, HINTS.open, HINTS.exit],
       };
     },
     reduce(s: HomeSnapshot, nav: NavState, event): ReduceResult<HomeSnapshot> {
-      const rows = homeRows(s);
-      const n = rows.length;
+      const n = homeItems(s).length;
       const idx = clamp(nav.selectedIndex, n);
       switch (event.type) {
+        // SCROLL_* are unreachable on a native-list screen (the firmware owns
+        // scroll and emits no per-step event) but kept for completeness/tests.
         case "SCROLL_UP":
           return { nav: { selectedIndex: clamp(idx - 1, n) } };
         case "SCROLL_DOWN":
