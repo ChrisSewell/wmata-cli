@@ -285,7 +285,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     if (trimmed.length === 0) {
       state.searchResults = [];
       state.searchError = null;
-      renderFavoritesCard();
+      renderFavoritesResults();
       return;
     }
     try {
@@ -301,7 +301,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
         state.searchError = "Unexpected error while searching.";
       }
     }
-    renderFavoritesCard();
+    renderFavoritesResults();
   }
 
   function showFavoritesNotice(message: string): void {
@@ -310,7 +310,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     state.favoritesNoticeTimer = setTimeout(() => {
       state.favoritesNotice = null;
       state.favoritesNoticeTimer = null;
-      renderFavoritesCard();
+      renderFavoritesResults();
     }, 3000);
   }
 
@@ -322,7 +322,12 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     }, 3000);
   }
 
+  // Dynamic results sub-node of the favorites card; rebuilt by
+  // renderFavoritesResults() WITHOUT recreating the search input above it.
+  let favoritesResultsMount: HTMLElement | null = null;
+
   function renderFavoritesCard(): void {
+    favoritesResultsMount = null;
     favoritesMount.replaceChildren();
     const gated = !state.keyAccepted || state.apiKey.length === 0;
     favoritesMount.setAttribute("aria-disabled", gated ? "true" : "false");
@@ -378,15 +383,30 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
       ]),
     );
 
+    // The dynamic results region lives in its own mount so re-rendering matches
+    // never recreates the search <input> above — recreating it would detach the
+    // focused field and dismiss the mobile keyboard mid-typing.
+    favoritesResultsMount = el("div", { class: "wmata-settings__results" });
+    favoritesMount.appendChild(favoritesResultsMount);
+    renderFavoritesResults();
+  }
+
+  /** Rebuilds ONLY the search-results + favorites-list region. The search input
+   *  (in renderFavoritesCard) is left untouched, so typing keeps focus. */
+  function renderFavoritesResults(): void {
+    const mount = favoritesResultsMount;
+    if (!mount) return; // gated — no search field rendered
+    mount.replaceChildren();
+
     if (state.searchError !== null) {
-      favoritesMount.appendChild(
+      mount.appendChild(
         el("div", { class: "wmata-settings__status wmata-settings__status--bad", role: "alert" }, [
           state.searchError,
         ]),
       );
     }
     if (state.favoritesNotice !== null) {
-      favoritesMount.appendChild(
+      mount.appendChild(
         el(
           "div",
           {
@@ -429,7 +449,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
               next.some((f) => f.code === station.Code) ? "Already a favorite." : "Limit reached (5).",
             );
           }
-          renderFavoritesCard();
+          renderFavoritesResults();
         });
         list.appendChild(
           el("li", { class: "wmata-settings__row" }, [
@@ -445,23 +465,23 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
           ]),
         );
       }
-      favoritesMount.appendChild(list);
+      mount.appendChild(list);
     } else if (state.searchQuery.length > 0 && state.searchError === null) {
-      favoritesMount.appendChild(
+      mount.appendChild(
         el("div", { class: "wmata-settings__empty" }, ["No stations match that query."]),
       );
     }
 
     // Favorites list
     const previousCount = state.favoritesCountAtLastRender;
-    favoritesMount.appendChild(
+    mount.appendChild(
       el("h3", { class: "wmata-settings__card-title" }, [
         `Your favorites (${String(state.favorites.length)}/${String(MAX_FAVORITES)})`,
       ]),
     );
 
     if (state.favorites.length === 0) {
-      favoritesMount.appendChild(
+      mount.appendChild(
         el("div", { class: "wmata-settings__empty" }, [
           "No favorites yet. Use the search above to pin a station.",
         ]),
@@ -508,7 +528,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
             showErrorToast("Couldn't reorder favorites.");
             return;
           }
-          renderFavoritesCard();
+          renderFavoritesResults();
         };
         upBtn.addEventListener("click", () => moveBy(-1));
         downBtn.addEventListener("click", () => moveBy(1));
@@ -525,7 +545,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
         );
         removeBtn.addEventListener("click", () => {
           state.favorites = removeFavorite(fav.code);
-          renderFavoritesCard();
+          renderFavoritesResults();
         });
 
         favList.appendChild(
@@ -542,14 +562,14 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
           ]),
         );
       });
-      favoritesMount.appendChild(favList);
+      mount.appendChild(favList);
     }
 
     // Passive "live on your glasses" confirmation. The glasses auto-transition
     // from the setup placeholder to Home once key + ≥1 favorite are saved.
     if (state.keyAccepted && state.favorites.length > 0) {
       const justGotFirst = previousCount === 0 && state.favorites.length >= 1;
-      favoritesMount.appendChild(
+      mount.appendChild(
         el("div", { class: "wmata-settings__done-row" }, [
           el(
             "div",
