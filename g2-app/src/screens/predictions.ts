@@ -1,6 +1,6 @@
 // Predictions — the per-station next-train board reached by tapping a favorite.
 // A read-only board (no caret): line glyph + destination on the left, soonest
-// ETA in the right-anchored value column. Auto-refreshes every 20s; stale /
+// ETA in the right-anchored value column. Auto-refreshes every 10s; stale /
 // errored data degrades to a clock marker + a tap-to-retry message rather than
 // blanking. Pure: the `fetcher` is injected; the wall clock arrives via ctx.
 
@@ -11,7 +11,10 @@ import { formatEtaValue, lineGlyph, toTitleCase } from "../ui/format";
 import { HINTS } from "../nav/affordances";
 import type { Layout, NavState, ReduceResult, Row, Screen, ViewContext } from "./router";
 
-export const PREDICTIONS_TICK_MS = 20_000;
+// WMATA refreshes its real-time predictions every ~20-30s server-side, so
+// polling much faster than this only adds requests without new data; 10s keeps
+// the board feeling live (picks up a server update within ~10s) without waste.
+export const PREDICTIONS_TICK_MS = 10_000;
 const STALE_MS = 60_000;
 /** Soonest N trains shown — sized to fit the body without overflow (no bounce). */
 const MAX_ROWS = 6;
