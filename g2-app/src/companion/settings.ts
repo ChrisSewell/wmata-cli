@@ -597,6 +597,16 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
   // JS-driven: while a field is focused, reserve a screenful of bottom scroll
   // room (body.kbd-open → CSS) and lift the field to ~16px from the top, clear
   // of the keyboard; release on blur once no field is focused.
+  const vv = window.visualViewport;
+  // Release the reserved scroll room the moment the keyboard is gone. focusout
+  // is unreliable on iOS — the field stays focused after the keyboard's
+  // return/done key — so the visualViewport (which shrinks with the keyboard and
+  // grows back when it hides) is the source of truth. Leaving the spacer on was
+  // what left a screenful of dead space below the content, so the page couldn't
+  // scroll to its true bottom.
+  const releaseIfKeyboardDown = (): void => {
+    if (vv && vv.height > window.innerHeight - 100) document.body.classList.remove("kbd-open");
+  };
   const onFocusIn = (e: FocusEvent): void => {
     if (!(e.target instanceof HTMLInputElement)) return;
     const input = e.target;
@@ -617,6 +627,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
   };
   document.addEventListener("focusin", onFocusIn);
   document.addEventListener("focusout", onFocusOut);
+  vv?.addEventListener("resize", releaseIfKeyboardDown);
 
   renderApiKeyCard();
   renderFavoritesCard();
@@ -626,6 +637,7 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
     if (state.favoritesNoticeTimer !== null) clearTimeout(state.favoritesNoticeTimer);
     document.removeEventListener("focusin", onFocusIn);
     document.removeEventListener("focusout", onFocusOut);
+    vv?.removeEventListener("resize", releaseIfKeyboardDown);
     document.body.classList.remove("kbd-open");
     root.replaceChildren();
   };
