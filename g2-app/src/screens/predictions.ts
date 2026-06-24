@@ -7,7 +7,7 @@
 import type { Train } from "../data/wmata";
 import { etaSortValue } from "../data/domain/eta";
 import { stalenessMarker } from "../data/domain/staleness";
-import { trackedCarFromTrain } from "../data/domain/tracked";
+import { carKey, trackedCarFromTrain, type TrackedCar } from "../data/domain/tracked";
 import { formatEtaValue, lineGlyph, toTitleCase } from "../ui/format";
 import { HINTS } from "../nav/affordances";
 import type { Layout, NavState, ReduceResult, Row, Screen, ViewContext } from "./router";
@@ -81,6 +81,7 @@ export function makeInitialPredictionsSnapshot(
 export function makePredictionsScreen(
   fetcher: () => Promise<PredictionsFetch>,
   initial: PredictionsSnapshot,
+  getTracked: () => TrackedCar[] = () => [],
 ): Screen<PredictionsSnapshot> {
   return {
     name: "predictions",
@@ -119,7 +120,13 @@ export function makePredictionsScreen(
       if (s.trains.length === 0) {
         return { header, body: { kind: "list", items: ["No upcoming trains."], selectedIndex: 0 }, hints: [HINTS.back], hero: { numeral: "" } };
       }
-      const items = sorted.slice(0, MAX_ROWS).map(trainItem);
+      // Mark trains the user is tracking with a leading • (the tracking
+      // indicator) so they stand out on the board.
+      const trackedKeys = new Set(getTracked().map(carKey));
+      const items = sorted.slice(0, MAX_ROWS).map((t) => {
+        const tracked = trackedKeys.has(carKey(trackedCarFromTrain(t, s.stationCode, s.stationName)));
+        return (tracked ? "• " : "") + trainItem(t);
+      });
       return {
         header,
         body: { kind: "list", items, selectedIndex: clamp(nav.selectedIndex, items.length) },

@@ -29,9 +29,11 @@ export function makeInitialCarDetailsSnapshot(): CarDetailsSnapshot {
 export function makeCarDetailsScreen(
   car: TrackedCar,
   fetcher: () => Promise<string[]>,
+  tracked = false,
 ): Screen<CarDetailsSnapshot> {
   const glyph = lineGlyph(car.line);
-  const title = `${glyph === "--" ? "" : glyph + " "}${car.destinationName || "Train"}`.trim();
+  const base = `${glyph === "--" ? "" : glyph + " "}${car.destinationName || "Train"}`.trim();
+  const title = (tracked ? "• " : "") + base; // • = the tracking indicator
   return {
     name: "carDetails",
     mode: "text",

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { makeHomeScreen, homeItems, type HomeSnapshot } from "./home";
 import type { FavoriteStation } from "../data/domain/lines";
+import { carKey, type TrackedCar } from "../data/domain/tracked";
 
 const FAVS: FavoriteStation[] = [
   { code: "A01", name: "Metro Center", lines: ["RD", "BL"] },
@@ -9,6 +10,8 @@ const FAVS: FavoriteStation[] = [
 const snap = (over: Partial<HomeSnapshot> = {}): HomeSnapshot => ({
   favorites: FAVS,
   favoriteEtas: { A01: "4", C04: "ARR" },
+  tracked: [],
+  trackedEtas: {},
   alertCount: 3,
   ...over,
 });
@@ -50,6 +53,33 @@ describe("home reduce", () => {
 
   it("exits the app on double-tap (root)", () => {
     expect(screen.reduce(snap(), { selectedIndex: 0 }, { type: "DOUBLE_TAP" }).navigate).toEqual({ to: "exit" });
+  });
+});
+
+describe("home with tracked slots", () => {
+  const car: TrackedCar = {
+    stationCode: "B11",
+    stationName: "Glenmont",
+    line: "RD",
+    group: "1",
+    destinationCode: "A15",
+    destinationName: "Shady Grove",
+  };
+  const screen = makeHomeScreen(() => snap());
+  it("inserts a • tracked row between favorites and the alerts row", () => {
+    const items = homeItems(snap({ tracked: [car], trackedEtas: { [carKey(car)]: "4" } }));
+    expect(items.length).toBe(4); // 2 favorites + 1 tracked + alerts
+    expect(items[2]).toBe("• RD Shady Grove · 4 min");
+  });
+  it("shows — for a tracked slot with no matching train", () => {
+    const items = homeItems(snap({ tracked: [car], trackedEtas: {} }));
+    expect(items[2]).toBe("• RD Shady Grove · —");
+  });
+  it("routes a tracked-row press to that car's details", () => {
+    const s = snap({ tracked: [car], trackedEtas: {} });
+    const r = screen.reduce(s, { selectedIndex: 2 }, { type: "TAP" });
+    expect(r.navigate).toMatchObject({ to: "carDetails" });
+    expect((r.navigate as { car: TrackedCar }).car).toEqual(car);
   });
 });
 

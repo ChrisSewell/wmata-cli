@@ -2,7 +2,7 @@
 // favorite-ETA fetch. Returns raw WMATA `Min` tokens; display formatting
 // ("4 min" / "ARR") is a UI concern (`ui/format`).
 
-import { WmataClient, buildRailPredictionsUrl, type PredictionsResponse } from "../wmata";
+import { WmataClient, buildRailPredictionsUrl, type PredictionsResponse, type Train } from "../wmata";
 
 /**
  * Sortable rank for "soonest train" selection (lower = sooner):
@@ -51,8 +51,18 @@ export async function buildFavoriteEtaMap(
   if (codes.length === 0) return {};
   const url = buildRailPredictionsUrl(codes.join(","));
   const data = await client.get<PredictionsResponse>(url);
-  const trains = data.Trains ?? [];
+  return etaMapFromTrains(data.Trains ?? [], codes);
+}
 
+/**
+ * Pure: `stationCode → soonest Min token | null` from already-fetched trains.
+ * Lets one batched GetPrediction response feed multiple maps (favorite ETAs +
+ * tracked-slot ETAs) without a second request.
+ */
+export function etaMapFromTrains(
+  trains: readonly Train[],
+  codes: readonly string[],
+): Record<string, string | null> {
   // The multi-station response can include platform siblings we didn't ask
   // for (e.g. Gallery Place B01/F01) — only bucket the requested codes.
   const wanted = new Set<string>(codes);
@@ -64,7 +74,6 @@ export async function buildFavoriteEtaMap(
     if (bucket) bucket.push(t.Min);
     else minsByCode.set(code, [t.Min]);
   }
-
   const out: Record<string, string | null> = {};
   for (const code of wanted) out[code] = soonestEta(minsByCode.get(code) ?? []);
   return out;

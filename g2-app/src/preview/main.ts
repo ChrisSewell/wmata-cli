@@ -19,8 +19,8 @@ import { makeAlertDetailScreen } from "../screens/alert-detail";
 import { makeCarMenuScreen } from "../screens/car-menu";
 import { makeCarDetailsScreen } from "../screens/car-details";
 import { buildAlertItems } from "../data/domain/alerts";
-import { carKey, matchesTrackedCar } from "../data/domain/tracked";
-import { isTracked, addTrackedCar, removeTrackedCar } from "../storage/settings";
+import { carKey, matchesTrackedCar, buildTrackedEtaMap } from "../data/domain/tracked";
+import { isTracked, addTrackedCar, removeTrackedCar, loadTracked } from "../storage/settings";
 import type { NavIntent, Router, Screen } from "../screens/router";
 import type { FavoriteStation } from "../data/domain/lines";
 import type { Train, RailIncident, ElevatorIncident } from "../data/wmata";
@@ -97,11 +97,21 @@ const ALERT_ITEMS = buildAlertItems(INCIDENTS, OUTAGES);
 function fixtureScreen(intent: NavIntent): Screen<any> | null {
   switch (intent.to) {
     case "home":
-      return makeHomeScreen((): HomeSnapshot => ({ favorites: FAVORITES, favoriteEtas: ETAS, alertCount: ALERT_ITEMS.length }));
+      return makeHomeScreen((): HomeSnapshot => {
+        const tracked = loadTracked();
+        return {
+          favorites: FAVORITES,
+          favoriteEtas: ETAS,
+          tracked,
+          trackedEtas: buildTrackedEtaMap(FIXTURE_TRAINS, tracked),
+          alertCount: ALERT_ITEMS.length,
+        };
+      });
     case "predictions":
       return makePredictionsScreen(
         async () => ({ trains: FIXTURE_TRAINS, fetchedAt: Date.now(), fetchError: null }),
         makeInitialPredictionsSnapshot(intent.stationCode, intent.stationName),
+        loadTracked,
       );
     case "alerts":
       return makeAlertsScreen(async () => ({ items: ALERT_ITEMS, fetchedAt: Date.now(), fetchError: null }), makeInitialAlertsSnapshot());
@@ -110,8 +120,10 @@ function fixtureScreen(intent: NavIntent): Screen<any> | null {
     case "carMenu":
       return makeCarMenuScreen(intent.car, isTracked(intent.car));
     case "carDetails":
-      return makeCarDetailsScreen(intent.car, async () =>
-        FIXTURE_TRAINS.filter((t) => matchesTrackedCar(t, intent.car)).map((t) => t.Min),
+      return makeCarDetailsScreen(
+        intent.car,
+        async () => FIXTURE_TRAINS.filter((t) => matchesTrackedCar(t, intent.car)).map((t) => t.Min),
+        isTracked(intent.car),
       );
     case "trackToggle":
       if (isTracked(intent.car)) removeTrackedCar(carKey(intent.car));

@@ -6,11 +6,11 @@
 import { Session } from "../data/session";
 import type { FavoriteStation } from "../data/domain/lines";
 import { computeUserLines } from "../data/domain/lines";
-import { buildFavoriteEtaMap, etaSortValue } from "../data/domain/eta";
+import { etaMapFromTrains, etaSortValue } from "../data/domain/eta";
 import { buildAlertItems } from "../data/domain/alerts";
-import { carKey, matchesTrackedCar } from "../data/domain/tracked";
-import { buildRailPredictionsUrl, type PredictionsResponse } from "../data/wmata";
-import { isTracked, addTrackedCar, removeTrackedCar } from "../storage/settings";
+import { carKey, matchesTrackedCar, buildTrackedEtaMap } from "../data/domain/tracked";
+import { buildRailPredictionsUrl, type PredictionsResponse, type Train } from "../data/wmata";
+import { isTracked, addTrackedCar, removeTrackedCar, loadTracked } from "../storage/settings";
 
 import { makeHomeScreen, type HomeSnapshot } from "../screens/home";
 import { makePredictionsScreen, makeInitialPredictionsSnapshot } from "../screens/predictions";
@@ -30,22 +30,37 @@ function homeLoader(session: Session, getFavorites: FavoritesProvider): HomeSnap
   const alertCount =
     session.readCachedIncidents().incidents.length +
     session.readCachedElevatorIncidents().incidents.length;
-  return { favorites, favoriteEtas: {}, alertCount };
+  return { favorites, favoriteEtas: {}, tracked: loadTracked(), trackedEtas: {}, alertCount };
 }
 
 async function homeRefresh(session: Session, getFavorites: FavoritesProvider): Promise<HomeSnapshot> {
   const favorites = getFavorites();
+  const tracked = loadTracked();
   const codes = favorites.map((f) => f.code);
+  // One batched GetPrediction covers favorite stations AND tracked-slot stations.
+  const allCodes = Array.from(new Set([...codes, ...tracked.map((c) => c.stationCode)]));
   const userLines = computeUserLines(favorites);
-  const [etas] = await Promise.all([
-    buildFavoriteEtaMap(session.client, codes).catch(() => ({}) as Record<string, string | null>),
+  const trainsPromise: Promise<Train[]> = allCodes.length
+    ? session.client
+        .get<PredictionsResponse>(buildRailPredictionsUrl(allCodes.join(",")))
+        .then((d) => d.Trains ?? [])
+        .catch(() => [] as Train[])
+    : Promise.resolve([] as Train[]);
+  const [trains] = await Promise.all([
+    trainsPromise,
     session.refreshIncidents(userLines),
     session.refreshElevatorIncidents(codes),
   ]);
   const alertCount =
     session.readCachedIncidents().incidents.length +
     session.readCachedElevatorIncidents().incidents.length;
-  return { favorites, favoriteEtas: etas, alertCount };
+  return {
+    favorites,
+    favoriteEtas: etaMapFromTrains(trains, codes),
+    tracked,
+    trackedEtas: buildTrackedEtaMap(trains, tracked),
+    alertCount,
+  };
 }
 
 /**
@@ -76,7 +91,7 @@ export async function buildScreen(
         const data = await session.client.get<PredictionsResponse>(buildRailPredictionsUrl(intent.stationCode));
         return { trains: data.Trains ?? [], fetchedAt: Date.now(), fetchError: null };
       };
-      return makePredictionsScreen(fetcher, makeInitialPredictionsSnapshot(intent.stationCode, intent.stationName));
+      return makePredictionsScreen(fetcher, makeInitialPredictionsSnapshot(intent.stationCode, intent.stationName), loadTracked);
     }
     case "alerts": {
       const fetcher = async () => {
@@ -112,7 +127,7 @@ export async function buildScreen(
           .sort((a, b) => etaSortValue(a.Min) - etaSortValue(b.Min))
           .map((t) => t.Min);
       };
-      return makeCarDetailsScreen(car, fetcher);
+      return makeCarDetailsScreen(car, fetcher, isTracked(car));
     }
     case "trackToggle": {
       // Impure step: do the storage write HERE (screens stay pure), then show
