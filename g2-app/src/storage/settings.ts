@@ -14,6 +14,7 @@
 
 import type { LineCode } from "../data/wmata";
 import type { FavoriteStation } from "../data/domain/lines";
+import { carKey, type TrackedCar } from "../data/domain/tracked";
 
 export type { FavoriteStation };
 
@@ -25,19 +26,23 @@ export interface Settings {
 
 /** Maximum number of favorite stations a user can pin. */
 export const MAX_FAVORITES = 5;
+/** Maximum number of tracked train slots. Kept small so favorites + tracked +
+ *  the alerts row stay within the firmware's 20-item list cap on Home. */
+export const MAX_TRACKED = 5;
 
 /** Bumped whenever the on-disk schema changes incompatibly. */
 const SCHEMA_VERSION = 1;
 
 const KEY_API_KEY = "wmata.g2.apiKey";
 const KEY_FAVORITES = "wmata.g2.favorites";
+const KEY_TRACKED = "wmata.g2.tracked";
 
 /**
  * Every namespaced settings key, for the bridge-sync layer to hydrate from /
  * mirror to the Even Hub durable store. A key missing here won't survive an
  * app restart on hardware.
  */
-export const STORAGE_KEYS: readonly string[] = [KEY_API_KEY, KEY_FAVORITES];
+export const STORAGE_KEYS: readonly string[] = [KEY_API_KEY, KEY_FAVORITES, KEY_TRACKED];
 
 const VALID_LINE_CODES: ReadonlySet<string> = new Set<string>(["RD", "BL", "YL", "OR", "GR", "SV"]);
 
@@ -143,6 +148,32 @@ function asFavoritesArray(x: unknown): FavoriteStation[] {
   return out.slice(0, MAX_FAVORITES);
 }
 
+function asTrackedCar(x: unknown): TrackedCar | null {
+  if (!isRecord(x)) return null;
+  const { stationCode, stationName, line, group, destinationCode, destinationName } = x;
+  if (typeof stationCode !== "string" || typeof stationName !== "string") return null;
+  if (typeof line !== "string" || typeof group !== "string") return null;
+  if (typeof destinationName !== "string") return null;
+  return {
+    stationCode,
+    stationName,
+    line,
+    group,
+    destinationCode: typeof destinationCode === "string" ? destinationCode : null,
+    destinationName,
+  };
+}
+
+function asTrackedArray(x: unknown): TrackedCar[] {
+  if (!Array.isArray(x)) return [];
+  const out: TrackedCar[] = [];
+  for (const item of x) {
+    const car = asTrackedCar(item);
+    if (car !== null) out.push(car);
+  }
+  return out.slice(0, MAX_TRACKED);
+}
+
 function writeEnvelope<T>(key: string, value: T): void {
   const envelope: Envelope<T> = { schemaVersion: SCHEMA_VERSION, value };
   safeSet(key, JSON.stringify(envelope));
@@ -207,8 +238,53 @@ export function reorderFavorites(newOrder: FavoriteStation[]): FavoriteStation[]
   return snapshot;
 }
 
+// --- Tracked train slots --------------------------------------------------
+
+function readTracked(): TrackedCar[] {
+  return asTrackedArray(parseEnvelope(safeGet(KEY_TRACKED)));
+}
+
+function writeTracked(tracked: TrackedCar[]): void {
+  writeEnvelope(KEY_TRACKED, tracked);
+}
+
+/** The current tracked train slots (saved "next <line> to <dest>" queries). */
+export function loadTracked(): TrackedCar[] {
+  return readTracked();
+}
+
+/** True if a slot with this car's key is already tracked. */
+export function isTracked(car: TrackedCar): boolean {
+  const key = carKey(car);
+  return readTracked().some((c) => carKey(c) === key);
+}
+
+/**
+ * Append a tracked slot. No-op if an identical slot exists or the list is full
+ * (`MAX_TRACKED`). Returns the updated list.
+ */
+export function addTrackedCar(car: TrackedCar): TrackedCar[] {
+  const current = readTracked();
+  const key = carKey(car);
+  if (current.some((c) => carKey(c) === key)) return current;
+  if (current.length >= MAX_TRACKED) return current;
+  const next = [...current, car];
+  writeTracked(next);
+  return next;
+}
+
+/** Remove a tracked slot by its `carKey`. Returns the updated list. */
+export function removeTrackedCar(key: string): TrackedCar[] {
+  const current = readTracked();
+  const next = current.filter((c) => carKey(c) !== key);
+  if (next.length === current.length) return current;
+  writeTracked(next);
+  return next;
+}
+
 /** Wipe all stored settings. */
 export function clearSettings(): void {
   safeRemove(KEY_API_KEY);
   safeRemove(KEY_FAVORITES);
+  safeRemove(KEY_TRACKED);
 }
