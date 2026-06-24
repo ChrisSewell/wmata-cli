@@ -21,11 +21,10 @@
         background: #232323;
         color: #E5E5E5;
         font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-        /* Kill WebView double-tap zoom + iOS text auto-sizing + scroll-chaining
-         * rubber-band — none of which block in-page scrolling. */
-        touch-action: manipulation;
         -webkit-text-size-adjust: 100%;
-        overscroll-behavior: none;
+        /* NB: deliberately NO touch-action / overscroll-behavior here — the
+         * working companion apps in this webview (FlightAware) don't set them,
+         * and they can interfere with scroll recovery after the keyboard hides. */
       }
       #app {
         box-sizing: border-box;

@@ -605,7 +605,18 @@ export function mountSettingsScreen(root: HTMLElement): () => void {
   // what left a screenful of dead space below the content, so the page couldn't
   // scroll to its true bottom.
   const releaseIfKeyboardDown = (): void => {
-    if (vv && vv.height > window.innerHeight - 100) document.body.classList.remove("kbd-open");
+    if (!vv || vv.height <= window.innerHeight - 100) return; // keyboard still up
+    if (!document.body.classList.contains("kbd-open")) return;
+    document.body.classList.remove("kbd-open");
+    // Removing the 80vh spacer shrinks the document. If the user had scrolled
+    // into that region, the scroll offset is now past the new maximum, which
+    // strands the WKWebView scroll view out of bounds and freezes it. Clamp the
+    // offset back into range (and re-issue scrollTo) on the next frame so the
+    // page stays scrollable once the keyboard is gone.
+    requestAnimationFrame(() => {
+      const maxY = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      window.scrollTo(0, Math.min(window.scrollY, maxY));
+    });
   };
   const onFocusIn = (e: FocusEvent): void => {
     if (!(e.target instanceof HTMLInputElement)) return;
