@@ -16,7 +16,11 @@ import { makeHomeScreen, type HomeSnapshot } from "../screens/home";
 import { makePredictionsScreen, makeInitialPredictionsSnapshot } from "../screens/predictions";
 import { makeAlertsScreen, makeInitialAlertsSnapshot } from "../screens/alerts";
 import { makeAlertDetailScreen } from "../screens/alert-detail";
+import { makeCarMenuScreen } from "../screens/car-menu";
+import { makeCarDetailsScreen } from "../screens/car-details";
 import { buildAlertItems } from "../data/domain/alerts";
+import { carKey, matchesTrackedCar } from "../data/domain/tracked";
+import { isTracked, addTrackedCar, removeTrackedCar } from "../storage/settings";
 import type { NavIntent, Router, Screen } from "../screens/router";
 import type { FavoriteStation } from "../data/domain/lines";
 import type { Train, RailIncident, ElevatorIncident } from "../data/wmata";
@@ -103,6 +107,19 @@ function fixtureScreen(intent: NavIntent): Screen<any> | null {
       return makeAlertsScreen(async () => ({ items: ALERT_ITEMS, fetchedAt: Date.now(), fetchError: null }), makeInitialAlertsSnapshot());
     case "alertDetail":
       return makeAlertDetailScreen(ALERT_ITEMS[intent.index] ?? { title: "Alert", detail: "Not found." });
+    case "carMenu":
+      return makeCarMenuScreen(intent.car, isTracked(intent.car));
+    case "carDetails":
+      return makeCarDetailsScreen(intent.car, async () =>
+        FIXTURE_TRAINS.filter((t) => matchesTrackedCar(t, intent.car)).map((t) => t.Min),
+      );
+    case "trackToggle":
+      if (isTracked(intent.car)) removeTrackedCar(carKey(intent.car));
+      else addTrackedCar(intent.car);
+      return makePredictionsScreen(
+        async () => ({ trains: FIXTURE_TRAINS, fetchedAt: Date.now(), fetchError: null }),
+        makeInitialPredictionsSnapshot(intent.car.stationCode, intent.car.stationName),
+      );
     case "unconfigured":
     case "exit":
       return null;

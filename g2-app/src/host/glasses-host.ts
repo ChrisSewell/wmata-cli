@@ -322,6 +322,23 @@ export async function mountGlassesScreen<S>(
       }),
     });
 
+  /** The hero image-accent placeholder (pixels arrive via pushAccent after the
+   *  page is built). Empty unless this is a hero screen. */
+  const heroImageObject = (): ImageContainerProperty[] => {
+    if (!hero) return [];
+    const a = heroRects().accent;
+    return [
+      new ImageContainerProperty({
+        xPosition: a.x,
+        yPosition: a.y,
+        width: a.w,
+        height: a.h,
+        containerID: ID_ACCENT,
+        containerName: "wmata.accent",
+      }),
+    ];
+  };
+
   const render = async (): Promise<void> => {
     if (!active) return;
     if (renderInFlight) {
@@ -342,13 +359,15 @@ export async function mountGlassesScreen<S>(
             // Items changed (a data tick) — no per-item update API exists, so
             // rebuild the whole page. The firmware resets list focus to 0 on
             // rebuild, so mirror that into nav.
+            const img = heroImageObject();
             try {
               await serial(() =>
                 bridge.rebuildPageContainer(
                   new RebuildPageContainer({
-                    containerTotalNum: 4,
+                    containerTotalNum: 3 + 1 + img.length, // header+clock+hint + list (+ hero image)
                     textObject: frameContainers(r.title, r.clock, r.hint),
                     listObject: [listContainer(items)],
+                    imageObject: hero ? img : undefined,
                   }),
                 ),
               );
@@ -360,6 +379,10 @@ export async function mountGlassesScreen<S>(
             lastClock = r.clock;
             lastHint = r.hint;
             nav = { selectedIndex: 0 };
+            if (hero) {
+              lastNumeral = null; // the rebuild wiped the image — force a re-push
+              await pushAccent(r.numeral);
+            }
           } else {
             // Unchanged items: only the cheap frame text (clock / staleness
             // marker / hint) may have moved — upgrade in place, never rebuild.
@@ -408,20 +431,7 @@ export async function mountGlassesScreen<S>(
 
   // The image accent can't be sent during page creation — create an empty
   // placeholder, then push pixels with updateImageRawData once the page is up.
-  const imageObject: ImageContainerProperty[] = [];
-  if (hero) {
-    const a = heroRects().accent;
-    imageObject.push(
-      new ImageContainerProperty({
-        xPosition: a.x,
-        yPosition: a.y,
-        width: a.w,
-        height: a.h,
-        containerID: ID_ACCENT,
-        containerName: "wmata.accent",
-      }),
-    );
-  }
+  const imageObject = heroImageObject();
 
   const totalNum = textContainers.length + listObject.length + imageObject.length;
   try {

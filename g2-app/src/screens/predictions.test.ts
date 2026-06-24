@@ -48,26 +48,25 @@ describe("trainRow", () => {
 });
 
 describe("view states", () => {
-  it("loading before the first fetch", () => {
+  it("loading before the first fetch (single-item list)", () => {
     const v = screen.view(snap(), { selectedIndex: 0 }, ctx);
-    expect(v.body).toMatchObject({ kind: "message" });
-    expect((v.body as { lines: string[] }).lines[0]).toBe("Loading…");
+    expect(v.body.kind).toBe("list");
+    expect((v.body as { items: string[] }).items[0]).toBe("Loading…");
   });
   it("first-load error offers retry", () => {
     const v = screen.view(snap({ fetchError: "boom" }), { selectedIndex: 0 }, ctx);
-    expect((v.body as { lines: string[] }).lines[0]).toContain("Couldn't reach");
+    expect((v.body as { items: string[] }).items[0]).toContain("Couldn't reach");
   });
   it("empty after a successful fetch", () => {
     const v = screen.view(snap({ fetchedAt: ctx.nowMs }), { selectedIndex: 0 }, ctx);
-    expect((v.body as { lines: string[] }).lines.join(" ")).toBe("No upcoming trains.");
+    expect((v.body as { items: string[] }).items[0]).toBe("No upcoming trains.");
   });
-  it("renders a read-only sorted board, capped at 6", () => {
+  it("renders a selectable native list of trains (capped at 6) + the hero numeral", () => {
     const many = Array.from({ length: 9 }, (_, i) => t("RD", `Dest${i}`, String(i + 1)));
     const v = screen.view(snap({ fetchedAt: ctx.nowMs, trains: many }), { selectedIndex: 0 }, ctx);
-    expect(v.body.kind).toBe("rows");
-    const body = v.body as { rows: unknown[]; selectable?: boolean };
-    expect(body.rows.length).toBe(6);
-    expect(body.selectable).toBe(false);
+    expect(v.body.kind).toBe("list");
+    expect((v.body as { items: string[] }).items.length).toBe(6);
+    expect(v.hero?.numeral).toBe("1"); // soonest train is "1 min"
   });
 });
 
@@ -81,9 +80,17 @@ describe("heroNumeral", () => {
 });
 
 describe("reduce", () => {
-  it("press and double-press go back to home", () => {
+  it("press opens the car menu for the highlighted train (carrying the slot identity)", () => {
+    const loaded = snap({ fetchedAt: ctx.nowMs, trains: [t("RD", "Glenmont", "3")] });
+    const r = screen.reduce(loaded, { selectedIndex: 0 }, { type: "TAP" });
+    expect(r.navigate).toMatchObject({ to: "carMenu" });
+    expect((r.navigate as { car: { stationCode: string; destinationName: string } }).car).toMatchObject({
+      stationCode: "A01",
+      destinationName: "Glenmont",
+    });
+  });
+  it("double-press goes back home", () => {
     const loaded = snap({ fetchedAt: ctx.nowMs, trains: [t("RD", "x", "3")] });
-    expect(screen.reduce(loaded, { selectedIndex: 0 }, { type: "TAP" }).navigate).toEqual({ to: "home" });
     expect(screen.reduce(loaded, { selectedIndex: 0 }, { type: "DOUBLE_TAP" }).navigate).toEqual({ to: "home" });
   });
   it("press requests a retry in the first-load error state", () => {

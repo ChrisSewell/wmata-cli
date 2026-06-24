@@ -8,6 +8,7 @@
 // characters, and never compute pixels — that keeps them fully unit-testable.
 
 import type { EvenAppBridge } from "@evenrealities/even_hub_sdk";
+import type { TrackedCar } from "../data/domain/tracked";
 
 /** Touchpad gesture after the host normalizes the SDK's event envelopes. */
 export type ScreenEvent =
@@ -31,6 +32,9 @@ export type NavIntent =
   | { to: "predictions"; stationCode: string; stationName: string }
   | { to: "alerts" }
   | { to: "alertDetail"; index: number }
+  | { to: "carMenu"; car: TrackedCar }
+  | { to: "carDetails"; car: TrackedCar }
+  | { to: "trackToggle"; car: TrackedCar } // transient: wiring writes storage, then shows the board
   | { to: "unconfigured" }
   | { to: "exit" };
 

@@ -7,9 +7,22 @@
 import type { Train } from "../data/wmata";
 import { etaSortValue } from "../data/domain/eta";
 import { stalenessMarker } from "../data/domain/staleness";
+import { trackedCarFromTrain } from "../data/domain/tracked";
 import { formatEtaValue, lineGlyph, toTitleCase } from "../ui/format";
 import { HINTS } from "../nav/affordances";
 import type { Layout, NavState, ReduceResult, Row, Screen, ViewContext } from "./router";
+
+function clamp(idx: number, count: number): number {
+  if (count <= 0) return 0;
+  return Math.max(0, Math.min(idx, count - 1));
+}
+
+/** A board row packed into one native-list item string (no positioned column —
+ *  the ETA rides after a middot, like Home/Alerts). */
+export function trainItem(t: Train): string {
+  const r = trainRow(t);
+  return r.value ? `${r.left} · ${r.value}` : r.left;
+}
 
 // WMATA refreshes its real-time predictions every ~20-30s server-side, so
 // polling much faster than this only adds requests without new data; 10s keeps
@@ -71,17 +84,16 @@ export function makePredictionsScreen(
 ): Screen<PredictionsSnapshot> {
   return {
     name: "predictions",
-    mode: "text",
-    // Hero screen: a big dot-matrix accent of the soonest train's ETA on the
-    // left, the train board (with its ETA value column) on the right. The
-    // accent is a PNG ≤156×140 — within the firmware's ≤288×144 image cap — sent
-    // via updateImageRawData after the page is built, the same proven pattern as
-    // g2-dotmatrix-demo. (It was once blamed for the on-device crash that turned
-    // out to be shutDownPageContainer-on-navigation, now fixed.)
+    // Hero + SELECTABLE native list: the big dot-matrix accent of the soonest
+    // train on the left, a scrollable list of upcoming trains on the right.
+    // Single press opens the per-car menu (track/untrack/details); double press
+    // goes back. (The native list owns scroll/selection — no bounce — and the
+    // accent is a PNG within the firmware's ≤288×144 image cap, pushed via
+    // updateImageRawData after the page builds, like g2-dotmatrix-demo.)
+    mode: "list",
     hero: true,
-    valueReserve: ["12 min"],
     init: () => initial,
-    view(s: PredictionsSnapshot, _nav: NavState, ctx: ViewContext): Layout {
+    view(s: PredictionsSnapshot, nav: NavState, ctx: ViewContext): Layout {
       const marker = stalenessMarker(
         { fetchedAt: s.fetchedAt, fetchError: s.fetchError, consecutiveFailures: s.consecutiveFailures },
         ctx.nowMs,
@@ -91,39 +103,51 @@ export function makePredictionsScreen(
       const sorted = sortTrains(s.trains);
       const numeral = sorted[0] ? heroNumeral(sorted[0].Min) : "";
       const firstLoadError = s.trains.length === 0 && s.fetchedAt === 0 && s.fetchError !== null;
+      // Transient states are single-item lists so the page never switches
+      // text↔list composition mid-screen (matches Home/Alerts).
       if (firstLoadError) {
         return {
           header,
-          body: { kind: "message", lines: ["Couldn't reach WMATA.", "", "Tap to retry."] },
+          body: { kind: "list", items: ["Couldn't reach WMATA — tap to retry"], selectedIndex: 0 },
           hints: [HINTS.retry, HINTS.back],
           hero: { numeral: "" },
         };
       }
       if (s.trains.length === 0 && s.fetchedAt === 0) {
-        return { header, body: { kind: "message", lines: ["Loading…"] }, hints: [HINTS.back], hero: { numeral: "" } };
+        return { header, body: { kind: "list", items: ["Loading…"], selectedIndex: 0 }, hints: [HINTS.back], hero: { numeral: "" } };
       }
       if (s.trains.length === 0) {
-        return { header, body: { kind: "message", lines: ["No upcoming trains."] }, hints: [HINTS.back], hero: { numeral: "" } };
+        return { header, body: { kind: "list", items: ["No upcoming trains."], selectedIndex: 0 }, hints: [HINTS.back], hero: { numeral: "" } };
       }
-      const rows = sorted.slice(0, MAX_ROWS).map(trainRow);
+      const items = sorted.slice(0, MAX_ROWS).map(trainItem);
       return {
         header,
-        body: { kind: "rows", rows, selectedIndex: 0, selectable: false },
-        hints: [HINTS.back],
+        body: { kind: "list", items, selectedIndex: clamp(nav.selectedIndex, items.length) },
+        hints: [HINTS.open, HINTS.back],
         hero: { numeral },
       };
     },
     reduce(s: PredictionsSnapshot, nav: NavState, event): ReduceResult<PredictionsSnapshot> {
       const firstLoadError = s.trains.length === 0 && s.fetchedAt === 0 && s.fetchError !== null;
+      const sorted = sortTrains(s.trains);
+      const count = Math.min(sorted.length, MAX_ROWS);
+      const idx = clamp(nav.selectedIndex, count);
       switch (event.type) {
-        case "TAP":
-          // Pure viewer: press is back. In the first-load error state it's the
-          // tap-to-retry affordance instead.
-          return firstLoadError ? { nav, requestTick: true } : { nav, navigate: { to: "home" } };
+        case "TAP": {
+          if (s.trains.length === 0) return firstLoadError ? { nav, requestTick: true } : { nav };
+          const train = sorted[idx];
+          return train
+            ? { nav: { selectedIndex: idx }, navigate: { to: "carMenu", car: trackedCarFromTrain(train, s.stationCode, s.stationName) } }
+            : { nav };
+        }
         case "DOUBLE_TAP":
           return { nav, navigate: { to: "home" } };
-        default:
-          return { nav }; // a board doesn't scroll-select
+        // SCROLL_* are unreachable on a native list (firmware owns scroll) but
+        // kept for completeness / tests.
+        case "SCROLL_UP":
+          return { nav: { selectedIndex: clamp(idx - 1, count) } };
+        case "SCROLL_DOWN":
+          return { nav: { selectedIndex: clamp(idx + 1, count) } };
       }
     },
     async tick(s: PredictionsSnapshot): Promise<PredictionsSnapshot> {
